@@ -32,6 +32,42 @@ const pool = mysql.createPool({
   connectionLimit: 5,
 });
 
+// Crea la tabla sola si no existe todavía, al arrancar el servidor — así
+// no hace falta ejecutar esquema.sql a mano en ningún sitio (Railway u
+// otro proveedor). Reintenta unas cuantas veces por si la base de datos
+// tarda unos segundos en aceptar conexiones justo tras un despliegue.
+async function asegurarEsquema() {
+  const INTENTOS = 5;
+  for (let intento = 1; intento <= INTENTOS; intento++) {
+    try {
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS solicitudes_llamada (
+          id            INT AUTO_INCREMENT PRIMARY KEY,
+          nombre        VARCHAR(120)      NOT NULL,
+          telefono      VARCHAR(30)       NOT NULL,
+          origen        VARCHAR(60)       NULL,
+          atendida      TINYINT(1)        NOT NULL DEFAULT 0,
+          creado_en     DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      try {
+        await pool.execute(
+          'CREATE INDEX idx_solicitudes_atendida ON solicitudes_llamada (atendida, creado_en)'
+        );
+      } catch (err) {
+        // ER_DUP_KEYNAME: el índice ya existe de un arranque anterior, no es un error real.
+        if (err.code !== 'ER_DUP_KEYNAME') throw err;
+      }
+      console.log('Tabla solicitudes_llamada lista.');
+      return;
+    } catch (err) {
+      console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
+      if (intento < INTENTOS) await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  console.error('No se pudo preparar la tabla tras varios intentos. El servidor sigue arrancando; /api/llamada fallará hasta que la base de datos esté disponible.');
+}
+
 // Validación mínima: nombre no vacío, teléfono con al menos 9 dígitos.
 // Esto es justo lo mismo que ya valida el propio formulario en el
 // navegador (refrescarEnviarLlamada) — se repite aquí porque nunca hay
@@ -65,4 +101,6 @@ app.post('/api/llamada', async (req, res) => {
 app.get('/salud', (req, res) => res.json({ estado: 'ok' }));
 
 const PUERTO = process.env.PORT || 3000;
-app.listen(PUERTO, () => console.log(`Backend de Acros escuchando en el puerto ${PUERTO}`));
+asegurarEsquema().finally(() => {
+  app.listen(PUERTO, () => console.log(`Backend de Acros escuchando en el puerto ${PUERTO}`));
+});

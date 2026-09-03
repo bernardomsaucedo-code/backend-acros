@@ -1,6 +1,7 @@
 -- Esquema mínimo para que "Llamadme gratis" llegue de verdad a MySQL.
--- Ejecutar esto una vez, en la base de datos que uses (Railway, PlanetScale,
--- un hosting con MySQL propio, etc.)
+-- Esto ya NO hace falta ejecutarlo a mano: server.js crea esta misma
+-- tabla solo, la primera vez que arranca, si todavía no existe. Este
+-- archivo queda solo como referencia de cómo es la tabla.
 
 CREATE TABLE IF NOT EXISTS solicitudes_llamada (
   id            INT AUTO_INCREMENT PRIMARY KEY,

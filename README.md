@@ -10,7 +10,9 @@ con una URL pública, y apuntar el formulario ahí.
 
 - `server.js` — el servidor (Node.js + Express). Un único endpoint,
   `POST /api/llamada`, que valida los datos y los guarda en MySQL.
-- `esquema.sql` — la tabla `solicitudes_llamada`. Se ejecuta una sola vez.
+- `esquema.sql` — cómo es la tabla `solicitudes_llamada`, solo de referencia:
+  el propio `server.js` la crea solo al arrancar si todavía no existe, así
+  que no hace falta ejecutar este archivo a mano en ningún sitio.
 - `package.json` — las dependencias (`express`, `mysql2`, `cors`, `dotenv`).
 - `.env.example` — plantilla de las variables de entorno. Cópiala como
   `.env` y rellena con los datos reales de tu base de datos.
@@ -24,17 +26,17 @@ suficiente para empezar.
    con tu cuenta de GitHub).
 2. "New Project" → "Provision MySQL" — esto te crea una base de datos y te
    da directamente las credenciales (host, usuario, contraseña, puerto).
-3. Ejecuta `esquema.sql` contra esa base de datos: Railway trae un cliente
-   MySQL integrado en su panel (pestaña "Data"), o puedes conectarte con
-   cualquier cliente MySQL de escritorio (TablePlus, DBeaver...) usando
-   esas mismas credenciales.
-4. En el mismo proyecto de Railway: "New" → "GitHub Repo" (sube esta
+3. En el mismo proyecto de Railway: "New" → "GitHub Repo" (sube esta
    carpeta a un repositorio de GitHub primero) o "Empty Service" y sube
    los archivos directamente.
-5. En la configuración del servicio (pestaña "Variables"), añade las
+4. En la configuración del servicio (pestaña "Variables"), añade las
    mismas variables que ves en `.env.example`, con los datos reales que
    te dio Railway en el paso 2.
-6. Railway despliega solo y te da una URL pública, algo como
+5. Railway despliega solo. La primera vez que arranca, `server.js` crea
+   él mismo la tabla que necesita — no hace falta tocar la base de datos
+   a mano.
+6. En la configuración del servicio, genera la URL pública (Settings →
+   Networking → Public Networking → "Generate Domain") — algo como
    `https://backend-acros-production.up.railway.app`.
 7. Prueba que está vivo entrando a esa URL + `/salud` en el navegador —
    debe responder `{"estado":"ok"}`.
