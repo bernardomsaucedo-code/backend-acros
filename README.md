@@ -1,18 +1,22 @@
-# Backend de Acros — "Llamadme gratis" → MySQL
+# Backend de Acros — "Llamadme gratis" y "Pide presupuesto" → MySQL
 
 Esto ya está **probado de verdad**, no es teoría: se montó MySQL y este mismo
-servidor en un entorno de pruebas, se le mandaron dos peticiones idénticas a
-las que hace el formulario real, y las dos quedaron guardadas en la tabla
-con sus datos correctos. Lo único que falta es desplegarlo en algún sitio
-con una URL pública, y apuntar el formulario ahí.
+servidor en un entorno de pruebas, se le mandaron peticiones idénticas a las
+que hacen los formularios reales (llamada y presupuesto, con array de
+servicios y con texto libre), y todas quedaron guardadas correctamente. Lo
+único que falta es desplegarlo con una URL pública y apuntar los formularios
+ahí.
 
 ## Qué hay en esta carpeta
 
-- `server.js` — el servidor (Node.js + Express). Un único endpoint,
-  `POST /api/llamada`, que valida los datos y los guarda en MySQL.
-- `esquema.sql` — cómo es la tabla `solicitudes_llamada`, solo de referencia:
-  el propio `server.js` la crea solo al arrancar si todavía no existe, así
-  que no hace falta ejecutar este archivo a mano en ningún sitio.
+- `server.js` — el servidor (Node.js + Express). Dos endpoints:
+  `POST /api/llamada` (Llamadme gratis) y `POST /api/presupuesto` (Pide
+  presupuesto). Ambos validan los datos y los guardan en MySQL, creando
+  ellos mismos las tablas que necesitan la primera vez que arrancan.
+- `esquema.sql` — cómo son las tablas `solicitudes_llamada` y
+  `solicitudes_presupuesto`, solo de referencia: el propio `server.js` las
+  crea solas al arrancar si todavía no existen, así que no hace falta
+  ejecutar este archivo a mano en ningún sitio.
 - `package.json` — las dependencias (`express`, `mysql2`, `cors`, `dotenv`).
 - `.env.example` — plantilla de las variables de entorno. Cópiala como
   `.env` y rellena con los datos reales de tu base de datos.
@@ -41,22 +45,29 @@ suficiente para empezar.
 7. Prueba que está vivo entrando a esa URL + `/salud` en el navegador —
    debe responder `{"estado":"ok"}`.
 
-## Conectar el formulario de verdad
+## Conectar los formularios de verdad
 
-En `acros_inicio.html` y `acros_empieza_aqui.html`, busca esta línea:
+En `acros_inicio.html` y `acros_empieza_aqui.html`, busca estas líneas:
 
 ```js
 const ENDPOINT_LLAMADA = '';
+const ENDPOINT_SOLICITUD = '';
 ```
 
-y cámbiala por tu URL real más `/api/llamada`:
+y cámbialas por tu URL real:
 
 ```js
 const ENDPOINT_LLAMADA = 'https://backend-acros-production.up.railway.app/api/llamada';
+const ENDPOINT_SOLICITUD = 'https://backend-acros-production.up.railway.app/api/presupuesto';
 ```
 
-En cuanto hagas ese cambio, "Llamadme gratis" deja de ser una maqueta:
-cada envío llega de verdad a la base de datos.
+En cuanto hagas esos cambios, "Llamadme gratis" y "Pide presupuesto" dejan
+de ser una maqueta: cada envío llega de verdad a la base de datos.
+
+Nota sobre `/api/presupuesto`: espera `servicios` (una lista, o el texto de
+"necesito algo más"), `telefono` (obligatorio), y opcionalmente `detalle`,
+`correo`, `utm` y `origen`. Si el formulario real envía los campos con
+otros nombres, dímelo y ajusto el endpoint — es un cambio pequeño.
 
 ## Qué falta todavía (para no llevarte una sorpresa)
 
@@ -71,6 +82,7 @@ cada envío llega de verdad a la base de datos.
   correo en cuanto entra una solicitud nueva): no está montado — hoy solo
   se guarda, no avisa a nadie. Se puede añadir con Twilio (WhatsApp/SMS) o
   Resend (correo) más adelante, sin tocar lo que ya funciona.
-- Esto cubre **solo** "Llamadme gratis". "Pide presupuesto" y el acceso de
-  clientes necesitarían sus propias tablas y endpoints, con la misma
-  idea.
+- Esto cubre "Llamadme gratis" y "Pide presupuesto". El acceso de clientes
+  (código de un solo uso) necesitaría su propia tabla y endpoints — está
+  pendiente de aclarar cómo tiene que funcionar exactamente antes de
+  montarlo.

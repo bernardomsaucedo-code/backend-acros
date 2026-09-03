@@ -14,3 +14,21 @@ CREATE TABLE IF NOT EXISTS solicitudes_llamada (
 
 -- Índice para que el panel de admin pueda listar rápido "las que faltan por atender"
 CREATE INDEX idx_solicitudes_atendida ON solicitudes_llamada (atendida, creado_en);
+
+-- Tabla para "Pide presupuesto". servicios guarda una lista (como JSON) o
+-- el texto libre de "necesito algo más". El resto sigue la misma idea que
+-- solicitudes_llamada: teléfono siempre, correo opcional, atendida para el
+-- panel de admin.
+CREATE TABLE IF NOT EXISTS solicitudes_presupuesto (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  servicios     TEXT              NOT NULL,
+  detalle       TEXT              NULL,
+  telefono      VARCHAR(30)       NOT NULL,
+  correo        VARCHAR(190)      NULL,
+  utm           VARCHAR(300)      NULL,
+  origen        VARCHAR(60)       NULL,
+  atendida      TINYINT(1)        NOT NULL DEFAULT 0,
+  creado_en     DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_presupuesto_atendida ON solicitudes_presupuesto (atendida, creado_en);
