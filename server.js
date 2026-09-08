@@ -37,9 +37,19 @@ const mysql = require('mysql2/promise');
 const app = express();
 app.use(express.json());
 
-const ORIGENES_PERMITIDOS = (process.env.ORIGENES_PERMITIDOS || '*')
-  .split(',')
-  .map(o => o.trim());
+// Bug real encontrado y corregido (08/09): con ORIGENES_PERMITIDOS=* el
+// .split(',') de antes convertía "*" en el ARRAY ['*'] — y el paquete
+// "cors" trata un array como una lista de orígenes exactos a comparar,
+// no como el comodín "cualquier origen". Eso hacía que NINGUNA petición
+// con cabeceras extra (Content-Type: application/json en un POST, o
+// x-admin-key) pasara el preflight, aunque la variable dijera "*". Con
+// una sola URL no fallaba (algunos navegadores son más permisivos en
+// GET simples), por eso no se había notado hasta probar el panel de
+// admin de verdad contra el servidor real.
+const ORIGENES_PERMITIDOS_RAW = process.env.ORIGENES_PERMITIDOS || '*';
+const ORIGENES_PERMITIDOS = ORIGENES_PERMITIDOS_RAW.trim() === '*'
+  ? '*'
+  : ORIGENES_PERMITIDOS_RAW.split(',').map(o => o.trim());
 app.use(cors({ origin: ORIGENES_PERMITIDOS }));
 
 const pool = mysql.createPool({
