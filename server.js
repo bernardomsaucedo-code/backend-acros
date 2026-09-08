@@ -378,6 +378,55 @@ app.get('/api/propuestas/:token', async (req, res) => {
   }
 });
 
+// Estado combinado (08/09) — para que el área de clientes sepa de una
+// sola llamada qué pantalla tocar, sin tener que deducir el estado real
+// combinando por su cuenta propuesta + pago + diligencia (esa lógica
+// vive aquí, en el servidor, no repetida en el navegador).
+app.get('/api/propuestas/:token/estado', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento FROM clientes WHERE id = ?', [p.cliente_id]);
+    const [pagos] = await conn.execute('SELECT metodo, estado, hash_transaccion, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
+    const [diligencias] = await conn.execute('SELECT estado, coherencia, resuelto_en FROM diligencias WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
+    res.json({
+      propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en },
+      cliente: clientes[0] || null,
+      pago: pagos[0] || null,
+      diligencia: diligencias[0] || null,
+    });
+  } finally {
+    conn.release();
+  }
+});
+
+// Datos de "Primer acceso" (nombre, apellidos, documento) — hoy solo se
+// pedían en el navegador y no se guardaban en ningún sitio.
+function datosIdentidadValidos(b) {
+  return (b.nombre || '').trim().length > 1
+    && (b.apellidos || '').trim().length > 1
+    && ['dni', 'nie', 'pasaporte'].includes(b.tipo_documento)
+    && (b.numero_documento || '').trim().length > 0;
+}
+app.post('/api/propuestas/:token/identidad', async (req, res) => {
+  if (!datosIdentidadValidos(req.body)) {
+    return res.status(400).json({ error: 'Faltan nombre, apellidos, tipo_documento o numero_documento' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    await conn.execute(
+      'UPDATE clientes SET nombre = ?, apellidos = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?',
+      [req.body.nombre.trim(), req.body.apellidos.trim(), req.body.tipo_documento, req.body.numero_documento.trim(), p.cliente_id]
+    );
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
 app.post('/api/propuestas/:token/aceptar', async (req, res) => {
   const conn = await pool.getConnection();
   try {
