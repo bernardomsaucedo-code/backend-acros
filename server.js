@@ -302,10 +302,35 @@ async function obtenerOCrearCliente(conn, { correo, telefono }) {
 // PROPUESTAS (antes lo llamaba "presupuestos" — cambiado de nombre para
 // no confundirlo con /api/presupuesto, que es la solicitud del cliente)
 // ================================================================
+
+// "servicios" acepta dos formas (08/09, desglose opcional a petición de
+// Vikn: algunos clientes quieren ver "esto cuesta tanto, esto otro
+// tanto", otros no):
+//   - simple:    ["renta", "m721"]                       + importe_centimos aparte
+//   - desglosado: [{id:"renta", precio_centimos:20000}, ...]  (el total se
+//     calcula SIEMPRE en el servidor sumando las partes — nunca nos
+//     fiamos del total que mande el navegador, aunque lo desglosado
+//     venga de nuestro propio panel).
+function normalizarServiciosPropuesta(servicios, importeCentimosBody) {
+  if (!Array.isArray(servicios) || !servicios.length) return null;
+  const esDesglose = typeof servicios[0] === 'object' && servicios[0] !== null;
+  if (esDesglose) {
+    for (const s of servicios) {
+      if (!s || typeof s.id !== 'string' || !s.id.trim() || !Number.isInteger(s.precio_centimos) || s.precio_centimos <= 0) return null;
+    }
+    const total = servicios.reduce((acc, s) => acc + s.precio_centimos, 0);
+    return { servicios, importe_centimos: total };
+  }
+  if (!servicios.every(s => typeof s === 'string' && s.trim())) return null;
+  if (!Number.isInteger(importeCentimosBody) || importeCentimosBody <= 0) return null;
+  return { servicios, importe_centimos: importeCentimosBody };
+}
+
 app.post('/api/propuestas', requiereAdmin, async (req, res) => {
   const { correo, telefono, servicios, importe_centimos } = req.body;
-  if (!correo || !Array.isArray(servicios) || !servicios.length || !Number.isInteger(importe_centimos) || importe_centimos <= 0) {
-    return res.status(400).json({ error: 'Faltan datos: correo, servicios (array) e importe_centimos (entero > 0)' });
+  const normalizado = correo ? normalizarServiciosPropuesta(servicios, importe_centimos) : null;
+  if (!correo || !normalizado) {
+    return res.status(400).json({ error: 'Faltan datos: correo, y servicios — o bien un array de ids + importe_centimos, o bien un array de {id, precio_centimos} con el desglose' });
   }
   const conn = await pool.getConnection();
   try {
@@ -315,10 +340,10 @@ app.post('/api/propuestas', requiereAdmin, async (req, res) => {
     const expira = sumarDias(ahora(), 14);
     const [r] = await conn.execute(
       'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en) VALUES (?, ?, ?, ?, ?)',
-      [cliente.id, JSON.stringify(servicios), importe_centimos, token, aSQLDatetime(expira)]
+      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira)]
     );
     await conn.commit();
-    res.status(201).json({ ok: true, propuesta_id: r.insertId, token, expira_en: expira.toISOString() });
+    res.status(201).json({ ok: true, propuesta_id: r.insertId, token, expira_en: expira.toISOString(), importe_centimos: normalizado.importe_centimos });
   } catch (err) {
     await conn.rollback();
     console.error('Error al crear la propuesta:', err);
