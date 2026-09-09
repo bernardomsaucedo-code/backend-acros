@@ -307,6 +307,57 @@ app.post('/api/presupuesto', async (req, res) => {
 });
 
 // ================================================================
+// PANEL DEL ASESOR — ver y marcar como atendidas las solicitudes
+// entrantes ("Llamadme gratis" y "Pide presupuesto"), 09/09. Hasta
+// ahora solo se podían consultar entrando a la base de datos a mano.
+// ================================================================
+app.get('/api/admin/llamadas', requiereAdmin, async (req, res) => {
+  const soloPendientes = req.query.atendida === '0';
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = soloPendientes
+      ? await conn.execute('SELECT * FROM solicitudes_llamada WHERE atendida = 0 ORDER BY creado_en')
+      : await conn.execute('SELECT * FROM solicitudes_llamada ORDER BY creado_en DESC LIMIT 100');
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/llamadas/:id/atender', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE solicitudes_llamada SET atendida = 1 WHERE id = ?', [req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de llamada no encontrada' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+app.get('/api/admin/solicitudes-presupuesto', requiereAdmin, async (req, res) => {
+  const soloPendientes = req.query.atendida === '0';
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = soloPendientes
+      ? await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 0 ORDER BY creado_en')
+      : await conn.execute('SELECT * FROM solicitudes_presupuesto ORDER BY creado_en DESC LIMIT 100');
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/solicitudes-presupuesto/:id/atender', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 1 WHERE id = ?', [req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de presupuesto no encontrada' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// ================================================================
 // UTILIDADES COMUNES (para todo lo de abajo, nuevo)
 // ================================================================
 const generarToken = () => crypto.randomBytes(16).toString('hex');
