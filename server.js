@@ -398,6 +398,18 @@ app.post('/api/admin/llamadas/:id/atender', requiereAdmin, async (req, res) => {
     conn.release();
   }
 });
+// "Desatender" (09/09): por si se marcó por error o hace falta retomarla
+// — nunca se borra nada, solo se mueve entre pendiente/atendida.
+app.post('/api/admin/llamadas/:id/desatender', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE solicitudes_llamada SET atendida = 0 WHERE id = ?', [req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de llamada no encontrada' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
 
 app.get('/api/admin/solicitudes-presupuesto', requiereAdmin, async (req, res) => {
   const soloPendientes = req.query.atendida === '0';
@@ -415,6 +427,16 @@ app.post('/api/admin/solicitudes-presupuesto/:id/atender', requiereAdmin, async 
   const conn = await pool.getConnection();
   try {
     const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 1 WHERE id = ?', [req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de presupuesto no encontrada' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/solicitudes-presupuesto/:id/desatender', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 0 WHERE id = ?', [req.params.id]);
     if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de presupuesto no encontrada' });
     res.json({ ok: true });
   } finally {
