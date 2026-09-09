@@ -65,6 +65,63 @@ const pool = mysql.createPool({
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 // ================================================================
+// ALMACENAMIENTO DE DOCUMENTOS (09/09) — Cloudflare R2, con API
+// compatible con S3 (por eso se usa el SDK oficial de AWS). El archivo
+// que se guarda aquí SIEMPRE llega ya cifrado desde el navegador del
+// cliente (RSA + AES, ver /api/propuestas/:token/documento-identidad) —
+// este servidor nunca ve el contenido en claro, y R2 tampoco.
+// ================================================================
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const r2 = new S3Client({
+  region: 'auto',
+  endpoint: process.env.R2_ENDPOINT,
+  forcePathStyle: true, // imprescindible para R2 (y para pruebas locales): sin esto, el SDK intenta usar bucket.tu-endpoint en vez de tu-endpoint/bucket
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
+const R2_BUCKET = process.env.R2_BUCKET;
+
+async function subirAR2(clave, buffer, tipoMime) {
+  await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: clave, Body: buffer, ContentType: tipoMime }));
+}
+async function bajarDeR2(clave) {
+  const resp = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: clave }));
+  const trozos = [];
+  for await (const trozo of resp.Body) trozos.push(trozo);
+  return { buffer: Buffer.concat(trozos), tipoMime: resp.ContentType };
+}
+
+// ================================================================
+// CORREO (09/09) — Brevo. Sin ADMIN_KEY... digo, sin BREVO_API_KEY
+// configurada, el sistema sigue funcionando exactamente como hasta
+// ahora (el enlace se devuelve en la respuesta, en vez de mandarse por
+// correo) — así no hace falta tener ya la cuenta de Brevo para seguir
+// probando el resto en local.
+const axios = require('axios');
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const BREVO_REMITENTE = process.env.BREVO_REMITENTE || '';
+const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, ''); // sin barra final
+const brevoActivo = () => !!(BREVO_API_KEY && BREVO_REMITENTE);
+
+async function enviarCorreo(destinatario, asunto, html) {
+  const url = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
+  await axios.post(url, {
+    sender: { email: BREVO_REMITENTE, name: 'Acros' },
+    to: [{ email: destinatario }],
+    subject: asunto,
+    htmlContent: html,
+  }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
+}
+function enlaceArea(ruta, token) {
+  // Sin SITE_URL configurada todavía (no hay dominio público real), el
+  // correo incluye el token en texto en vez de un enlace clicable — se
+  // arregla solo en cuanto Vikn tenga dominio y se configure SITE_URL.
+  return SITE_URL ? `${SITE_URL}/${ruta}?token=${token}` : null;
+}
+
+// ================================================================
 // ESQUEMA — todas las tablas se crean solas aquí. CREATE TABLE IF NOT
 // EXISTS no toca nada si la tabla ya existe (y ya tiene datos de verdad
 // de Vikn), así que subir este archivo no borra nada de lo ya guardado.
@@ -169,6 +226,9 @@ async function asegurarEsquema() {
           actividad         VARCHAR(200) NULL,
           prp               TINYINT(1) NULL,
           documento_ref     VARCHAR(300) NULL,
+          documento_iv      VARCHAR(50) NULL,
+          documento_clave_cifrada VARCHAR(1000) NULL,
+          documento_tipo_mime VARCHAR(100) NULL,
           firma_nombre      VARCHAR(160) NULL,
           firma_en          DATETIME NULL,
           estado            ENUM('pendiente','revision','examen','aprobado','rechazado') NOT NULL DEFAULT 'pendiente',
@@ -180,6 +240,11 @@ async function asegurarEsquema() {
           FOREIGN KEY (propuesta_id) REFERENCES propuestas(id)
         )
       `);
+      // Cifrado del documento de identidad (09/09): columnas nuevas — si la
+      // tabla ya existía de antes sin ellas, se añaden solas sin tocar nada.
+      await agregaColumnaSiFalta('diligencias', 'documento_iv', 'VARCHAR(50) NULL');
+      await agregaColumnaSiFalta('diligencias', 'documento_clave_cifrada', 'VARCHAR(1000) NULL');
+      await agregaColumnaSiFalta('diligencias', 'documento_tipo_mime', 'VARCHAR(100) NULL');
       await creaIndiceSiFalta('idx_diligencias_estado ON diligencias (estado)');
 
       await pool.execute(`
@@ -429,6 +494,18 @@ app.post('/api/propuestas', requiereAdmin, async (req, res) => {
       [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira)]
     );
     await conn.commit();
+    if (brevoActivo()) {
+      const enlace = enlaceArea('acros_area.html', token);
+      const importeTexto = (normalizado.importe_centimos / 100).toFixed(2) + ' €';
+      const cuerpo = enlace
+        ? `<p>Hola,</p><p>Tu asesor te ha enviado una propuesta por ${importeTexto}. Puedes verla y aceptarla aquí:</p><p><a href="${enlace}">${enlace}</a></p><p>Válida durante 14 días.</p>`
+        : `<p>Hola,</p><p>Tu asesor te ha enviado una propuesta por ${importeTexto}. Tu código de acceso es:</p><p><strong>${token}</strong></p><p>Válida durante 14 días.</p>`;
+      try {
+        await enviarCorreo(correo, 'Tu propuesta de Acros', cuerpo);
+      } catch (err) {
+        console.error('Error al enviar el correo de propuesta (Brevo):', err.response?.data || err.message);
+      }
+    }
     res.status(201).json({ ok: true, propuesta_id: r.insertId, token, expira_en: expira.toISOString(), importe_centimos: normalizado.importe_centimos });
   } catch (err) {
     await conn.rollback();
@@ -622,9 +699,69 @@ function validarDiligencia(b) {
   if (typeof b.prp !== 'boolean') errores.push('prp');
   if (!['dni', 'nie', 'pasaporte'].includes(b.tipo_documento)) errores.push('tipo_documento');
   if (!(b.documento_ref || '').trim()) errores.push('documento_ref');
+  if (!(b.documento_iv || '').trim()) errores.push('documento_iv');
+  if (!(b.documento_clave_cifrada || '').trim()) errores.push('documento_clave_cifrada');
   if (!(b.firma_nombre || '').trim() || b.firma_nombre.trim().length < 2) errores.push('firma_nombre');
   return errores;
 }
+
+// Sube el documento de identidad YA CIFRADO por el navegador del cliente
+// (ver acros_area.html: RSA-OAEP + AES-GCM, con la clave pública que solo
+// puede cifrar — nunca descifrar). Este servidor guarda bytes que no
+// puede leer, en un sitio (R2) que tampoco puede leerlos.
+function limiteTamanoOk(base64, limiteBytes) {
+  // Una cadena base64 pesa ~4/3 del tamaño real — cálculo aproximado, de sobra para un límite de seguridad.
+  return (base64.length * 3) / 4 <= limiteBytes;
+}
+app.post('/api/propuestas/:token/documento-identidad', async (req, res) => {
+  const { archivo_cifrado, iv, clave_cifrada, tipo_mime } = req.body;
+  if (!archivo_cifrado || !iv || !clave_cifrada) {
+    return res.status(400).json({ error: 'Faltan archivo_cifrado, iv o clave_cifrada' });
+  }
+  if (!limiteTamanoOk(archivo_cifrado, 15 * 1024 * 1024)) {
+    return res.status(400).json({ error: 'El archivo no puede superar los 15 MB' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const clave = `dilig/${p.cliente_id}/${generarToken()}.enc`;
+    await subirAR2(clave, Buffer.from(archivo_cifrado, 'base64'), 'application/octet-stream');
+    // La clave de R2, el iv y la clave AES cifrada viajan de vuelta al
+    // navegador — se reenvían tal cual en el POST final de /diligencia,
+    // igual que el resto de respuestas del cuestionario. No se guardan
+    // aquí todavía porque la fila de "diligencias" no existe hasta ese
+    // envío final.
+    res.status(201).json({ ok: true, documento_ref: clave, iv, clave_cifrada, tipo_mime: tipo_mime || 'image/jpeg' });
+  } catch (err) {
+    console.error('Error al subir el documento de identidad:', err);
+    res.status(500).json({ error: 'No se pudo subir el documento' });
+  } finally {
+    conn.release();
+  }
+});
+
+// El asesor recupera el documento (sigue cifrado) para descifrarlo en su
+// propio navegador con su clave privada — este servidor solo hace de
+// intermediario entre R2 y el panel, nunca ve el contenido en claro.
+app.get('/api/admin/diligencias/:id/documento', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime FROM diligencias WHERE id = ?', [req.params.id]);
+    if (!filas.length || !filas[0].documento_ref) return res.status(404).json({ error: 'Documento no encontrado' });
+    const d = filas[0];
+    const { buffer } = await bajarDeR2(d.documento_ref);
+    res.json({
+      archivo_cifrado: buffer.toString('base64'),
+      iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada, tipo_mime: d.documento_tipo_mime,
+    });
+  } catch (err) {
+    console.error('Error al recuperar el documento:', err);
+    res.status(500).json({ error: 'No se pudo recuperar el documento' });
+  } finally {
+    conn.release();
+  }
+});
 
 app.post('/api/propuestas/:token/diligencia', async (req, res) => {
   const errores = validarDiligencia(req.body);
@@ -644,11 +781,13 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
       `INSERT INTO diligencias
         (cliente_id, propuesta_id, relacion, opera_desde, origen_fondos, origen_fondos_otro,
          custodia, patrimonio_rango, terceros, terceros_detalle, actividad, prp,
-         documento_ref, firma_nombre, firma_en, estado)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'revision')`,
+         documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime,
+         firma_nombre, firma_en, estado)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'revision')`,
       [p.cliente_id, p.id, b.relacion, b.opera_desde, b.origen_fondos, b.origen_fondos_otro || null,
        b.custodia, b.patrimonio_rango, b.terceros ? 1 : 0, b.terceros_detalle || null, b.actividad.trim(), b.prp ? 1 : 0,
-       b.documento_ref.trim(), b.firma_nombre.trim(), aSQLDatetime(ahora())]
+       b.documento_ref.trim(), b.documento_iv.trim(), b.documento_clave_cifrada.trim(), b.documento_tipo_mime || 'image/jpeg',
+       b.firma_nombre.trim(), aSQLDatetime(ahora())]
     );
     await conn.execute('UPDATE clientes SET tipo_documento = ?, numero_documento = ? WHERE id = ?',
       [b.tipo_documento, b.numero_documento || null, p.cliente_id]);
@@ -731,6 +870,18 @@ app.post('/api/acceso/solicitar', async (req, res) => {
         'INSERT INTO tokens_acceso (cliente_id, token, expira_en) VALUES (?, ?, ?)',
         [filas[0].id, token, aSQLDatetime(expira)]
       );
+      if (brevoActivo()) {
+        const enlace = enlaceArea('acros_area.html', token);
+        const cuerpo = enlace
+          ? `<p>Hola,</p><p>Aquí tienes tu acceso, válido durante 15 minutos:</p><p><a href="${enlace}">${enlace}</a></p>`
+          : `<p>Hola,</p><p>Tu código de acceso (válido 15 minutos) es:</p><p><strong>${token}</strong></p>`;
+        try {
+          await enviarCorreo(correo, 'Tu acceso a Acros', cuerpo);
+        } catch (err) {
+          console.error('Error al enviar el correo de acceso (Brevo):', err.response?.data || err.message);
+        }
+        return res.json({ ok: true, expira_en: expira.toISOString() });
+      }
       return res.json({ ok: true, token_demo: token, expira_en: expira.toISOString() });
     }
     res.json({ ok: true });
