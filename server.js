@@ -71,7 +71,7 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 // cliente (RSA + AES, ver /api/propuestas/:token/documento-identidad) —
 // este servidor nunca ve el contenido en claro, y R2 tampoco.
 // ================================================================
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const r2 = new S3Client({
   region: 'auto',
   endpoint: process.env.R2_ENDPOINT,
@@ -758,6 +758,59 @@ app.get('/api/admin/diligencias/:id/documento', requiereAdmin, async (req, res) 
   } catch (err) {
     console.error('Error al recuperar el documento:', err);
     res.status(500).json({ error: 'No se pudo recuperar el documento' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Copia de seguridad completa (09/09) — TODOS los documentos cifrados
+// que hay en R2, en un único .zip, junto con un manifiesto con lo que
+// hace falta para descifrar cada uno (iv + clave AES cifrada). Sigue
+// viajando todo cifrado — la copia en el propio dispositivo de Vikn es
+// tan ilegible para cualquier otro como el original en R2. Pensado para
+// pulsarlo de vez en cuando y guardarlo aparte (protección contra perder
+// Railway/R2 Y contra perder el propio ordenador, no solo uno de los dos).
+const archiver = require('archiver');
+app.get('/api/admin/documentos/backup', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT d.id, d.documento_ref, d.documento_iv, d.documento_clave_cifrada, d.documento_tipo_mime,
+              d.creado_en, c.correo
+       FROM diligencias d JOIN clientes c ON c.id = d.cliente_id
+       WHERE d.documento_ref IS NOT NULL ORDER BY d.id`
+    );
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="acros_documentos_${new Date().toISOString().slice(0, 10)}.zip"`);
+    const zip = archiver('zip');
+    zip.on('error', err => { console.error('Error al construir el zip de backup:', err); res.status(500).end(); });
+    zip.pipe(res);
+
+    const manifiesto = [];
+    for (const d of filas) {
+      try {
+        const { buffer } = await bajarDeR2(d.documento_ref);
+        const nombreEnZip = `documentos/diligencia_${d.id}.enc`;
+        zip.append(buffer, { name: nombreEnZip });
+        manifiesto.push({
+          archivo: nombreEnZip, diligencia_id: d.id, cliente_correo: d.correo,
+          iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada,
+          tipo_mime: d.documento_tipo_mime, subido_en: d.creado_en,
+        });
+      } catch (err) {
+        console.error(`No se pudo incluir el documento de la diligencia ${d.id} en el backup:`, err.message);
+      }
+    }
+    const leeme = 'Cada archivo .enc está cifrado — para abrirlo, pega tu clave privada en el panel de Acros ' +
+      '(acros_admin.html) y usa "Ver documento" en la diligencia correspondiente, o descifra tú mismo con ' +
+      'metadatos.json (iv + clave_cifrada por archivo, cifrados con RSA-OAEP/SHA-256 tu clave pública; ' +
+      'archivo cifrado con AES-256-GCM).';
+    zip.append(JSON.stringify(manifiesto, null, 2), { name: 'metadatos.json' });
+    zip.append(leeme, { name: 'LEEME.txt' });
+    await zip.finalize();
+  } catch (err) {
+    console.error('Error al generar la copia de seguridad:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'No se pudo generar la copia de seguridad' });
   } finally {
     conn.release();
   }
