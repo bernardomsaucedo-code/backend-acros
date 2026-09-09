@@ -96,10 +96,15 @@ async function asegurarEsquema() {
           correo        VARCHAR(190)      NULL,
           utm           VARCHAR(300)      NULL,
           origen        VARCHAR(60)       NULL,
+          cuestionario  TEXT              NULL,
           atendida      TINYINT(1)        NOT NULL DEFAULT 0,
           creado_en     DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
       `);
+      // "cuestionario" es nueva (08/09): si la tabla ya existía de antes
+      // (desplegada sin esta columna), se añade aquí sin tocar nada de lo
+      // que ya hubiera — CREATE TABLE IF NOT EXISTS no la habría creado sola.
+      await agregaColumnaSiFalta('solicitudes_presupuesto', 'cuestionario', 'TEXT NULL');
       await creaIndiceSiFalta('idx_presupuesto_atendida ON solicitudes_presupuesto (atendida, creado_en)');
 
       // --- NUEVO: clientes, propuestas, pagos, diligencias, acceso ---
@@ -208,6 +213,15 @@ async function creaIndiceSiFalta(definicion) {
     if (err.code !== 'ER_DUP_KEYNAME') throw err;
   }
 }
+// Igual que creaIndiceSiFalta, pero para columnas nuevas en tablas que ya
+// existían antes de que esa columna se añadiera al código.
+async function agregaColumnaSiFalta(tabla, columna, definicionTipo) {
+  try {
+    await pool.execute(`ALTER TABLE ${tabla} ADD COLUMN ${columna} ${definicionTipo}`);
+  } catch (err) {
+    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+  }
+}
 
 // ================================================================
 // "Llamadme gratis" — sin cambios.
@@ -217,15 +231,33 @@ function datosValidosLlamada(cuerpo) {
   const digitos = (cuerpo.telefono || '').replace(/\D/g, '');
   return nombre.length > 0 && digitos.length >= 9;
 }
+// Los formularios reales (acros_inicio.html / acros_empieza_aqui.html) NO
+// mandan un campo "origen" ni "utm" — mandan fuente/medio/campana sueltos
+// (estilo utm_source/utm_medium/utm_campaign) y un campo trampa "hp"
+// (honeypot: casilla invisible para humanos; si un bot la rellena, se
+// acepta la petición con normalidad pero no se guarda nada, para no
+// delatar el filtro). Sin esto, todo llegaba con origen/utm en blanco.
+function esSpam(cuerpo) { return !!(cuerpo.hp || '').toString().trim(); }
+function resolverAtribucion(cuerpo) {
+  const { fuente, medio, campana } = cuerpo;
+  const hayUtm = fuente || medio || campana;
+  const utm = cuerpo.utm
+    ? (typeof cuerpo.utm === 'string' ? cuerpo.utm : JSON.stringify(cuerpo.utm))
+    : (hayUtm ? JSON.stringify({ fuente, medio, campana }) : null);
+  const origen = (cuerpo.origen || fuente || null);
+  return { utm, origen: origen ? origen.toString().slice(0, 60) : null };
+}
 app.post('/api/llamada', async (req, res) => {
   if (!datosValidosLlamada(req.body)) {
     return res.status(400).json({ error: 'Nombre o teléfono no válidos' });
   }
-  const { nombre, telefono, origen } = req.body;
+  if (esSpam(req.body)) return res.status(201).json({ ok: true }); // honeypot: no se guarda, pero no se delata
+  const { nombre, telefono } = req.body;
+  const { origen } = resolverAtribucion(req.body);
   try {
     await pool.execute(
       'INSERT INTO solicitudes_llamada (nombre, telefono, origen) VALUES (?, ?, ?)',
-      [nombre.trim(), telefono.trim(), origen || null]
+      [nombre.trim(), telefono.trim(), origen]
     );
     res.status(201).json({ ok: true });
   } catch (err) {
@@ -251,17 +283,20 @@ app.post('/api/presupuesto', async (req, res) => {
   if (!datosPresupuestoValidos(req.body)) {
     return res.status(400).json({ error: 'Faltan servicios o el teléfono no es válido' });
   }
-  const { servicios, detalle, telefono, correo, utm, origen } = req.body;
+  if (esSpam(req.body)) return res.status(201).json({ ok: true }); // honeypot: no se guarda, pero no se delata
+  const { servicios, detalle, telefono, correo, cuestionario } = req.body;
+  const { utm, origen } = resolverAtribucion(req.body);
   try {
     await pool.execute(
-      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [
         Array.isArray(servicios) ? JSON.stringify(servicios) : servicios.toString().trim(),
         detalle ? detalle.toString().trim() : null,
         telefono.trim(),
         correo ? correo.toString().trim() : null,
-        utm ? JSON.stringify(utm) : null,
-        origen || null,
+        utm,
+        origen,
+        (cuestionario && Object.keys(cuestionario).length) ? JSON.stringify(cuestionario) : null,
       ]
     );
     res.status(201).json({ ok: true });
@@ -576,12 +611,15 @@ app.get('/api/admin/diligencias', requiereAdmin, async (req, res) => {
   const estado = req.query.estado;
   const conn = await pool.getConnection();
   try {
+    // c.tipo_documento/numero_documento (08/09): viven en clientes, no en
+    // diligencias — sin este JOIN, el panel del asesor no podía mostrar
+    // qué documento aportó el cliente.
     const [filas] = estado
       ? await conn.execute(
-          `SELECT d.*, c.correo, c.nombre, c.apellidos FROM diligencias d
+          `SELECT d.*, c.correo, c.nombre, c.apellidos, c.tipo_documento, c.numero_documento FROM diligencias d
            JOIN clientes c ON c.id = d.cliente_id WHERE d.estado = ? ORDER BY d.creado_en`, [estado])
       : await conn.execute(
-          `SELECT d.*, c.correo, c.nombre, c.apellidos FROM diligencias d
+          `SELECT d.*, c.correo, c.nombre, c.apellidos, c.tipo_documento, c.numero_documento FROM diligencias d
            JOIN clientes c ON c.id = d.cliente_id ORDER BY d.creado_en`);
     res.json(filas);
   } finally {
