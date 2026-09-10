@@ -8,25 +8,31 @@
 // despliega solo y, al arrancar, el propio programa se asegura de que las
 // tablas nuevas existan sin tocar las que ya tenías con datos.
 //
-// Qué hay aquí, en el orden en que se construyó:
-//   1. "Llamadme gratis"   → POST /api/llamada       (ya desplegado)
-//   2. "Pide presupuesto"  → POST /api/presupuesto    (ya desplegado — esto
-//      es la SOLICITUD del cliente, el formulario de contacto)
-//   3. "Propuesta formal"  → todo lo de abajo, NUEVO — esto es cuando TÚ,
-//      el asesor, ya has decidido el precio y se lo envías al cliente con
-//      un enlace para aceptar y pagar. Antes lo llamé "presupuesto" a
-//      secas, pero es fácil de confundir con el punto 2 — de ahí el
-//      cambio de nombre a "propuesta" en tablas y endpoints.
+// Qué cubre esto hoy (10/09), de menos a más reciente:
+//   - Formularios públicos: "Llamadme gratis" y "Pide presupuesto" (la
+//     SOLICITUD del cliente, no confundir con "propuesta" más abajo).
+//   - Propuestas: el asesor decide el precio y se lo envía al cliente con
+//     enlace mágico para aceptar y pagar (Bizum/transferencia/cripto/
+//     tarjeta — "tarjeta" sigue siendo autodeclarado hasta que haya Stripe
+//     real con su propio webhook).
+//   - Diligencia reforzada (KYC/PBC): cuestionario + documento de
+//     identidad cifrado, revisión del asesor con sus transiciones.
+//   - Documentación fiscal más allá del DNI: el asesor pide documentos,
+//     el cliente los sube cifrados igual que el DNI.
+//   - Documentos cifrados en Cloudflare R2 (RSA-4096 + AES-256, cifrado
+//     en el navegador del cliente — este servidor y R2 nunca ven el
+//     contenido en claro) + copia de seguridad.
+//   - Correo real por Brevo (con fallback a modo maqueta si faltan las
+//     claves) y enlaces mágicos de acceso/reentrada.
+//   - Cuentas de asesor con login propio (ya no una ADMIN_KEY compartida
+//     para el día a día) y rol de administrador.
+//   - Verificación automática de pagos cripto por hash (BTC/ETH/SOL +
+//     USDC/USDT) contra el explorador público de cada red.
 //
 // Alcance dejado fuera a propósito (para no llevarte una sorpresa):
-// - No hay pantalla en el panel todavía para "enviar propuesta" ni para
-//   "confirmar pago" — hoy estos endpoints solo se pueden probar con una
-//   herramienta como Postman, no con un botón en pantalla. Es el
-//   siguiente paso natural, no incluido en esta entrega.
-// - Sin envío de correos real: el enlace de la propuesta y el de acceso
-//   se devuelven en la respuesta en vez de mandarse por correo.
-// - "Tarjeta" se trata igual que un pago autodeclarado más, hasta que
-//   haya cuenta de Stripe real que conectar con su propio webhook.
+// - Stripe real: "tarjeta" se trata igual que un pago autodeclarado más.
+// - SITE_URL vacía todavía: los correos llevan el código en texto en vez
+//   de un enlace clicable, hasta que haya dominio real.
 
 require('dotenv').config();
 const express = require('express');
@@ -35,6 +41,19 @@ const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 const app = express();
+
+// Red de seguridad (10/09, encontrado mientras se probaba lo de asesores):
+// un error async que escape de una ruta sin pasar por su propio
+// try/catch (p. ej. una consulta contra una tabla que de pronto no
+// existe, o cualquier fallo de red con la base de datos a mitad de
+// petición) podía tirar abajo TODO el proceso — no solo esa petición,
+// sino el servidor entero para todos los clientes a la vez. Se registra
+// el error y el servidor sigue vivo; la petición que falló recibe su
+// error de todos modos (Express ya responde 500 antes de que esto se
+// dispare), pero las demás no se ven arrastradas.
+process.on('unhandledRejection', err => {
+  console.error('Unhandled rejection (el servidor sigue vivo):', err);
+});
 // Límite de payload subido a 15mb (04/09... 10/09: encontrado el bug real):
 // el límite por defecto de express.json() es 100kb. Los PDFs escaneados del
 // DNI suelen colar por debajo de eso, pero una foto de móvil (el caso normal
@@ -299,7 +318,57 @@ async function asegurarEsquema() {
       await creaIndiceSiFalta('idx_documentos_fiscales_propuesta ON documentos_fiscales (propuesta_id, estado)');
       await creaIndiceSiFalta('idx_documentos_fiscales_estado ON documentos_fiscales (estado, creado_en)');
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales).');
+      // --- Cuentas individuales de asesor (10/09) ---
+      // Sustituye la ADMIN_KEY compartida para el uso diario del panel.
+      // La ADMIN_KEY no desaparece: sigue existiendo como "clave maestra"
+      // solo para dar de alta cuentas nuevas (ver /api/admin/asesores),
+      // nunca para las acciones del día a día — esas ahora requieren una
+      // sesión de asesor real, y quedan atribuidas a quién las hizo.
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS asesores (
+          id                INT AUTO_INCREMENT PRIMARY KEY,
+          correo            VARCHAR(160)  NOT NULL UNIQUE,
+          nombre            VARCHAR(120)  NOT NULL,
+          contrasena_hash   VARCHAR(100)  NOT NULL,
+          activo            TINYINT(1)    NOT NULL DEFAULT 1,
+          es_admin          TINYINT(1)    NOT NULL DEFAULT 0,
+          creado_en         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      // "es_admin" es nueva (10/09, segunda vuelta): si la tabla ya
+      // existía de antes sin ella, se añade sola sin tocar nada de lo
+      // que ya hubiera.
+      await agregaColumnaSiFalta('asesores', 'es_admin', 'TINYINT(1) NOT NULL DEFAULT 0');
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS sesiones_asesor (
+          id            INT AUTO_INCREMENT PRIMARY KEY,
+          asesor_id     INT NOT NULL,
+          token         CHAR(48) NOT NULL UNIQUE,
+          expira_en     DATETIME NOT NULL,
+          creado_en     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (asesor_id) REFERENCES asesores(id)
+        )
+      `);
+      await creaIndiceSiFalta('idx_sesiones_asesor_token ON sesiones_asesor (token)');
+      // Atribución: quién resolvió/confirmó qué. NULL para todo lo de
+      // antes de esta fecha (no había manera de saberlo) y para lo que
+      // se siga resolviendo con la clave maestra directamente.
+      await agregaColumnaSiFalta('diligencias', 'resuelto_por_asesor_id', 'INT NULL');
+      await agregaColumnaSiFalta('documentos_fiscales', 'resuelto_por_asesor_id', 'INT NULL');
+      await agregaColumnaSiFalta('documentos_fiscales', 'pedido_por_asesor_id', 'INT NULL');
+      await agregaColumnaSiFalta('pagos', 'confirmado_por_asesor_id', 'INT NULL');
+      await agregaColumnaSiFalta('propuestas', 'creado_por_asesor_id', 'INT NULL');
+
+      // Verificación automática de cripto por hash (10/09, cuarta vuelta).
+      // "red"/"moneda_cripto"/"importe_cripto" no se guardaban hasta hoy
+      // — el cliente los elegía en pantalla pero solo viajaba el hash, así
+      // que no había con qué comparar la transacción real de la cadena.
+      await agregaColumnaSiFalta('pagos', 'red', "VARCHAR(10) NULL");
+      await agregaColumnaSiFalta('pagos', 'moneda_cripto', "VARCHAR(10) NULL");
+      await agregaColumnaSiFalta('pagos', 'importe_cripto', "VARCHAR(40) NULL");
+      await agregaColumnaSiFalta('pagos', 'verificado_auto', 'TINYINT(1) NOT NULL DEFAULT 0');
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -415,7 +484,7 @@ app.post('/api/presupuesto', async (req, res) => {
 // entrantes ("Llamadme gratis" y "Pide presupuesto"), 09/09. Hasta
 // ahora solo se podían consultar entrando a la base de datos a mano.
 // ================================================================
-app.get('/api/admin/llamadas', requiereAdmin, async (req, res) => {
+app.get('/api/admin/llamadas', requiereSesionAsesor, async (req, res) => {
   // 09/09: antes solo distinguía "pendientes" (atendida=0) de "todas" —
   // pedir expresamente las atendidas (atendida=1) devolvía TODAS sin
   // filtrar, mezclando pendientes y atendidas en el panel.
@@ -430,7 +499,7 @@ app.get('/api/admin/llamadas', requiereAdmin, async (req, res) => {
     conn.release();
   }
 });
-app.post('/api/admin/llamadas/:id/atender', requiereAdmin, async (req, res) => {
+app.post('/api/admin/llamadas/:id/atender', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [r] = await conn.execute('UPDATE solicitudes_llamada SET atendida = 1 WHERE id = ?', [req.params.id]);
@@ -442,7 +511,7 @@ app.post('/api/admin/llamadas/:id/atender', requiereAdmin, async (req, res) => {
 });
 // "Desatender" (09/09): por si se marcó por error o hace falta retomarla
 // — nunca se borra nada, solo se mueve entre pendiente/atendida.
-app.post('/api/admin/llamadas/:id/desatender', requiereAdmin, async (req, res) => {
+app.post('/api/admin/llamadas/:id/desatender', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [r] = await conn.execute('UPDATE solicitudes_llamada SET atendida = 0 WHERE id = ?', [req.params.id]);
@@ -453,7 +522,7 @@ app.post('/api/admin/llamadas/:id/desatender', requiereAdmin, async (req, res) =
   }
 });
 
-app.get('/api/admin/solicitudes-presupuesto', requiereAdmin, async (req, res) => {
+app.get('/api/admin/solicitudes-presupuesto', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     let filas;
@@ -465,7 +534,7 @@ app.get('/api/admin/solicitudes-presupuesto', requiereAdmin, async (req, res) =>
     conn.release();
   }
 });
-app.post('/api/admin/solicitudes-presupuesto/:id/atender', requiereAdmin, async (req, res) => {
+app.post('/api/admin/solicitudes-presupuesto/:id/atender', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 1 WHERE id = ?', [req.params.id]);
@@ -475,7 +544,7 @@ app.post('/api/admin/solicitudes-presupuesto/:id/atender', requiereAdmin, async 
     conn.release();
   }
 });
-app.post('/api/admin/solicitudes-presupuesto/:id/desatender', requiereAdmin, async (req, res) => {
+app.post('/api/admin/solicitudes-presupuesto/:id/desatender', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 0 WHERE id = ?', [req.params.id]);
@@ -495,11 +564,191 @@ const sumarDias = (fecha, dias) => new Date(fecha.getTime() + dias * 86400000);
 const sumarMinutos = (fecha, min) => new Date(fecha.getTime() + min * 60000);
 const aSQLDatetime = fecha => fecha.toISOString().slice(0, 19).replace('T', ' ');
 
-function requiereAdmin(req, res, next) {
+// Antes ("requiereAdmin") protegía TODO el panel con esta única clave
+// compartida. Ahora solo protege el alta de cuentas de asesor — el uso
+// diario pasa a requiereSesionAsesor, más abajo. Se mantiene con la
+// ADMIN_KEY de siempre a propósito: sirve de "llave maestra" para poder
+// crear la primera cuenta sin depender de que ya exista ninguna.
+function requiereClaveMaestra(req, res, next) {
   if (!ADMIN_KEY) return res.status(500).json({ error: 'ADMIN_KEY no configurada en el servidor' });
-  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ error: 'No autorizado' });
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ error: 'Clave maestra incorrecta' });
   next();
 }
+
+// ================================================================
+// CUENTAS INDIVIDUALES DE ASESOR (10/09) — sustituye la ADMIN_KEY
+// compartida para el uso diario. Cada acción del panel queda atribuida
+// a quién la hizo de verdad (req.asesor), no a "el panel" en general.
+// Contraseñas con bcrypt; sesiones con un token propio (no JWT — no hace
+// falta nada más elaborado para un equipo de un puñado de personas), con
+// caducidad larga (30 días) porque es una herramienta interna, no el
+// área de un cliente.
+// ================================================================
+const bcrypt = require('bcryptjs');
+const DIAS_VIGENCIA_SESION_ASESOR = 30;
+
+async function requiereSesionAsesor(req, res, next) {
+  const token = (req.get('x-sesion-token') || '').trim();
+  if (!token) return res.status(401).json({ error: 'Falta iniciar sesión' });
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT s.id AS sesion_id, s.expira_en, a.id, a.nombre, a.correo, a.activo, a.es_admin
+       FROM sesiones_asesor s JOIN asesores a ON a.id = s.asesor_id WHERE s.token = ?`, [token]
+    );
+    if (!filas.length) return res.status(401).json({ error: 'Sesión no válida. Vuelve a iniciar sesión.' });
+    const s = filas[0];
+    if (new Date(s.expira_en) < ahora()) return res.status(401).json({ error: 'Tu sesión ha caducado. Vuelve a iniciar sesión.' });
+    if (!s.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada.' });
+    req.asesor = { id: s.id, nombre: s.nombre, correo: s.correo, esAdmin: !!s.es_admin };
+    next();
+  } finally {
+    conn.release();
+  }
+}
+
+// Alta de un asesor nuevo — protegida por la clave maestra (ADMIN_KEY),
+// no por una sesión: así se puede dar de alta al primer asesor sin que
+// exista ninguna cuenta todavía. Pensada para usarse pocas veces (cada
+// vez que se incorpora alguien al equipo), no como login del día a día.
+app.post('/api/admin/asesores', requiereClaveMaestra, async (req, res) => {
+  const correo = (req.body.correo || '').trim().toLowerCase();
+  const nombre = (req.body.nombre || '').trim();
+  const contrasena = req.body.contrasena || '';
+  const esAdmin = req.body.es_admin ? 1 : 0;
+  if (!correo || !nombre) return res.status(400).json({ error: 'Faltan correo o nombre' });
+  if (contrasena.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  const conn = await pool.getConnection();
+  try {
+    const hash = await bcrypt.hash(contrasena, 10);
+    const [r] = await conn.execute('INSERT INTO asesores (correo, nombre, contrasena_hash, es_admin) VALUES (?,?,?,?)', [correo, nombre, hash, esAdmin]);
+    res.status(201).json({ ok: true, id: r.insertId });
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Ya existe un asesor con ese correo' });
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// Cambiar si un asesor YA existente es administrador o no — protegido
+// también por la clave maestra (no por sesión, ni siquiera de un
+// administrador): es un cambio de privilegios, mismo nivel de confianza
+// que dar de alta una cuenta nueva. Sirve para el caso de "se me olvidó
+// marcar la casilla al crear mi cuenta" sin tener que borrarla y
+// rehacerla.
+app.post('/api/admin/asesores/:id/rol', requiereClaveMaestra, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE asesores SET es_admin = ? WHERE id = ?', [req.body.es_admin ? 1 : 0, req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Asesor no encontrado' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+app.post('/api/admin/login', async (req, res) => {
+  const correo = (req.body.correo || '').trim().toLowerCase();
+  const contrasena = req.body.contrasena || '';
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT * FROM asesores WHERE correo = ?', [correo]);
+    // Mismo mensaje tanto si el correo no existe como si la contraseña es
+    // incorrecta — no hay que confirmar a quien intenta entrar cuáles de
+    // los dos falló.
+    const error = () => res.status(401).json({ error: 'Correo o contraseña incorrectos' });
+    if (!filas.length) return error();
+    const asesor = filas[0];
+    if (!asesor.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada' });
+    const ok = await bcrypt.compare(contrasena, asesor.contrasena_hash);
+    if (!ok) return error();
+    const token = crypto.randomBytes(24).toString('hex');
+    const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_ASESOR * 24 * 60 * 60 * 1000);
+    await conn.execute('INSERT INTO sesiones_asesor (asesor_id, token, expira_en) VALUES (?,?,?)', [asesor.id, token, aSQLDatetime(expira)]);
+    res.json({ ok: true, token, nombre: asesor.nombre, correo: asesor.correo, es_admin: !!asesor.es_admin, expira_en: expira.toISOString() });
+  } finally {
+    conn.release();
+  }
+});
+
+app.post('/api/admin/logout', requiereSesionAsesor, async (req, res) => {
+  const token = req.get('x-sesion-token');
+  const conn = await pool.getConnection();
+  try {
+    await conn.execute('DELETE FROM sesiones_asesor WHERE token = ?', [token]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// Cambiar la propia contraseña (10/09) — exige la actual, como cualquier
+// "cambiar contraseña" normal. De momento no invalida las demás sesiones
+// abiertas en otros navegadores (aparcado: no parece grave para un
+// equipo de un puñado de personas, pero queda anotado como pendiente).
+app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res) => {
+  const actual = req.body.contrasena_actual || '';
+  const nueva = req.body.contrasena_nueva || '';
+  if (nueva.length < 8) return res.status(400).json({ error: 'La contraseña nueva debe tener al menos 8 caracteres' });
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT contrasena_hash FROM asesores WHERE id = ?', [req.asesor.id]);
+    const ok = await bcrypt.compare(actual, filas[0].contrasena_hash);
+    if (!ok) return res.status(401).json({ error: 'Tu contraseña actual no es correcta' });
+    const hash = await bcrypt.hash(nueva, 10);
+    await conn.execute('UPDATE asesores SET contrasena_hash = ? WHERE id = ?', [hash, req.asesor.id]);
+    // Cierra todas las DEMÁS sesiones abiertas de este asesor (otro
+    // navegador, otro móvil...) — si el motivo para cambiarla era una
+    // sospecha de que alguien más tenía acceso, cambiar la contraseña
+    // sin esto no serviría de mucho, esa otra sesión seguiría viva hasta
+    // que caducase sola (30 días). La sesión actual (con la que se pidió
+    // el cambio) se mantiene, para no cerrar la sesión a quien lo acaba
+    // de hacer él mismo.
+    const tokenActual = req.get('x-sesion-token');
+    await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ? AND token != ?', [req.asesor.id, tokenActual]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// Listado de asesores (10/09) — para poder ver quién tiene cuenta y
+// desactivar a alguien que se va, sin tener que tocar la base de datos a
+// mano. Cualquier asesor con sesión puede verlo y activar/desactivar a
+// otros (equipo pequeño, no hace falta un rol de "superadmin" aparte) —
+// pero nadie puede desactivarse a sí mismo, para no quedarse fuera sin
+// querer y sin nadie más conectado en ese momento.
+app.get('/api/admin/asesores', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT id, nombre, correo, activo, es_admin, creado_en FROM asesores ORDER BY nombre');
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/asesores/:id/activo', requiereSesionAsesor, async (req, res) => {
+  // Solo un administrador puede activar/desactivar a otros asesores —
+  // cualquier asesor puede VER el listado, pero no tocarlo. Quién es
+  // administrador se decide al dar de alta la cuenta (o cambiando el rol
+  // después), en los dos casos con la clave maestra, nunca desde aquí.
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador puede activar o desactivar cuentas' });
+  if (Number(req.params.id) === req.asesor.id) {
+    return res.status(400).json({ error: 'No puedes activar o desactivar tu propia cuenta' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute('UPDATE asesores SET activo = ? WHERE id = ?', [req.body.activo ? 1 : 0, req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Asesor no encontrado' });
+    // Si se desactiva, sus sesiones abiertas se cierran también — si no,
+    // seguiría pudiendo actuar hasta que caducasen solas (30 días).
+    if (!req.body.activo) await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [req.params.id]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
 
 async function obtenerOCrearCliente(conn, { correo, telefono }) {
   const correoNorm = (correo || '').trim().toLowerCase();
@@ -541,7 +790,7 @@ function normalizarServiciosPropuesta(servicios, importeCentimosBody) {
   return { servicios, importe_centimos: importeCentimosBody };
 }
 
-app.post('/api/propuestas', requiereAdmin, async (req, res) => {
+app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
   const { correo, telefono, servicios, importe_centimos } = req.body;
   const normalizado = correo ? normalizarServiciosPropuesta(servicios, importe_centimos) : null;
   if (!correo || !normalizado) {
@@ -554,8 +803,8 @@ app.post('/api/propuestas', requiereAdmin, async (req, res) => {
     const token = generarToken();
     const expira = sumarDias(ahora(), 14);
     const [r] = await conn.execute(
-      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en) VALUES (?, ?, ?, ?, ?)',
-      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira)]
+      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id]
     );
     await conn.commit();
     if (brevoActivo()) {
@@ -700,13 +949,26 @@ app.post('/api/propuestas/:token/rechazar', async (req, res) => {
 // ================================================================
 const METODOS_PAGO = ['tarjeta', 'bizum', 'transferencia', 'cripto', 'otro'];
 
+const REDES_CRIPTO = ['btc', 'eth', 'sol'];
+const MONEDAS_CRIPTO = ['btc', 'eth', 'sol', 'usdc', 'usdt'];
+
 app.post('/api/propuestas/:token/pago', async (req, res) => {
-  const { metodo, hash_transaccion } = req.body;
+  const { metodo, hash_transaccion, red, moneda_cripto, importe_cripto } = req.body;
   if (!METODOS_PAGO.includes(metodo)) {
     return res.status(400).json({ error: `Método no válido. Debe ser uno de: ${METODOS_PAGO.join(', ')}` });
   }
-  if (metodo === 'cripto' && !(hash_transaccion || '').trim()) {
-    return res.status(400).json({ error: 'Falta el hash de la transacción, obligatorio para cripto' });
+  if (metodo === 'cripto') {
+    if (!(hash_transaccion || '').trim()) return res.status(400).json({ error: 'Falta el hash de la transacción, obligatorio para cripto' });
+    if (!REDES_CRIPTO.includes(red)) return res.status(400).json({ error: `Falta o no es válida la red. Debe ser una de: ${REDES_CRIPTO.join(', ')}` });
+    if (!MONEDAS_CRIPTO.includes(moneda_cripto)) return res.status(400).json({ error: `Falta o no es válida la moneda. Debe ser una de: ${MONEDAS_CRIPTO.join(', ')}` });
+    // El importe en cripto es solo orientativo (viene de CoinGecko en el
+    // navegador del cliente) — si esa consulta falló, no hay por qué
+    // bloquear el pago por eso; simplemente no se podrá intentar la
+    // verificación automática después, y quedará para revisión manual
+    // como hasta ahora.
+    if (importe_cripto !== undefined && importe_cripto !== null && (isNaN(Number(importe_cripto)) || Number(importe_cripto) <= 0)) {
+      return res.status(400).json({ error: 'El importe en cripto, si se manda, tiene que ser un número mayor que cero' });
+    }
   }
   const conn = await pool.getConnection();
   try {
@@ -714,8 +976,9 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'aceptada') return res.status(409).json({ error: `No se puede declarar el pago: la propuesta está "${p.estado}", no "aceptada"` });
     const [r] = await conn.execute(
-      'INSERT INTO pagos (propuesta_id, metodo, hash_transaccion) VALUES (?, ?, ?)',
-      [p.id, metodo, (hash_transaccion || '').trim() || null]
+      'INSERT INTO pagos (propuesta_id, metodo, hash_transaccion, red, moneda_cripto, importe_cripto) VALUES (?, ?, ?, ?, ?, ?)',
+      [p.id, metodo, (hash_transaccion || '').trim() || null, metodo === 'cripto' ? red : null,
+       metodo === 'cripto' ? moneda_cripto : null, metodo === 'cripto' ? String(importe_cripto) : null]
     );
     res.status(201).json({ ok: true, pago_id: r.insertId, estado: 'autodeclarado' });
   } finally {
@@ -723,7 +986,7 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
   }
 });
 
-app.get('/api/admin/pagos', requiereAdmin, async (req, res) => {
+app.get('/api/admin/pagos', requiereSesionAsesor, async (req, res) => {
   const estado = req.query.estado;
   const conn = await pool.getConnection();
   try {
@@ -744,14 +1007,182 @@ app.get('/api/admin/pagos', requiereAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/pagos/:id/confirmar', requiereAdmin, async (req, res) => {
+app.post('/api/admin/pagos/:id/confirmar', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT * FROM pagos WHERE id = ?', [req.params.id]);
     if (!filas.length) return res.status(404).json({ error: 'Pago no encontrado' });
     if (filas[0].estado === 'confirmado') return res.status(409).json({ error: 'Ese pago ya estaba confirmado' });
-    await conn.execute('UPDATE pagos SET estado = ?, confirmado_en = ? WHERE id = ?', ['confirmado', aSQLDatetime(ahora()), req.params.id]);
+    await conn.execute('UPDATE pagos SET estado = ?, confirmado_en = ?, confirmado_por_asesor_id = ? WHERE id = ?', ['confirmado', aSQLDatetime(ahora()), req.asesor.id, req.params.id]);
     res.json({ ok: true, estado: 'confirmado' });
+  } finally {
+    conn.release();
+  }
+});
+
+// ================================================================
+// VERIFICACIÓN AUTOMÁTICA DE CRIPTO POR HASH (10/09, "nivel 1" — ver
+// ACROS_WEB_ESTADO.md). Consulta el explorador público de la red
+// correspondiente y, si el hash es real, va a la dirección esperada,
+// el importe cuadra (con tolerancia, porque el tipo de cambio se movió
+// entre que el cliente vio el precio y envió la transacción) y tiene
+// al menos una confirmación, marca el pago como confirmado SOLO —
+// nunca rechaza nada por sí sola: si algo no cuadra o el explorador
+// falla, se queda tal cual para que el asesor lo revise a mano, como
+// hasta ahora. Direcciones esperadas: variables de entorno
+// (CRIPTO_DIRECCION_BTC/ETH/SOL) — las mismas que ya usa Vikn en
+// `acros_area.html` (constante DATOS_PAGO), todavía sin rellenar con
+// las reales (ver Plan de ruta) — sin ellas configuradas, se avisa con
+// claridad en vez de fallar en silencio.
+// URLs de los tres exploradores/RPC configurables por variable de
+// entorno — útil tanto para poder apuntar a otro proveedor si el
+// público da problemas de límite de peticiones, como para las pruebas
+// (apuntan a un simulador local, nunca a la red real).
+// ================================================================
+const EXPLORER_BTC_URL = process.env.EXPLORER_BTC_URL || 'https://mempool.space/api';
+const EXPLORER_ETH_RPC_URL = process.env.EXPLORER_ETH_RPC_URL || 'https://eth.llamarpc.com';
+const EXPLORER_SOL_RPC_URL = process.env.EXPLORER_SOL_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const TOLERANCIA_IMPORTE_CRIPTO = 0.03; // 3% — el precio se mueve entre que se calcula y se envía
+
+// Contratos ERC-20 (Ethereum mainnet) y mints SPL (Solana mainnet) de
+// las dos stablecoins aceptadas — hace falta conocerlos para leer el
+// Transfer real en vez de solo mirar el "to"/"value" nativo de la tx.
+const CONTRATOS_ERC20 = {
+  usdc: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+  usdt: '0xdac17f958d2ee523a2206206994597c13d831ec7',
+};
+const MINTS_SPL = {
+  usdc: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  usdt: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+};
+const TOPIC_TRANSFER_ERC20 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+function importeDentroDeTolerancia(real, esperado) {
+  if (!esperado) return true; // sin importe orientativo guardado, no se puede comparar — no bloquea, solo no aporta esa comprobación
+  const diferencia = Math.abs(real - esperado) / esperado;
+  return diferencia <= TOLERANCIA_IMPORTE_CRIPTO;
+}
+
+async function verificarBTC(hash, direccionEsperada, importeEsperado) {
+  const { data } = await axios.get(`${EXPLORER_BTC_URL}/tx/${hash}`);
+  if (!data || !data.status) return { ok: false, motivo: 'Transacción no encontrada en mempool.space' };
+  if (!data.status.confirmed) return { ok: false, motivo: 'Todavía sin confirmar en la red Bitcoin' };
+  const salida = (data.vout || []).find(v => (v.scriptpubkey_address || '').toLowerCase() === direccionEsperada.toLowerCase());
+  if (!salida) return { ok: false, motivo: 'Esa transacción no envía nada a la dirección esperada' };
+  const btcReal = salida.value / 1e8; // sats -> BTC
+  if (!importeDentroDeTolerancia(btcReal, importeEsperado)) {
+    return { ok: false, motivo: `El importe (${btcReal} BTC) no coincide con el esperado (${importeEsperado} BTC)` };
+  }
+  return { ok: true, detalles: { importe_real: btcReal, confirmaciones: 1 } };
+}
+
+async function llamarRpc(url, metodo, params) {
+  const { data } = await axios.post(url, { jsonrpc: '2.0', id: 1, method: metodo, params });
+  if (data.error) throw new Error(data.error.message || 'Error del nodo RPC');
+  return data.result;
+}
+
+async function verificarETH(hash, direccionEsperada, moneda, importeEsperado) {
+  const recibo = await llamarRpc(EXPLORER_ETH_RPC_URL, 'eth_getTransactionReceipt', [hash]);
+  if (!recibo) return { ok: false, motivo: 'Transacción no encontrada (o todavía pendiente) en la red Ethereum' };
+  if (recibo.status !== '0x1') return { ok: false, motivo: 'La transacción existe pero falló en la cadena' };
+  if (moneda === 'eth') {
+    const tx = await llamarRpc(EXPLORER_ETH_RPC_URL, 'eth_getTransactionByHash', [hash]);
+    if (!tx || (tx.to || '').toLowerCase() !== direccionEsperada.toLowerCase()) {
+      return { ok: false, motivo: 'Esa transacción no envía nada a la dirección esperada' };
+    }
+    const ethReal = Number(BigInt(tx.value)) / 1e18;
+    if (!importeDentroDeTolerancia(ethReal, importeEsperado)) {
+      return { ok: false, motivo: `El importe (${ethReal} ETH) no coincide con el esperado (${importeEsperado} ETH)` };
+    }
+    return { ok: true, detalles: { importe_real: ethReal } };
+  }
+  // USDC/USDT: hay que leer el evento Transfer de los logs, no el "value"
+  // nativo de la transacción (que para un envío de token es 0).
+  const contrato = CONTRATOS_ERC20[moneda];
+  if (!contrato) return { ok: false, motivo: `Moneda "${moneda}" no soportada en Ethereum` };
+  const direccionPadded = '0x' + direccionEsperada.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+  const log = (recibo.logs || []).find(l =>
+    (l.address || '').toLowerCase() === contrato && (l.topics || [])[0] === TOPIC_TRANSFER_ERC20 && (l.topics || [])[2] === direccionPadded
+  );
+  if (!log) return { ok: false, motivo: 'Esa transacción no incluye ningún envío de esta stablecoin a la dirección esperada' };
+  const importeReal = Number(BigInt(log.data)) / 1e6; // USDC/USDT: 6 decimales en Ethereum
+  if (!importeDentroDeTolerancia(importeReal, importeEsperado)) {
+    return { ok: false, motivo: `El importe (${importeReal} ${moneda.toUpperCase()}) no coincide con el esperado (${importeEsperado})` };
+  }
+  return { ok: true, detalles: { importe_real: importeReal } };
+}
+
+async function verificarSOL(hash, direccionEsperada, moneda, importeEsperado) {
+  const tx = await llamarRpc(EXPLORER_SOL_RPC_URL, 'getTransaction', [hash, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
+  if (!tx) return { ok: false, motivo: 'Transacción no encontrada en la red Solana' };
+  if (tx.meta && tx.meta.err) return { ok: false, motivo: 'La transacción existe pero falló en la cadena' };
+  const claves = tx.transaction.message.accountKeys.map(k => (k.pubkey || k));
+  if (moneda === 'sol') {
+    const indice = claves.findIndex(k => k === direccionEsperada);
+    if (indice === -1) return { ok: false, motivo: 'Esa dirección no participa en la transacción' };
+    const antes = tx.meta.preBalances[indice], despues = tx.meta.postBalances[indice];
+    const solReal = (despues - antes) / 1e9; // lamports -> SOL
+    if (solReal <= 0) return { ok: false, motivo: 'Esa dirección no recibió SOL en esta transacción' };
+    if (!importeDentroDeTolerancia(solReal, importeEsperado)) {
+      return { ok: false, motivo: `El importe (${solReal} SOL) no coincide con el esperado (${importeEsperado} SOL)` };
+    }
+    return { ok: true, detalles: { importe_real: solReal } };
+  }
+  const mint = MINTS_SPL[moneda];
+  if (!mint) return { ok: false, motivo: `Moneda "${moneda}" no soportada en Solana` };
+  // El campo "owner" (con encoding jsonParsed) ya es la wallet del titular
+  // del token, no la cuenta asociada (ATA) — comparar contra eso es lo
+  // correcto; comparar contra accountKeys[accountIndex] compararía con la
+  // dirección de la ATA, que es distinta de la wallet real del cliente.
+  const antes = (tx.meta.preTokenBalances || []).find(b => b.mint === mint && b.owner === direccionEsperada);
+  const despues = (tx.meta.postTokenBalances || []).find(b => b.mint === mint && b.owner === direccionEsperada);
+  if (!despues) return { ok: false, motivo: 'Esa transacción no incluye ningún envío de esta stablecoin a la dirección esperada' };
+  const importeReal = Number(despues.uiTokenAmount.uiAmount || 0) - Number(antes ? antes.uiTokenAmount.uiAmount || 0 : 0);
+  if (!importeDentroDeTolerancia(importeReal, importeEsperado)) {
+    return { ok: false, motivo: `El importe (${importeReal} ${moneda.toUpperCase()}) no coincide con el esperado (${importeEsperado})` };
+  }
+  return { ok: true, detalles: { importe_real: importeReal } };
+}
+
+const DIRECCIONES_ESPERADAS = {
+  btc: process.env.CRIPTO_DIRECCION_BTC,
+  eth: process.env.CRIPTO_DIRECCION_ETH,
+  sol: process.env.CRIPTO_DIRECCION_SOL,
+};
+
+app.post('/api/admin/pagos/:id/verificar-cripto', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT * FROM pagos WHERE id = ?', [req.params.id]);
+    if (!filas.length) return res.status(404).json({ error: 'Pago no encontrado' });
+    const pago = filas[0];
+    if (pago.metodo !== 'cripto') return res.status(400).json({ error: 'Este pago no es en cripto' });
+    if (pago.estado === 'confirmado') return res.status(409).json({ error: 'Ese pago ya estaba confirmado' });
+    if (!pago.hash_transaccion || !pago.red || !pago.moneda_cripto) {
+      return res.status(400).json({ error: 'A este pago le falta la red, la moneda o el hash — no se puede verificar automáticamente' });
+    }
+    const direccionEsperada = DIRECCIONES_ESPERADAS[pago.red];
+    if (!direccionEsperada) {
+      return res.status(500).json({ error: `Falta configurar CRIPTO_DIRECCION_${pago.red.toUpperCase()} en el servidor — sin eso no hay con qué comparar` });
+    }
+    const importeEsperado = pago.importe_cripto ? Number(pago.importe_cripto) : null;
+    let resultado;
+    try {
+      if (pago.red === 'btc') resultado = await verificarBTC(pago.hash_transaccion, direccionEsperada, importeEsperado);
+      else if (pago.red === 'eth') resultado = await verificarETH(pago.hash_transaccion, direccionEsperada, pago.moneda_cripto, importeEsperado);
+      else if (pago.red === 'sol') resultado = await verificarSOL(pago.hash_transaccion, direccionEsperada, pago.moneda_cripto, importeEsperado);
+      else return res.status(400).json({ error: `Red "${pago.red}" no soportada` });
+    } catch (err) {
+      console.error('Error consultando el explorador para verificar un pago cripto:', err.message);
+      return res.status(502).json({ error: 'No se pudo consultar el explorador de la red ahora mismo. Puedes reintentarlo, o confirmarlo a mano si ya lo has comprobado tú.' });
+    }
+    if (!resultado.ok) return res.json({ ok: true, verificado: false, motivo: resultado.motivo });
+    await conn.execute(
+      'UPDATE pagos SET estado = ?, confirmado_en = ?, verificado_auto = 1 WHERE id = ?',
+      ['confirmado', aSQLDatetime(ahora()), req.params.id]
+    );
+    res.json({ ok: true, verificado: true, estado: 'confirmado', detalles: resultado.detalles });
   } finally {
     conn.release();
   }
@@ -822,7 +1253,7 @@ app.post('/api/propuestas/:token/documento-identidad', async (req, res) => {
 // El asesor recupera el documento (sigue cifrado) para descifrarlo en su
 // propio navegador con su clave privada — este servidor solo hace de
 // intermediario entre R2 y el panel, nunca ve el contenido en claro.
-app.get('/api/admin/diligencias/:id/documento', requiereAdmin, async (req, res) => {
+app.get('/api/admin/diligencias/:id/documento', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime FROM diligencias WHERE id = ?', [req.params.id]);
@@ -850,7 +1281,7 @@ app.get('/api/admin/diligencias/:id/documento', requiereAdmin, async (req, res) 
 // vez en cuando y guardarlo aparte (protección contra perder Railway/R2
 // Y contra perder el propio ordenador, no solo uno de los dos).
 const archiver = require('archiver');
-app.get('/api/admin/documentos/backup', requiereAdmin, async (req, res) => {
+app.get('/api/admin/documentos/backup', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [dniFilas] = await conn.execute(
@@ -949,20 +1380,30 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
   }
 });
 
-app.get('/api/admin/diligencias', requiereAdmin, async (req, res) => {
+app.get('/api/admin/diligencias', requiereSesionAsesor, async (req, res) => {
   const estado = req.query.estado;
   const conn = await pool.getConnection();
   try {
     // c.tipo_documento/numero_documento (08/09): viven en clientes, no en
     // diligencias — sin este JOIN, el panel del asesor no podía mostrar
-    // qué documento aportó el cliente.
+    // qué documento aportó el cliente. asesor_cartera (10/09): quién creó
+    // la propuesta de este cliente — da contexto de "de quién es" aunque
+    // la diligencia en sí todavía no la haya resuelto nadie.
+    const columnas = `d.*, c.correo, c.nombre, c.apellidos, c.tipo_documento, c.numero_documento,
+              ac.nombre AS asesor_cartera`;
     const [filas] = estado
       ? await conn.execute(
-          `SELECT d.*, c.correo, c.nombre, c.apellidos, c.tipo_documento, c.numero_documento FROM diligencias d
-           JOIN clientes c ON c.id = d.cliente_id WHERE d.estado = ? ORDER BY d.creado_en`, [estado])
+          `SELECT ${columnas} FROM diligencias d
+           JOIN clientes c ON c.id = d.cliente_id
+           LEFT JOIN propuestas p ON p.id = d.propuesta_id
+           LEFT JOIN asesores ac ON ac.id = p.creado_por_asesor_id
+           WHERE d.estado = ? ORDER BY d.creado_en`, [estado])
       : await conn.execute(
-          `SELECT d.*, c.correo, c.nombre, c.apellidos, c.tipo_documento, c.numero_documento FROM diligencias d
-           JOIN clientes c ON c.id = d.cliente_id ORDER BY d.creado_en`);
+          `SELECT ${columnas} FROM diligencias d
+           JOIN clientes c ON c.id = d.cliente_id
+           LEFT JOIN propuestas p ON p.id = d.propuesta_id
+           LEFT JOIN asesores ac ON ac.id = p.creado_por_asesor_id
+           ORDER BY d.creado_en`);
     res.json(filas);
   } finally {
     conn.release();
@@ -975,7 +1416,7 @@ const ACCIONES_DILIGENCIA = {
   rechazar: [['examen'], 'rechazado'],
 };
 
-app.post('/api/admin/diligencias/:id/resolver', requiereAdmin, async (req, res) => {
+app.post('/api/admin/diligencias/:id/resolver', requiereSesionAsesor, async (req, res) => {
   const { accion, coherencia, nota } = req.body;
   const regla = ACCIONES_DILIGENCIA[accion];
   if (!regla) return res.status(400).json({ error: 'Acción no válida. Debe ser: aprobar, examen o rechazar' });
@@ -992,8 +1433,8 @@ app.post('/api/admin/diligencias/:id/resolver', requiereAdmin, async (req, res) 
       return res.status(409).json({ error: `Acción "${accion}" no permitida desde el estado "${d.estado}"` });
     }
     await conn.execute(
-      'UPDATE diligencias SET estado = ?, coherencia = COALESCE(?, coherencia), nota_asesor = COALESCE(?, nota_asesor), resuelto_en = ? WHERE id = ?',
-      [estadoResultante, coherencia || null, nota || null, aSQLDatetime(ahora()), d.id]
+      'UPDATE diligencias SET estado = ?, coherencia = COALESCE(?, coherencia), nota_asesor = COALESCE(?, nota_asesor), resuelto_en = ?, resuelto_por_asesor_id = ? WHERE id = ?',
+      [estadoResultante, coherencia || null, nota || null, aSQLDatetime(ahora()), req.asesor.id, d.id]
     );
     if (accion === 'rechazar') {
       await conn.execute('UPDATE clientes SET estado = ? WHERE id = ?', ['inerte', d.cliente_id]);
@@ -1019,7 +1460,7 @@ app.post('/api/admin/diligencias/:id/resolver', requiereAdmin, async (req, res) 
 // los que de verdad tiene sentido pedirles un documento fiscal (antes de
 // eso, la sección de Documentación en su área sigue bloqueada). Sirve
 // para el desplegable de "pedir documento nuevo" del panel.
-app.get('/api/admin/clientes-activos', requiereAdmin, async (req, res) => {
+app.get('/api/admin/clientes-activos', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
@@ -1035,7 +1476,7 @@ app.get('/api/admin/clientes-activos', requiereAdmin, async (req, res) => {
 
 // El asesor pide un documento nuevo a un cliente concreto (equivalente al
 // formulario "Vista asesor · pedir documento nuevo" de la maqueta).
-app.post('/api/admin/documentos', requiereAdmin, async (req, res) => {
+app.post('/api/admin/documentos', requiereSesionAsesor, async (req, res) => {
   const { propuesta_id, servicio, nombre, urgente } = req.body;
   if (!propuesta_id || !(nombre || '').trim()) {
     return res.status(400).json({ error: 'Faltan propuesta_id o nombre' });
@@ -1045,8 +1486,8 @@ app.post('/api/admin/documentos', requiereAdmin, async (req, res) => {
     const [propuestas] = await conn.execute('SELECT id, cliente_id FROM propuestas WHERE id = ?', [propuesta_id]);
     if (!propuestas.length) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [r] = await conn.execute(
-      'INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, urgente) VALUES (?,?,?,?,?)',
-      [propuestas[0].cliente_id, propuesta_id, servicio || null, nombre.trim(), urgente ? 1 : 0]
+      'INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, urgente, pedido_por_asesor_id) VALUES (?,?,?,?,?,?)',
+      [propuestas[0].cliente_id, propuesta_id, servicio || null, nombre.trim(), urgente ? 1 : 0, req.asesor.id]
     );
     res.status(201).json({ ok: true, id: r.insertId });
   } finally {
@@ -1056,24 +1497,32 @@ app.post('/api/admin/documentos', requiereAdmin, async (req, res) => {
 
 // Cola del panel: todos los documentos pedidos/enviados, opcionalmente
 // filtrados por estado (p. ej. ?estado=enviado para la cola de revisión).
-app.get('/api/admin/documentos', requiereAdmin, async (req, res) => {
+app.get('/api/admin/documentos', requiereSesionAsesor, async (req, res) => {
   const estado = req.query.estado;
   const conn = await pool.getConnection();
   try {
     // OJO: documentos_fiscales y clientes tienen las dos una columna
     // "nombre" (el nombre del documento vs. el nombre de pila) — con
     // SELECT d.*, c.nombre chocarían y una pisaría a la otra en el
-    // objeto resultado. Se renombran las dos explícitamente.
+    // objeto resultado. Se renombran las dos explícitamente. asesor_pide
+    // (10/09): quién lo pidió — tiene sentido mostrarlo ya en la cola de
+    // revisión, a diferencia de "quién lo resolvió" (que por definición
+    // todavía es nadie mientras siga en esta cola).
     const columnas = `d.id, d.cliente_id, d.propuesta_id, d.servicio, d.nombre AS nombre_doc, d.urgente,
               d.estado, d.razon_rechazo, d.subido_en, d.creado_en,
-              c.correo, c.nombre AS nombre_cliente, c.apellidos`;
+              c.correo, c.nombre AS nombre_cliente, c.apellidos,
+              ap.nombre AS asesor_pide`;
     const [filas] = estado
       ? await conn.execute(
           `SELECT ${columnas} FROM documentos_fiscales d
-           JOIN clientes c ON c.id = d.cliente_id WHERE d.estado = ? ORDER BY d.urgente DESC, d.creado_en`, [estado])
+           JOIN clientes c ON c.id = d.cliente_id
+           LEFT JOIN asesores ap ON ap.id = d.pedido_por_asesor_id
+           WHERE d.estado = ? ORDER BY d.urgente DESC, d.creado_en`, [estado])
       : await conn.execute(
           `SELECT ${columnas} FROM documentos_fiscales d
-           JOIN clientes c ON c.id = d.cliente_id ORDER BY d.urgente DESC, d.creado_en`);
+           JOIN clientes c ON c.id = d.cliente_id
+           LEFT JOIN asesores ap ON ap.id = d.pedido_por_asesor_id
+           ORDER BY d.urgente DESC, d.creado_en`);
     res.json(filas);
   } finally {
     conn.release();
@@ -1083,7 +1532,7 @@ app.get('/api/admin/documentos', requiereAdmin, async (req, res) => {
 // El asesor retira una solicitud que ya no hace falta — solo si el
 // cliente no ha subido nada todavía (si ya envió algo, hay que
 // resolverlo con /revisar, no desaparecerlo sin más).
-app.delete('/api/admin/documentos/:id', requiereAdmin, async (req, res) => {
+app.delete('/api/admin/documentos/:id', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT estado FROM documentos_fiscales WHERE id = ?', [req.params.id]);
@@ -1135,7 +1584,7 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
 
 // El asesor recupera el archivo (sigue cifrado) para descifrarlo en su
 // propio navegador con su clave privada — igual que con el DNI.
-app.get('/api/admin/documentos/:id/descargar', requiereAdmin, async (req, res) => {
+app.get('/api/admin/documentos/:id/descargar', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime FROM documentos_fiscales WHERE id = ?', [req.params.id]);
@@ -1157,7 +1606,7 @@ app.get('/api/admin/documentos/:id/descargar', requiereAdmin, async (req, res) =
 const ACCIONES_DOCUMENTO = { valido: 'valido', rechazar: 'rechazado' };
 
 // El asesor valida o rechaza (con motivo) un documento ya enviado.
-app.post('/api/admin/documentos/:id/revisar', requiereAdmin, async (req, res) => {
+app.post('/api/admin/documentos/:id/revisar', requiereSesionAsesor, async (req, res) => {
   const { accion, razon } = req.body;
   const estadoResultante = ACCIONES_DOCUMENTO[accion];
   if (!estadoResultante) return res.status(400).json({ error: 'Acción no válida. Debe ser: valido o rechazar' });
@@ -1172,8 +1621,8 @@ app.post('/api/admin/documentos/:id/revisar', requiereAdmin, async (req, res) =>
       return res.status(409).json({ error: `Solo se puede revisar un documento en estado "enviado" (actual: "${filas[0].estado}")` });
     }
     await conn.execute(
-      'UPDATE documentos_fiscales SET estado = ?, razon_rechazo = ? WHERE id = ?',
-      [estadoResultante, accion === 'rechazar' ? razon.trim() : null, req.params.id]
+      'UPDATE documentos_fiscales SET estado = ?, razon_rechazo = ?, resuelto_por_asesor_id = ? WHERE id = ?',
+      [estadoResultante, accion === 'rechazar' ? razon.trim() : null, req.asesor.id, req.params.id]
     );
     res.json({ ok: true, estado: estadoResultante });
   } finally {

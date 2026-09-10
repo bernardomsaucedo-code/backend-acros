@@ -82,6 +82,10 @@ CREATE TABLE IF NOT EXISTS pagos (
   hash_transaccion  VARCHAR(120) NULL,
   estado            ENUM('autodeclarado','confirmado') NOT NULL DEFAULT 'autodeclarado',
   confirmado_en     DATETIME NULL,
+  red               VARCHAR(10) NULL,
+  moneda_cripto     VARCHAR(10) NULL,
+  importe_cripto    VARCHAR(40) NULL,
+  verificado_auto   TINYINT(1) NOT NULL DEFAULT 0,
   creado_en         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (propuesta_id) REFERENCES propuestas(id)
 );
@@ -158,3 +162,36 @@ CREATE TABLE IF NOT EXISTS documentos_fiscales (
 );
 CREATE INDEX idx_documentos_fiscales_propuesta ON documentos_fiscales (propuesta_id, estado);
 CREATE INDEX idx_documentos_fiscales_estado ON documentos_fiscales (estado, creado_en);
+
+-- ============================================================
+-- CUENTAS INDIVIDUALES DE ASESOR (10/09) — sustituye la ADMIN_KEY
+-- compartida para el uso diario. La ADMIN_KEY sigue existiendo, pero
+-- solo como "clave maestra" para dar de alta cuentas nuevas.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS asesores (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  correo            VARCHAR(160)  NOT NULL UNIQUE,
+  nombre            VARCHAR(120)  NOT NULL,
+  contrasena_hash   VARCHAR(100)  NOT NULL,
+  activo            TINYINT(1)    NOT NULL DEFAULT 1,
+  es_admin          TINYINT(1)    NOT NULL DEFAULT 0,
+  creado_en         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sesiones_asesor (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  asesor_id     INT NOT NULL,
+  token         CHAR(48) NOT NULL UNIQUE,
+  expira_en     DATETIME NOT NULL,
+  creado_en     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (asesor_id) REFERENCES asesores(id)
+);
+CREATE INDEX idx_sesiones_asesor_token ON sesiones_asesor (token);
+
+-- Atribución (10/09): quién hizo qué. NULL para lo anterior a esta fecha
+-- (no había manera de saberlo) y para lo resuelto con la clave maestra.
+ALTER TABLE diligencias ADD COLUMN resuelto_por_asesor_id INT NULL;
+ALTER TABLE documentos_fiscales ADD COLUMN resuelto_por_asesor_id INT NULL;
+ALTER TABLE documentos_fiscales ADD COLUMN pedido_por_asesor_id INT NULL;
+ALTER TABLE pagos ADD COLUMN confirmado_por_asesor_id INT NULL;
+ALTER TABLE propuestas ADD COLUMN creado_por_asesor_id INT NULL;
