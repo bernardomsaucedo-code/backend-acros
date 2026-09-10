@@ -35,7 +35,16 @@ const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 const app = express();
-app.use(express.json());
+// Límite de payload subido a 15mb (04/09... 10/09: encontrado el bug real):
+// el límite por defecto de express.json() es 100kb. Los PDFs escaneados del
+// DNI suelen colar por debajo de eso, pero una foto de móvil (el caso normal
+// si el cliente sube una imagen en vez de un PDF) pesa varios MB y en
+// base64 crece ~33% más — así que toda subida de imagen quedaba rechazada
+// con 413 antes de llegar siquiera al route handler, mientras los PDF (más
+// comprimidos) pasaban. No era un problema de tipo de archivo, era de
+// tamaño. 15mb cubre con margen una foto de cámara de móvil típica ya en
+// base64.
+app.use(express.json({ limit: '15mb' }));
 
 // Bug real encontrado y corregido (08/09): con ORIGENES_PERMITIDOS=* el
 // .split(',') de antes convertía "*" en el ARRAY ['*'] — y el paquete
@@ -260,7 +269,37 @@ async function asegurarEsquema() {
       `);
       await creaIndiceSiFalta('idx_tokens_acceso_token ON tokens_acceso (token)');
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso).');
+      // --- Documentación fiscal más allá del DNI (10/09) ---
+      // Reutiliza el mismo patrón de cifrado ya construido para el DNI
+      // (RSA-OAEP + AES-GCM en el navegador del cliente): este servidor y
+      // R2 solo mueven bytes que no pueden leer. A diferencia del DNI (uno
+      // por diligencia), aquí puede haber varios documentos por encargo,
+      // pedidos por el asesor uno a uno — igual que ya hacía la maqueta de
+      // "Documentación" en acros_area.html, ahora conectado de verdad.
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS documentos_fiscales (
+          id                INT AUTO_INCREMENT PRIMARY KEY,
+          cliente_id        INT NOT NULL,
+          propuesta_id      INT NOT NULL,
+          servicio          VARCHAR(50) NULL,
+          nombre            VARCHAR(255) NOT NULL,
+          urgente           TINYINT(1) NOT NULL DEFAULT 0,
+          estado            ENUM('pendiente','enviado','valido','rechazado') NOT NULL DEFAULT 'pendiente',
+          razon_rechazo     VARCHAR(300) NULL,
+          documento_ref     VARCHAR(300) NULL,
+          documento_iv      VARCHAR(50) NULL,
+          documento_clave_cifrada VARCHAR(1000) NULL,
+          documento_tipo_mime VARCHAR(100) NULL,
+          subido_en         DATETIME NULL,
+          creado_en         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (cliente_id) REFERENCES clientes(id),
+          FOREIGN KEY (propuesta_id) REFERENCES propuestas(id)
+        )
+      `);
+      await creaIndiceSiFalta('idx_documentos_fiscales_propuesta ON documentos_fiscales (propuesta_id, estado)');
+      await creaIndiceSiFalta('idx_documentos_fiscales_estado ON documentos_fiscales (estado, creado_en)');
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -377,12 +416,15 @@ app.post('/api/presupuesto', async (req, res) => {
 // ahora solo se podían consultar entrando a la base de datos a mano.
 // ================================================================
 app.get('/api/admin/llamadas', requiereAdmin, async (req, res) => {
-  const soloPendientes = req.query.atendida === '0';
+  // 09/09: antes solo distinguía "pendientes" (atendida=0) de "todas" —
+  // pedir expresamente las atendidas (atendida=1) devolvía TODAS sin
+  // filtrar, mezclando pendientes y atendidas en el panel.
   const conn = await pool.getConnection();
   try {
-    const [filas] = soloPendientes
-      ? await conn.execute('SELECT * FROM solicitudes_llamada WHERE atendida = 0 ORDER BY creado_en')
-      : await conn.execute('SELECT * FROM solicitudes_llamada ORDER BY creado_en DESC LIMIT 100');
+    let filas;
+    if (req.query.atendida === '0') [filas] = await conn.execute('SELECT * FROM solicitudes_llamada WHERE atendida = 0 ORDER BY creado_en');
+    else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT * FROM solicitudes_llamada WHERE atendida = 1 ORDER BY creado_en DESC');
+    else [filas] = await conn.execute('SELECT * FROM solicitudes_llamada ORDER BY creado_en DESC LIMIT 100');
     res.json(filas);
   } finally {
     conn.release();
@@ -412,12 +454,12 @@ app.post('/api/admin/llamadas/:id/desatender', requiereAdmin, async (req, res) =
 });
 
 app.get('/api/admin/solicitudes-presupuesto', requiereAdmin, async (req, res) => {
-  const soloPendientes = req.query.atendida === '0';
   const conn = await pool.getConnection();
   try {
-    const [filas] = soloPendientes
-      ? await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 0 ORDER BY creado_en')
-      : await conn.execute('SELECT * FROM solicitudes_presupuesto ORDER BY creado_en DESC LIMIT 100');
+    let filas;
+    if (req.query.atendida === '0') [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 0 ORDER BY creado_en');
+    else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 1 ORDER BY creado_en DESC');
+    else [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto ORDER BY creado_en DESC LIMIT 100');
     res.json(filas);
   } finally {
     conn.release();
@@ -575,11 +617,25 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
     const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento FROM clientes WHERE id = ?', [p.cliente_id]);
     const [pagos] = await conn.execute('SELECT metodo, estado, hash_transaccion, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
     const [diligencias] = await conn.execute('SELECT estado, coherencia, resuelto_en FROM diligencias WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
+    // Solo interesa mandar la lista de documentos una vez la diligencia está
+    // aprobada — antes de eso la sección sigue bloqueada en el navegador, y
+    // no hace falta el viaje de más. El propio documento cifrado no viaja
+    // aquí (solo referencia/estado): el archivo se pide aparte, igual que
+    // el del DNI.
+    let documentos = [];
+    if (diligencias[0] && diligencias[0].estado === 'aprobado') {
+      const [filas] = await conn.execute(
+        'SELECT id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en FROM documentos_fiscales WHERE propuesta_id = ? ORDER BY creado_en',
+        [p.id]
+      );
+      documentos = filas;
+    }
     res.json({
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
       diligencia: diligencias[0] || null,
+      documentos,
     });
   } finally {
     conn.release();
@@ -785,21 +841,28 @@ app.get('/api/admin/diligencias/:id/documento', requiereAdmin, async (req, res) 
   }
 });
 
-// Copia de seguridad completa (09/09) — TODOS los documentos cifrados
-// que hay en R2, en un único .zip, junto con un manifiesto con lo que
-// hace falta para descifrar cada uno (iv + clave AES cifrada). Sigue
-// viajando todo cifrado — la copia en el propio dispositivo de Vikn es
-// tan ilegible para cualquier otro como el original en R2. Pensado para
-// pulsarlo de vez en cuando y guardarlo aparte (protección contra perder
-// Railway/R2 Y contra perder el propio ordenador, no solo uno de los dos).
+// Copia de seguridad completa (09/09; 10/09 amplía a los documentos
+// fiscales además del DNI) — TODOS los documentos cifrados que hay en R2,
+// en un único .zip, junto con un manifiesto con lo que hace falta para
+// descifrar cada uno (iv + clave AES cifrada). Sigue viajando todo
+// cifrado — la copia en el propio dispositivo de Vikn es tan ilegible
+// para cualquier otro como el original en R2. Pensado para pulsarlo de
+// vez en cuando y guardarlo aparte (protección contra perder Railway/R2
+// Y contra perder el propio ordenador, no solo uno de los dos).
 const archiver = require('archiver');
 app.get('/api/admin/documentos/backup', requiereAdmin, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [filas] = await conn.execute(
+    const [dniFilas] = await conn.execute(
       `SELECT d.id, d.documento_ref, d.documento_iv, d.documento_clave_cifrada, d.documento_tipo_mime,
               d.creado_en, c.correo
        FROM diligencias d JOIN clientes c ON c.id = d.cliente_id
+       WHERE d.documento_ref IS NOT NULL ORDER BY d.id`
+    );
+    const [fiscalFilas] = await conn.execute(
+      `SELECT d.id, d.nombre, d.documento_ref, d.documento_iv, d.documento_clave_cifrada, d.documento_tipo_mime,
+              d.subido_en, c.correo
+       FROM documentos_fiscales d JOIN clientes c ON c.id = d.cliente_id
        WHERE d.documento_ref IS NOT NULL ORDER BY d.id`
     );
     res.setHeader('Content-Type', 'application/zip');
@@ -809,13 +872,13 @@ app.get('/api/admin/documentos/backup', requiereAdmin, async (req, res) => {
     zip.pipe(res);
 
     const manifiesto = [];
-    for (const d of filas) {
+    for (const d of dniFilas) {
       try {
         const { buffer } = await bajarDeR2(d.documento_ref);
         const nombreEnZip = `documentos/diligencia_${d.id}.enc`;
         zip.append(buffer, { name: nombreEnZip });
         manifiesto.push({
-          archivo: nombreEnZip, diligencia_id: d.id, cliente_correo: d.correo,
+          archivo: nombreEnZip, tipo: 'dni', diligencia_id: d.id, cliente_correo: d.correo,
           iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada,
           tipo_mime: d.documento_tipo_mime, subido_en: d.creado_en,
         });
@@ -823,9 +886,23 @@ app.get('/api/admin/documentos/backup', requiereAdmin, async (req, res) => {
         console.error(`No se pudo incluir el documento de la diligencia ${d.id} en el backup:`, err.message);
       }
     }
+    for (const d of fiscalFilas) {
+      try {
+        const { buffer } = await bajarDeR2(d.documento_ref);
+        const nombreEnZip = `documentos/fiscal_${d.id}.enc`;
+        zip.append(buffer, { name: nombreEnZip });
+        manifiesto.push({
+          archivo: nombreEnZip, tipo: 'fiscal', documento_id: d.id, nombre: d.nombre, cliente_correo: d.correo,
+          iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada,
+          tipo_mime: d.documento_tipo_mime, subido_en: d.subido_en,
+        });
+      } catch (err) {
+        console.error(`No se pudo incluir el documento fiscal ${d.id} en el backup:`, err.message);
+      }
+    }
     const leeme = 'Cada archivo .enc está cifrado — para abrirlo, pega tu clave privada en el panel de Acros ' +
-      '(acros_admin.html) y usa "Ver documento" en la diligencia correspondiente, o descifra tú mismo con ' +
-      'metadatos.json (iv + clave_cifrada por archivo, cifrados con RSA-OAEP/SHA-256 tu clave pública; ' +
+      '(acros_admin.html) y usa "Ver documento" en la diligencia o documento correspondiente, o descifra tú mismo ' +
+      'con metadatos.json (iv + clave_cifrada por archivo, cifrados con RSA-OAEP/SHA-256 tu clave pública; ' +
       'archivo cifrado con AES-256-GCM).';
     zip.append(JSON.stringify(manifiesto, null, 2), { name: 'metadatos.json' });
     zip.append(leeme, { name: 'LEEME.txt' });
@@ -928,8 +1005,181 @@ app.post('/api/admin/diligencias/:id/resolver', requiereAdmin, async (req, res) 
 });
 
 // ================================================================
-// ACCESO DE CLIENTES YA DADOS DE ALTA (enlace mágico de reentrada)
+// DOCUMENTACIÓN FISCAL MÁS ALLÁ DEL DNI (10/09)
+// Mismo patrón de cifrado que el documento de identidad: el archivo se
+// cifra en el navegador del cliente (RSA-OAEP + AES-GCM) antes de salir de
+// él — este servidor y R2 solo mueven bytes que no pueden leer. A
+// diferencia del DNI (uno por diligencia), aquí hay una fila por
+// documento pedido, y el asesor puede pedir tantos como haga falta por
+// encargo — igual que ya hacía la maqueta de "Documentación", ahora de
+// verdad.
 // ================================================================
+
+// Lista de clientes con diligencia aprobada — el conjunto de clientes a
+// los que de verdad tiene sentido pedirles un documento fiscal (antes de
+// eso, la sección de Documentación en su área sigue bloqueada). Sirve
+// para el desplegable de "pedir documento nuevo" del panel.
+app.get('/api/admin/clientes-activos', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT c.id AS cliente_id, c.correo, c.nombre, c.apellidos, d.propuesta_id
+       FROM diligencias d JOIN clientes c ON c.id = d.cliente_id
+       WHERE d.estado = 'aprobado' ORDER BY d.resuelto_en DESC`
+    );
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+
+// El asesor pide un documento nuevo a un cliente concreto (equivalente al
+// formulario "Vista asesor · pedir documento nuevo" de la maqueta).
+app.post('/api/admin/documentos', requiereAdmin, async (req, res) => {
+  const { propuesta_id, servicio, nombre, urgente } = req.body;
+  if (!propuesta_id || !(nombre || '').trim()) {
+    return res.status(400).json({ error: 'Faltan propuesta_id o nombre' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    const [propuestas] = await conn.execute('SELECT id, cliente_id FROM propuestas WHERE id = ?', [propuesta_id]);
+    if (!propuestas.length) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [r] = await conn.execute(
+      'INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, urgente) VALUES (?,?,?,?,?)',
+      [propuestas[0].cliente_id, propuesta_id, servicio || null, nombre.trim(), urgente ? 1 : 0]
+    );
+    res.status(201).json({ ok: true, id: r.insertId });
+  } finally {
+    conn.release();
+  }
+});
+
+// Cola del panel: todos los documentos pedidos/enviados, opcionalmente
+// filtrados por estado (p. ej. ?estado=enviado para la cola de revisión).
+app.get('/api/admin/documentos', requiereAdmin, async (req, res) => {
+  const estado = req.query.estado;
+  const conn = await pool.getConnection();
+  try {
+    // OJO: documentos_fiscales y clientes tienen las dos una columna
+    // "nombre" (el nombre del documento vs. el nombre de pila) — con
+    // SELECT d.*, c.nombre chocarían y una pisaría a la otra en el
+    // objeto resultado. Se renombran las dos explícitamente.
+    const columnas = `d.id, d.cliente_id, d.propuesta_id, d.servicio, d.nombre AS nombre_doc, d.urgente,
+              d.estado, d.razon_rechazo, d.subido_en, d.creado_en,
+              c.correo, c.nombre AS nombre_cliente, c.apellidos`;
+    const [filas] = estado
+      ? await conn.execute(
+          `SELECT ${columnas} FROM documentos_fiscales d
+           JOIN clientes c ON c.id = d.cliente_id WHERE d.estado = ? ORDER BY d.urgente DESC, d.creado_en`, [estado])
+      : await conn.execute(
+          `SELECT ${columnas} FROM documentos_fiscales d
+           JOIN clientes c ON c.id = d.cliente_id ORDER BY d.urgente DESC, d.creado_en`);
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+
+// El asesor retira una solicitud que ya no hace falta — solo si el
+// cliente no ha subido nada todavía (si ya envió algo, hay que
+// resolverlo con /revisar, no desaparecerlo sin más).
+app.delete('/api/admin/documentos/:id', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT estado FROM documentos_fiscales WHERE id = ?', [req.params.id]);
+    if (!filas.length) return res.status(404).json({ error: 'Documento no encontrado' });
+    if (filas[0].estado !== 'pendiente') {
+      return res.status(409).json({ error: 'Solo se puede retirar una solicitud mientras sigue pendiente de subida' });
+    }
+    await conn.execute('DELETE FROM documentos_fiscales WHERE id = ?', [req.params.id]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// El cliente sube el archivo (ya cifrado por su navegador) contra un
+// documento pedido en concreto. Mismo límite de tamaño que el DNI.
+app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
+  const { archivo_cifrado, iv, clave_cifrada, tipo_mime } = req.body;
+  if (!archivo_cifrado || !iv || !clave_cifrada) {
+    return res.status(400).json({ error: 'Faltan archivo_cifrado, iv o clave_cifrada' });
+  }
+  if (!limiteTamanoOk(archivo_cifrado, 15 * 1024 * 1024)) {
+    return res.status(400).json({ error: 'El archivo no puede superar los 15 MB' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [filas] = await conn.execute('SELECT * FROM documentos_fiscales WHERE id = ? AND propuesta_id = ?', [req.params.id, p.id]);
+    if (!filas.length) return res.status(404).json({ error: 'Documento no encontrado' });
+    const clave = `docs/${p.cliente_id}/${generarToken()}.enc`;
+    await subirAR2(clave, Buffer.from(archivo_cifrado, 'base64'), 'application/octet-stream');
+    // Re-subir tras un rechazo también vale — vuelve a "enviado" y borra
+    // la razón anterior, para que el asesor lo revise de nuevo desde cero.
+    await conn.execute(
+      `UPDATE documentos_fiscales SET estado = 'enviado', razon_rechazo = NULL,
+       documento_ref = ?, documento_iv = ?, documento_clave_cifrada = ?, documento_tipo_mime = ?, subido_en = ?
+       WHERE id = ?`,
+      [clave, iv, clave_cifrada, tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), req.params.id]
+    );
+    res.json({ ok: true, estado: 'enviado' });
+  } catch (err) {
+    console.error('Error al subir un documento fiscal:', err);
+    res.status(500).json({ error: 'No se pudo subir el documento' });
+  } finally {
+    conn.release();
+  }
+});
+
+// El asesor recupera el archivo (sigue cifrado) para descifrarlo en su
+// propio navegador con su clave privada — igual que con el DNI.
+app.get('/api/admin/documentos/:id/descargar', requiereAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime FROM documentos_fiscales WHERE id = ?', [req.params.id]);
+    if (!filas.length || !filas[0].documento_ref) return res.status(404).json({ error: 'Documento no encontrado' });
+    const d = filas[0];
+    const { buffer } = await bajarDeR2(d.documento_ref);
+    res.json({
+      archivo_cifrado: buffer.toString('base64'),
+      iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada, tipo_mime: d.documento_tipo_mime,
+    });
+  } catch (err) {
+    console.error('Error al recuperar un documento fiscal:', err);
+    res.status(500).json({ error: 'No se pudo recuperar el documento' });
+  } finally {
+    conn.release();
+  }
+});
+
+const ACCIONES_DOCUMENTO = { valido: 'valido', rechazar: 'rechazado' };
+
+// El asesor valida o rechaza (con motivo) un documento ya enviado.
+app.post('/api/admin/documentos/:id/revisar', requiereAdmin, async (req, res) => {
+  const { accion, razon } = req.body;
+  const estadoResultante = ACCIONES_DOCUMENTO[accion];
+  if (!estadoResultante) return res.status(400).json({ error: 'Acción no válida. Debe ser: valido o rechazar' });
+  if (accion === 'rechazar' && !(razon || '').trim()) {
+    return res.status(400).json({ error: 'Falta la razón del rechazo' });
+  }
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT estado FROM documentos_fiscales WHERE id = ?', [req.params.id]);
+    if (!filas.length) return res.status(404).json({ error: 'Documento no encontrado' });
+    if (filas[0].estado !== 'enviado') {
+      return res.status(409).json({ error: `Solo se puede revisar un documento en estado "enviado" (actual: "${filas[0].estado}")` });
+    }
+    await conn.execute(
+      'UPDATE documentos_fiscales SET estado = ?, razon_rechazo = ? WHERE id = ?',
+      [estadoResultante, accion === 'rechazar' ? razon.trim() : null, req.params.id]
+    );
+    res.json({ ok: true, estado: estadoResultante });
+  } finally {
+    conn.release();
+  }
+});
 const MINUTOS_VIGENCIA_ACCESO = 15;
 
 app.post('/api/acceso/solicitar', async (req, res) => {
@@ -979,6 +1229,18 @@ app.get('/api/acceso/:token', async (req, res) => {
   } finally {
     conn.release();
   }
+});
+
+// Middleware de error genérico (10/09): un payload que supera el límite de
+// express.json() (15mb) llegaba antes como una página HTML cruda de
+// Express, no como el JSON que espera el resto de la web. No es un fallo
+// nuevo de la subida de documentos — afectaba a cualquier ruta — pero se
+// nota más ahí porque es la única que mueve archivos grandes de verdad.
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'El archivo es demasiado grande (máximo 15 MB por subida).' });
+  }
+  next(err);
 });
 
 const PUERTO = process.env.PORT || 3000;
