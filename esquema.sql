@@ -48,8 +48,22 @@ CREATE TABLE IF NOT EXISTS clientes (
   tipo_documento    ENUM('dni','nie','pasaporte') NULL,
   numero_documento  VARCHAR(20)   NULL,
   estado            ENUM('activo','inerte') NOT NULL DEFAULT 'activo',
+  contrasena_hash   VARCHAR(100)  NULL,
   creado_en         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Sesiones de cliente (10/09, sexta vuelta): capa común para las dos
+-- formas de entrar (enlace mágico y contraseña) — ver server.js, sección
+-- ACCESO DE CLIENTES, para el porqué.
+CREATE TABLE IF NOT EXISTS sesiones_cliente (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  cliente_id    INT NOT NULL,
+  token         CHAR(48) NOT NULL UNIQUE,
+  expira_en     DATETIME NOT NULL,
+  creado_en     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+);
+CREATE INDEX idx_sesiones_cliente_token ON sesiones_cliente (token);
 
 -- ============================================================
 -- PROPUESTAS — nacen cuando el asesor las envía; el token es el enlace

@@ -131,6 +131,17 @@ const axios = require('axios');
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const BREVO_REMITENTE = process.env.BREVO_REMITENTE || '';
 const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, ''); // sin barra final
+
+// Cómo entran los clientes al área (10/09): "enlace" (solo enlace mágico),
+// "contrasena" (correo + contraseña, con el enlace como recuperación) o
+// "ambos" (por defecto — para poder probar los dos y decidir). Se cambia
+// en Railway sin tocar código. La constante vive aquí arriba para que
+// esté definida antes de cualquier ruta que la consulte.
+const MODOS_ACCESO_CLIENTE = ['enlace', 'contrasena', 'ambos'];
+const MODO_ACCESO_CLIENTE = MODOS_ACCESO_CLIENTE.includes(process.env.MODO_ACCESO_CLIENTE)
+  ? process.env.MODO_ACCESO_CLIENTE : 'ambos';
+const DIAS_VIGENCIA_SESION_CLIENTE = 7;
+const MINUTOS_VIGENCIA_ACCESO = 15;
 const brevoActivo = () => !!(BREVO_API_KEY && BREVO_REMITENTE);
 
 async function enviarCorreo(destinatario, asunto, html) {
@@ -142,11 +153,14 @@ async function enviarCorreo(destinatario, asunto, html) {
     htmlContent: html,
   }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
 }
-function enlaceArea(ruta, token) {
+function enlaceArea(ruta, token, parametro = 'token') {
   // Sin SITE_URL configurada todavía (no hay dominio público real), el
   // correo incluye el token en texto en vez de un enlace clicable — se
   // arregla solo en cuanto Vikn tenga dominio y se configure SITE_URL.
-  return SITE_URL ? `${SITE_URL}/${ruta}?token=${token}` : null;
+  // "parametro" (10/09): el enlace de reentrada usa ?acceso= en vez de
+  // ?token=, para que el área sepa que es un enlace de un solo uso y no
+  // el token de una propuesta.
+  return SITE_URL ? `${SITE_URL}/${ruta}?${parametro}=${token}` : null;
 }
 
 // ================================================================
@@ -368,7 +382,24 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('pagos', 'importe_cripto', "VARCHAR(40) NULL");
       await agregaColumnaSiFalta('pagos', 'verificado_auto', 'TINYINT(1) NOT NULL DEFAULT 0');
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores).');
+      // Acceso del cliente por contraseña + sesiones de cliente (10/09,
+      // quinta vuelta). Conviven las dos formas de entrar — enlace mágico
+      // y contraseña — sobre una misma capa de sesión; cuál se ofrece se
+      // decide con MODO_ACCESO_CLIENTE (ver más abajo), sin tocar código.
+      await agregaColumnaSiFalta('clientes', 'contrasena_hash', 'VARCHAR(100) NULL');
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS sesiones_cliente (
+          id            INT AUTO_INCREMENT PRIMARY KEY,
+          cliente_id    INT NOT NULL,
+          token         CHAR(48) NOT NULL UNIQUE,
+          expira_en     DATETIME NOT NULL,
+          creado_en     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+        )
+      `);
+      await creaIndiceSiFalta('idx_sesiones_cliente_token ON sesiones_cliente (token)');
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -903,6 +934,15 @@ app.post('/api/propuestas/:token/identidad', async (req, res) => {
   if (!datosIdentidadValidos(req.body)) {
     return res.status(400).json({ error: 'Faltan nombre, apellidos, tipo_documento o numero_documento' });
   }
+  // Contraseña opcional en el primer acceso (10/09): si el modo de acceso
+  // la contempla y el cliente la rellena, queda puesta desde el primer
+  // día y ya puede entrar con ella la próxima vez. Si no la rellena (o el
+  // modo es solo "enlace"), no pasa nada — siempre puede ponerla después
+  // desde dentro del área, o seguir entrando por enlace.
+  const contrasena = req.body.contrasena || '';
+  if (contrasena && contrasena.length < 8) {
+    return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  }
   const conn = await pool.getConnection();
   try {
     const p = await propuestaVigente(conn, req.params.token);
@@ -911,7 +951,11 @@ app.post('/api/propuestas/:token/identidad', async (req, res) => {
       'UPDATE clientes SET nombre = ?, apellidos = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?',
       [req.body.nombre.trim(), req.body.apellidos.trim(), req.body.tipo_documento, req.body.numero_documento.trim(), p.cliente_id]
     );
-    res.json({ ok: true });
+    if (contrasena && MODO_ACCESO_CLIENTE !== 'enlace') {
+      const hash = await bcrypt.hash(contrasena, 10);
+      await conn.execute('UPDATE clientes SET contrasena_hash = ? WHERE id = ?', [hash, p.cliente_id]);
+    }
+    res.json({ ok: true, contrasena_puesta: !!(contrasena && MODO_ACCESO_CLIENTE !== 'enlace') });
   } finally {
     conn.release();
   }
@@ -1629,8 +1673,58 @@ app.post('/api/admin/documentos/:id/revisar', requiereSesionAsesor, async (req, 
     conn.release();
   }
 });
-const MINUTOS_VIGENCIA_ACCESO = 15;
+// ================================================================
+// ACCESO DE CLIENTES (10/09, quinta vuelta): DOS formas de entrar que
+// conviven — enlace mágico de un solo uso y correo + contraseña — sobre
+// una misma capa de sesión de cliente. Cuál se ofrece en pantalla lo
+// decide MODO_ACCESO_CLIENTE (Railway): "enlace", "contrasena" o
+// "ambos" (por defecto). El enlace mágico NO desaparece nunca del
+// código aunque se elija "contrasena": es la única forma sensata de
+// "he olvidado mi contraseña" (entras con el enlace, y desde dentro te
+// pones una nueva).
+//
+// Cómo encaja con lo que ya había: toda la API del área sigue colgando
+// del token de propuesta (/api/propuestas/:token/...). Una sesión de
+// cliente simplemente RESUELVE a ese token (GET /api/clientes/sesion)
+// y el área continúa igual que siempre a partir de ahí — sin tener que
+// reescribir los diez endpoints que ya funcionan. El token de propuesta
+// deja de ir en la barra de direcciones para quien entra por sesión
+// (solo sigue en el enlace inicial de alta, que es inevitable).
+// ================================================================
 
+// Lo que el área necesita saber antes de pintar la pantalla de entrada.
+app.get('/api/configuracion-publica', (req, res) => {
+  res.json({ modo_acceso_cliente: MODO_ACCESO_CLIENTE });
+});
+
+async function crearSesionCliente(conn, clienteId) {
+  const token = generarToken();
+  const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_CLIENTE * 24 * 60 * 60 * 1000);
+  await conn.execute('INSERT INTO sesiones_cliente (cliente_id, token, expira_en) VALUES (?,?,?)', [clienteId, token, aSQLDatetime(expira)]);
+  return { token, expira_en: expira.toISOString() };
+}
+
+async function requiereSesionCliente(req, res, next) {
+  const token = (req.get('x-sesion-cliente') || '').trim();
+  if (!token) return res.status(401).json({ error: 'Falta iniciar sesión' });
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT s.expira_en, c.id, c.correo, c.nombre, c.apellidos, c.estado, c.contrasena_hash IS NOT NULL AS tiene_contrasena
+       FROM sesiones_cliente s JOIN clientes c ON c.id = s.cliente_id WHERE s.token = ?`, [token]
+    );
+    if (!filas.length) return res.status(401).json({ error: 'Sesión no válida. Vuelve a entrar.' });
+    const s = filas[0];
+    if (new Date(s.expira_en) < ahora()) return res.status(401).json({ error: 'Tu sesión ha caducado. Vuelve a entrar.' });
+    if (s.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
+    req.cliente = { id: s.id, correo: s.correo, nombre: s.nombre, apellidos: s.apellidos, tieneContrasena: !!s.tiene_contrasena };
+    next();
+  } finally {
+    conn.release();
+  }
+}
+
+// --- Opción A: enlace mágico de un solo uso (reentrada) ---
 app.post('/api/acceso/solicitar', async (req, res) => {
   const correo = (req.body.correo || '').trim().toLowerCase();
   if (!correo) return res.status(400).json({ error: 'Falta el correo' });
@@ -1645,7 +1739,7 @@ app.post('/api/acceso/solicitar', async (req, res) => {
         [filas[0].id, token, aSQLDatetime(expira)]
       );
       if (brevoActivo()) {
-        const enlace = enlaceArea('acros_area.html', token);
+        const enlace = enlaceArea('acros_area.html', token, 'acceso');
         const cuerpo = enlace
           ? `<p>Hola,</p><p>Aquí tienes tu acceso, válido durante 15 minutos:</p><p><a href="${enlace}">${enlace}</a></p>`
           : `<p>Hola,</p><p>Tu código de acceso (válido 15 minutos) es:</p><p><strong>${token}</strong></p>`;
@@ -1658,12 +1752,17 @@ app.post('/api/acceso/solicitar', async (req, res) => {
       }
       return res.json({ ok: true, token_demo: token, expira_en: expira.toISOString() });
     }
+    // Mismo "ok" tanto si el correo existe como si no: no hay que confirmar
+    // a un desconocido qué correos son clientes.
     res.json({ ok: true });
   } finally {
     conn.release();
   }
 });
 
+// Consumir el enlace: además de marcarlo como usado, ahora abre una
+// sesión de cliente (antes solo devolvía los datos del cliente y el área
+// no sabía qué hacer con ellos — la reentrada estaba a medias).
 app.get('/api/acceso/:token', async (req, res) => {
   const conn = await pool.getConnection();
   try {
@@ -1673,8 +1772,107 @@ app.get('/api/acceso/:token', async (req, res) => {
     if (t.usado) return res.status(410).json({ error: 'Este enlace ya se ha usado' });
     if (new Date(t.expira_en) < ahora()) return res.status(410).json({ error: 'Este enlace ha caducado' });
     await conn.execute('UPDATE tokens_acceso SET usado = 1 WHERE id = ?', [t.id]);
+    const sesion = await crearSesionCliente(conn, t.cliente_id);
     const [cliente] = await conn.execute('SELECT id, correo, nombre, apellidos FROM clientes WHERE id = ?', [t.cliente_id]);
-    res.json({ ok: true, cliente: cliente[0] });
+    res.json({ ok: true, cliente: cliente[0], sesion });
+  } finally {
+    conn.release();
+  }
+});
+
+// --- Opción B: correo + contraseña ---
+app.post('/api/clientes/login', async (req, res) => {
+  if (MODO_ACCESO_CLIENTE === 'enlace') {
+    return res.status(403).json({ error: 'El acceso por contraseña no está activado; usa el enlace de acceso.' });
+  }
+  const correo = (req.body.correo || '').trim().toLowerCase();
+  const contrasena = req.body.contrasena || '';
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT * FROM clientes WHERE correo = ?', [correo]);
+    // Mismo mensaje siempre — ni si existe el correo, ni si tiene o no
+    // contraseña puesta: no hay que dar pistas a quien prueba a ciegas.
+    const error = () => res.status(401).json({ error: 'Correo o contraseña incorrectos' });
+    if (!filas.length || !filas[0].contrasena_hash) return error();
+    const cliente = filas[0];
+    if (cliente.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa' });
+    const ok = await bcrypt.compare(contrasena, cliente.contrasena_hash);
+    if (!ok) return error();
+    const sesion = await crearSesionCliente(conn, cliente.id);
+    res.json({ ok: true, cliente: { correo: cliente.correo, nombre: cliente.nombre, apellidos: cliente.apellidos }, sesion });
+  } finally {
+    conn.release();
+  }
+});
+
+// Con sesión: a qué propuesta hay que llevar al cliente. Su encargo más
+// reciente — si en el futuro hubiera varios en marcha a la vez, esto es
+// lo que habría que ampliar (un selector), no la sesión en sí.
+app.get('/api/clientes/sesion', requiereSesionCliente, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [propuestas] = await conn.execute(
+      'SELECT token, estado FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC, id DESC LIMIT 1', [req.cliente.id]
+    );
+    res.json({
+      ok: true,
+      cliente: { correo: req.cliente.correo, nombre: req.cliente.nombre, apellidos: req.cliente.apellidos, tiene_contrasena: req.cliente.tieneContrasena },
+      propuesta_token: propuestas.length ? propuestas[0].token : null,
+      modo_acceso_cliente: MODO_ACCESO_CLIENTE,
+    });
+  } finally {
+    conn.release();
+  }
+});
+
+// Poner o cambiar la contraseña desde dentro del área. Si el cliente
+// todavía no tiene ninguna (entró por enlace), no se le pide la actual;
+// si ya tiene, sí. Al cambiarla se cierran sus demás sesiones abiertas
+// (mismo criterio que con los asesores).
+app.post('/api/clientes/contrasena', requiereSesionCliente, async (req, res) => {
+  if (MODO_ACCESO_CLIENTE === 'enlace') {
+    return res.status(403).json({ error: 'El acceso por contraseña no está activado.' });
+  }
+  const nueva = req.body.contrasena_nueva || '';
+  const actual = req.body.contrasena_actual || '';
+  if (nueva.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  const conn = await pool.getConnection();
+  try {
+    if (req.cliente.tieneContrasena) {
+      const [filas] = await conn.execute('SELECT contrasena_hash FROM clientes WHERE id = ?', [req.cliente.id]);
+      const ok = await bcrypt.compare(actual, filas[0].contrasena_hash);
+      if (!ok) return res.status(401).json({ error: 'Tu contraseña actual no es correcta' });
+    }
+    const hash = await bcrypt.hash(nueva, 10);
+    await conn.execute('UPDATE clientes SET contrasena_hash = ? WHERE id = ?', [hash, req.cliente.id]);
+    await conn.execute('DELETE FROM sesiones_cliente WHERE cliente_id = ? AND token != ?', [req.cliente.id, req.get('x-sesion-cliente')]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+app.post('/api/clientes/logout', requiereSesionCliente, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.execute('DELETE FROM sesiones_cliente WHERE token = ?', [req.get('x-sesion-cliente')]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// Entrar por el enlace inicial de la propuesta también abre sesión:
+// tener ese token ya demuestra la identidad al mismo nivel que el enlace
+// mágico (ambos llegan por correo), y así el cliente puede ponerse
+// contraseña desde dentro y volver luego sin necesitar el enlace.
+app.post('/api/propuestas/:token/sesion', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const sesion = await crearSesionCliente(conn, p.cliente_id);
+    res.json({ ok: true, sesion });
   } finally {
     conn.release();
   }
