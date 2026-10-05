@@ -28,6 +28,8 @@
 //     para el día a día) y rol de administrador.
 //   - Verificación automática de pagos cripto por hash (BTC/ETH/SOL +
 //     USDC/USDT) contra el explorador público de cada red.
+//   - Web pública editable desde el panel (05/10): logo, equipo,
+//     destacados y ofertas, con historial y vuelta atrás.
 //
 // Alcance dejado fuera a propósito (para no llevarte una sorpresa):
 // - Stripe real: "tarjeta" se trata igual que un pago autodeclarado más.
@@ -131,6 +133,29 @@ const axios = require('axios');
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const BREVO_REMITENTE = process.env.BREVO_REMITENTE || '';
 const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, ''); // sin barra final
+
+// WHATSAPP (10/09, séptima vuelta) — Twilio. Aparcado hasta hoy a
+// propósito: el envío del código de acceso ya estaba separado del resto
+// (misma idea que con Brevo), así que añadir un canal más no toca nada
+// de la lógica de acceso en sí, solo se suma al envío por correo. Sin
+// las 3 variables configuradas, no se intenta nada — sigue funcionando
+// exactamente igual que hasta ahora.
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ''; // p.ej. 'whatsapp:+14155238886' (sandbox) o el número real en producción
+const twilioActivo = () => !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_WHATSAPP_FROM);
+
+async function enviarWhatsApp(telefono, mensaje) {
+  // Twilio exige el prefijo "whatsapp:" en origen y destino, y el
+  // teléfono en formato E.164 (con "+" y prefijo de país) — los
+  // clientes lo dan como '600111222', así que si no trae "+" se asume
+  // España (+34) por defecto; para otros países habrá que pedirlo con
+  // prefijo desde el principio (pendiente menor, no bloquea nada hoy).
+  const destino = telefono.trim().startsWith('+') ? telefono.trim() : ('+34' + telefono.trim().replace(/\D/g, ''));
+  const url = (process.env.TWILIO_API_URL || `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`);
+  const cuerpo = new URLSearchParams({ From: `whatsapp:${TWILIO_WHATSAPP_FROM.replace(/^whatsapp:/, '')}`, To: `whatsapp:${destino}`, Body: mensaje });
+  await axios.post(url, cuerpo, { auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN } });
+}
 
 // Cómo entran los clientes al área (10/09): "enlace" (solo enlace mágico),
 // "contrasena" (correo + contraseña, con el enlace como recuperación) o
@@ -399,7 +424,81 @@ async function asegurarEsquema() {
       `);
       await creaIndiceSiFalta('idx_sesiones_cliente_token ON sesiones_cliente (token)');
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente).');
+      // Empresas colaboradoras (28/09): gestorías, asesorías, inmobiliarias
+      // y «otro». Solo se registran desde la vista «Empresas» de Inicio;
+      // no entran al área ni usan chat — la relación va por teléfono,
+      // WhatsApp o correo. El alta NO activa nada: queda «pendiente»
+      // hasta que un asesor la valida y se firma el acuerdo B2B (es la
+      // puerta de control, porque con empresas no se pide DNI a los
+      // clientes finales). Nunca se borra ninguna: se marca «descartada».
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS empresas (
+          id                  INT AUTO_INCREMENT PRIMARY KEY,
+          razon_social        VARCHAR(160) NOT NULL,
+          cif                 VARCHAR(12)  NOT NULL,
+          tipo                VARCHAR(20)  NOT NULL,
+          tipo_otro           VARCHAR(80)  NULL,
+          contacto_nombre     VARCHAR(120) NOT NULL,
+          telefono            VARCHAR(30)  NOT NULL,
+          correo              VARCHAR(190) NOT NULL,
+          canal_preferido     VARCHAR(12)  NOT NULL DEFAULT 'whatsapp',
+          comentario          TEXT         NULL,
+          idioma              CHAR(2)      NULL,
+          utm                 VARCHAR(300) NULL,
+          origen              VARCHAR(60)  NULL,
+          estado              VARCHAR(20)  NOT NULL DEFAULT 'pendiente',
+          asesor_asignado_id  INT NULL,
+          estado_cambiado_por_asesor_id INT NULL,
+          estado_cambiado_en  DATETIME NULL,
+          creado_en           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (asesor_asignado_id) REFERENCES asesores(id),
+          FOREIGN KEY (estado_cambiado_por_asesor_id) REFERENCES asesores(id)
+        )
+      `);
+      await creaIndiceSiFalta('idx_empresas_estado ON empresas (estado, creado_en)');
+
+      // Web pública editable desde el panel (05/10): logo, equipo,
+      // destacados y ofertas. Un registro por «clave» ('marca' y
+      // 'catalogo') con su número de versión; cada guardado deja una
+      // copia en el historial (las últimas 30) para poder volver atrás.
+      // Las imágenes (logo y fotos) se guardan aquí mismo, ya reducidas
+      // en el navegador del administrador: son públicas y pequeñas, así
+      // que no van a R2 (que solo guarda documentos cifrados).
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS web_contenido (
+          clave                     VARCHAR(20)  PRIMARY KEY,
+          datos                     MEDIUMTEXT   NOT NULL,
+          version                   INT          NOT NULL,
+          actualizado_en            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          actualizado_por_asesor_id INT NULL,
+          FOREIGN KEY (actualizado_por_asesor_id) REFERENCES asesores(id)
+        )
+      `);
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS web_contenido_historial (
+          id                     INT AUTO_INCREMENT PRIMARY KEY,
+          clave                  VARCHAR(20)  NOT NULL,
+          version                INT          NOT NULL,
+          datos                  MEDIUMTEXT   NOT NULL,
+          guardado_en            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          guardado_por_asesor_id INT NULL,
+          FOREIGN KEY (guardado_por_asesor_id) REFERENCES asesores(id)
+        )
+      `);
+      await creaIndiceSiFalta('idx_web_historial ON web_contenido_historial (clave, version)');
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS web_imagenes (
+          id                   CHAR(32)     PRIMARY KEY,
+          tipo                 VARCHAR(40)  NOT NULL,
+          datos                MEDIUMBLOB   NOT NULL,
+          bytes                INT          NOT NULL,
+          creado_en            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          creado_por_asesor_id INT NULL,
+          FOREIGN KEY (creado_por_asesor_id) REFERENCES asesores(id)
+        )
+      `);
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -775,6 +874,128 @@ app.post('/api/admin/asesores/:id/activo', requiereSesionAsesor, async (req, res
     // Si se desactiva, sus sesiones abiertas se cierran también — si no,
     // seguiría pudiendo actuar hasta que caducasen solas (30 días).
     if (!req.body.activo) await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [req.params.id]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// ================================================================
+// EMPRESAS COLABORADORAS (28/09) — alta pública desde la vista
+// «Empresas» de Inicio + cola en el panel del asesor.
+// ================================================================
+const TIPOS_EMPRESA = ['gestoria', 'asesoria', 'inmobiliaria', 'otro'];
+const CANALES_EMPRESA = ['whatsapp', 'telefono', 'correo'];
+const ESTADOS_EMPRESA = ['pendiente', 'acuerdo_firmado', 'activa', 'descartada'];
+
+// NIF/NIE/CIF español con su dígito o letra de control. Acepta CIF de
+// sociedad (B12345678…) y también NIF de persona física o NIE, porque
+// hay gestores y asesores que trabajan como autónomos. La MISMA función
+// está copiada en acros_inicio.html (validación en el navegador): si se
+// toca una, tocar la otra.
+function validarNifCif(valor) {
+  const v = (valor || '').toString().toUpperCase().replace(/[\s.\-]/g, '');
+  const LETRAS_DNI = 'TRWAGMYFPDXBNJZSQVHLCKE';
+  let m = v.match(/^(\d{8})([A-Z])$/);
+  if (m) return LETRAS_DNI[Number(m[1]) % 23] === m[2] ? v : null;
+  m = v.match(/^([XYZ])(\d{7})([A-Z])$/);
+  if (m) return LETRAS_DNI[Number('XYZ'.indexOf(m[1]) + m[2]) % 23] === m[3] ? v : null;
+  m = v.match(/^([ABCDEFGHJNPQRSUVW])(\d{7})([0-9A-J])$/);
+  if (!m) return null;
+  const d = m[2].split('').map(Number);
+  let suma = d[1] + d[3] + d[5];
+  for (const i of [0, 2, 4, 6]) { const x = d[i] * 2; suma += Math.floor(x / 10) + (x % 10); }
+  const c = (10 - (suma % 10)) % 10;
+  const letra = 'JABCDEFGHI'[c];
+  if ('ABEH'.includes(m[1])) return m[3] === String(c) ? v : null;      // siempre número
+  if ('KPQSNW'.includes(m[1])) return m[3] === letra ? v : null;        // siempre letra
+  return (m[3] === String(c) || m[3] === letra) ? v : null;             // cualquiera de los dos
+}
+function datosEmpresaValidos(b) {
+  const texto = (x, max) => { const t = (x || '').toString().trim(); return t && t.length <= max ? t : null; };
+  const razon = texto(b.razon_social, 160);
+  const cif = validarNifCif(b.cif);
+  const tipo = TIPOS_EMPRESA.includes(b.tipo) ? b.tipo : null;
+  const tipoOtro = tipo === 'otro' ? texto(b.tipo_otro, 80) : null;
+  const contacto = texto(b.contacto_nombre, 120);
+  const telefono = texto(b.telefono, 30);
+  const correo = texto(b.correo, 190);
+  const canal = CANALES_EMPRESA.includes(b.canal_preferido) ? b.canal_preferido : 'whatsapp';
+  const comentario = (b.comentario || '').toString().trim().slice(0, 2000) || null;
+  const errores = [];
+  if (!razon) errores.push('razón social');
+  if (!cif) errores.push('CIF/NIF');
+  if (!tipo || (tipo === 'otro' && !tipoOtro)) errores.push('tipo de empresa');
+  if (!contacto) errores.push('persona de contacto');
+  if (!telefono || telefono.replace(/\D/g, '').length < 9) errores.push('teléfono');
+  if (!correo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) errores.push('correo');
+  if (errores.length) return { errores };
+  return { datos: { razon, cif, tipo, tipoOtro, contacto, telefono, correo: correo.toLowerCase(), canal, comentario } };
+}
+app.post('/api/empresas', async (req, res) => {
+  const { errores, datos } = datosEmpresaValidos(req.body || {});
+  if (errores) return res.status(400).json({ error: 'Revisa estos datos: ' + errores.join(', '), campos: errores });
+  if (esSpam(req.body)) return res.status(201).json({ ok: true }); // honeypot: no se guarda, pero no se delata
+  const { utm, origen } = resolverAtribucion(req.body);
+  const idioma = (req.body.idioma || '').toString().toLowerCase() === 'en' ? 'en' : 'es';
+  try {
+    await pool.execute(
+      `INSERT INTO empresas (razon_social, cif, tipo, tipo_otro, contacto_nombre, telefono, correo, canal_preferido, comentario, idioma, utm, origen)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [datos.razon, datos.cif, datos.tipo, datos.tipoOtro, datos.contacto, datos.telefono, datos.correo, datos.canal, datos.comentario, idioma, utm, origen]
+    );
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error('Error al guardar el alta de empresa:', err);
+    res.status(500).json({ error: 'No se pudo guardar el alta' });
+  }
+});
+app.get('/api/admin/empresas', requiereSesionAsesor, async (req, res) => {
+  const estado = req.query.estado;
+  const conn = await pool.getConnection();
+  try {
+    const base = `SELECT e.*, aa.nombre AS asesor_asignado_nombre, ac.nombre AS estado_cambiado_por_nombre
+                  FROM empresas e
+                  LEFT JOIN asesores aa ON aa.id = e.asesor_asignado_id
+                  LEFT JOIN asesores ac ON ac.id = e.estado_cambiado_por_asesor_id`;
+    let filas;
+    if (ESTADOS_EMPRESA.includes(estado)) [filas] = await conn.execute(base + ' WHERE e.estado = ? ORDER BY e.creado_en DESC', [estado]);
+    else [filas] = await conn.execute(base + ' ORDER BY e.creado_en DESC LIMIT 500');
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+// Cambiar de estado: cualquier asesor, en cualquier dirección (para poder
+// corregir un error), dejando siempre quién y cuándo. Nunca se borra.
+app.post('/api/admin/empresas/:id/estado', requiereSesionAsesor, async (req, res) => {
+  const estado = (req.body || {}).estado;
+  if (!ESTADOS_EMPRESA.includes(estado)) return res.status(400).json({ error: 'Estado no válido' });
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute(
+      'UPDATE empresas SET estado = ?, estado_cambiado_por_asesor_id = ?, estado_cambiado_en = NOW() WHERE id = ?',
+      [estado, req.asesor.id, req.params.id]
+    );
+    if (!r.affectedRows) return res.status(404).json({ error: 'Empresa no encontrada' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+// Asesor asignado: la persona de Acros a la que esa empresa manda los
+// casos y la documentación. null = sin asignar. Solo cuentas activas.
+app.post('/api/admin/empresas/:id/asesor', requiereSesionAsesor, async (req, res) => {
+  const bruto = (req.body || {}).asesor_id;
+  const asesorId = bruto === null || bruto === '' || bruto === undefined ? null : Number(bruto);
+  const conn = await pool.getConnection();
+  try {
+    if (asesorId !== null) {
+      const [a] = await conn.execute('SELECT id FROM asesores WHERE id = ? AND activo = 1', [asesorId]);
+      if (!a.length) return res.status(400).json({ error: 'Ese asesor no existe o está desactivado' });
+    }
+    const [r] = await conn.execute('UPDATE empresas SET asesor_asignado_id = ? WHERE id = ?', [asesorId, req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Empresa no encontrada' });
     res.json({ ok: true });
   } finally {
     conn.release();
@@ -1375,7 +1596,17 @@ app.get('/api/admin/documentos/backup', requiereSesionAsesor, async (req, res) =
         console.error(`No se pudo incluir el documento fiscal ${d.id} en el backup:`, err.message);
       }
     }
-    const leeme = 'Cada archivo .enc está cifrado — para abrirlo, pega tu clave privada en el panel de Acros ' +
+    // Web pública (05/10): contenido editable e imágenes, sin cifrar (son públicos).
+    try {
+      const [web] = await conn.execute('SELECT clave, datos, version, actualizado_en FROM web_contenido');
+      zip.append(JSON.stringify(web.map(f => ({ ...f, datos: JSON.parse(f.datos) })), null, 2), { name: 'web/contenido.json' });
+      const [imgs] = await conn.execute('SELECT id, tipo, datos FROM web_imagenes');
+      imgs.forEach(i => zip.append(i.datos, { name: `web/imagenes/${i.id}.${TIPOS_IMAGEN_WEB[i.tipo] || 'bin'}` }));
+    } catch (err) {
+      console.error('No se pudo incluir la web pública en el backup:', err.message);
+    }
+    const leeme = 'La carpeta web/ guarda el contenido editable de la web pública (logo, equipo, destacados, ofertas) y sus imágenes, sin cifrar porque ya son públicos. ' +
+      'Cada archivo .enc está cifrado — para abrirlo, pega tu clave privada en el panel de Acros ' +
       '(acros_admin.html) y usa "Ver documento" en la diligencia o documento correspondiente, o descifra tú mismo ' +
       'con metadatos.json (iv + clave_cifrada por archivo, cifrados con RSA-OAEP/SHA-256 tu clave pública; ' +
       'archivo cifrado con AES-256-GCM).';
@@ -1732,24 +1963,44 @@ app.post('/api/acceso/solicitar', async (req, res) => {
   try {
     const [filas] = await conn.execute('SELECT * FROM clientes WHERE correo = ?', [correo]);
     if (filas.length && filas[0].estado === 'activo') {
+      const cliente = filas[0];
       const token = generarToken();
       const expira = sumarMinutos(ahora(), MINUTOS_VIGENCIA_ACCESO);
       await conn.execute(
         'INSERT INTO tokens_acceso (cliente_id, token, expira_en) VALUES (?, ?, ?)',
-        [filas[0].id, token, aSQLDatetime(expira)]
+        [cliente.id, token, aSQLDatetime(expira)]
       );
+      const enlace = enlaceArea('acros_area.html', token, 'acceso');
+      let algunCanalReal = false;
       if (brevoActivo()) {
-        const enlace = enlaceArea('acros_area.html', token, 'acceso');
         const cuerpo = enlace
           ? `<p>Hola,</p><p>Aquí tienes tu acceso, válido durante 15 minutos:</p><p><a href="${enlace}">${enlace}</a></p>`
           : `<p>Hola,</p><p>Tu código de acceso (válido 15 minutos) es:</p><p><strong>${token}</strong></p>`;
         try {
           await enviarCorreo(correo, 'Tu acceso a Acros', cuerpo);
+          algunCanalReal = true;
         } catch (err) {
           console.error('Error al enviar el correo de acceso (Brevo):', err.response?.data || err.message);
         }
-        return res.json({ ok: true, expira_en: expira.toISOString() });
       }
+      // WhatsApp (10/09): canal aparte del de correo, no lo sustituye —
+      // se manda por los dos si los dos están configurados y el cliente
+      // tiene teléfono. Nunca bloquea la respuesta: si Twilio falla (o
+      // en el sandbox, si ese número no se vinculó primero desde el
+      // móvil con "join..."), el correo (o el token_demo) siguen
+      // funcionando igual que si esto no existiera.
+      if (twilioActivo() && cliente.telefono) {
+        const texto = enlace
+          ? `Tu acceso a Acros (válido 15 minutos): ${enlace}`
+          : `Tu código de acceso a Acros (válido 15 minutos) es: ${token}`;
+        try {
+          await enviarWhatsApp(cliente.telefono, texto);
+          algunCanalReal = true;
+        } catch (err) {
+          console.error('Error al enviar el acceso por WhatsApp (Twilio):', err.response?.data || err.message);
+        }
+      }
+      if (algunCanalReal) return res.json({ ok: true, expira_en: expira.toISOString() });
       return res.json({ ok: true, token_demo: token, expira_en: expira.toISOString() });
     }
     // Mismo "ok" tanto si el correo existe como si no: no hay que confirmar
@@ -1873,6 +2124,286 @@ app.post('/api/propuestas/:token/sesion', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const sesion = await crearSesionCliente(conn, p.cliente_id);
     res.json({ ok: true, sesion });
+  } finally {
+    conn.release();
+  }
+});
+
+// ================================================================
+// WEB PÚBLICA EDITABLE DESDE EL PANEL (05/10)
+// Dos bloques de contenido, cada uno un JSON con versión:
+//   - 'marca':    logo (id de imagen), título/subtítulo del equipo y las
+//                 personas (nombre, foto, puesto y bio en ES/EN).
+//   - 'catalogo': destacados (lista de ids de servicio) y ofertas
+//                 ({ id: { descuento, fin } }).
+// La web lo lee de /api/web/contenido (público). Si este servidor no
+// responde, cada página tira de acros_marca.js y de su propio HTML, así
+// que nunca se queda una sección vacía. Solo un administrador escribe.
+// Cada guardado comprueba la versión de partida (dos personas editando a
+// la vez no se pisan: la segunda recibe un aviso y recarga).
+// ================================================================
+const CLAVES_WEB = ['marca', 'catalogo'];
+const HISTORIAL_WEB_MAX = 30;
+const TIPOS_IMAGEN_WEB = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/svg+xml': 'svg' };
+const MAX_BYTES_IMAGEN_WEB = 600 * 1024;
+const RE_ID_IMAGEN = /^[0-9a-f]{32}$/;
+const RE_ID_SERVICIO = /^[a-z0-9_-]{1,40}$/;
+
+function requiereAdminWeb(req, res, next) {
+  if (!req.asesor || !req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador puede cambiar la web pública' });
+  next();
+}
+function textoWeb(v, max) {
+  // Sin caracteres de control (salvo saltos de línea); recortado al máximo.
+  return typeof v === 'string' ? v.replace(/[\u0000-\u0009\u000B-\u001F\u007F]/g, '').trim().slice(0, max) : '';
+}
+function bilingueWeb(v, max) {
+  const o = v && typeof v === 'object' ? v : {};
+  return { es: textoWeb(o.es, max), en: textoWeb(o.en, max) };
+}
+function errorWeb(mensaje) { const e = new Error(mensaje); e.esValidacion = true; return e; }
+
+function validarMarcaWeb(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) throw errorWeb('Formato de marca no válido');
+  const logo = d.logo === null || d.logo === undefined || d.logo === '' ? null : String(d.logo);
+  if (logo && !RE_ID_IMAGEN.test(logo)) throw errorWeb('Logo no válido');
+  const equipo = Array.isArray(d.equipo) ? d.equipo : [];
+  if (equipo.length > 12) throw errorWeb('Como mucho 12 personas en el equipo');
+  return {
+    logo,
+    equipo_titulo: bilingueWeb(d.equipo_titulo, 120),
+    equipo_subtitulo: bilingueWeb(d.equipo_subtitulo, 300),
+    equipo: equipo.map((p, i) => {
+      const persona = p && typeof p === 'object' ? p : {};
+      const nombre = textoWeb(persona.nombre, 80);
+      if (!nombre) throw errorWeb('Falta el nombre de la persona ' + (i + 1));
+      const foto = persona.foto ? String(persona.foto) : null;
+      if (foto && !RE_ID_IMAGEN.test(foto)) throw errorWeb('Foto no válida en la persona ' + (i + 1));
+      return { nombre, foto, puesto: bilingueWeb(persona.puesto, 120), bio: bilingueWeb(persona.bio, 400) };
+    }),
+  };
+}
+function validarCatalogoWeb(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) throw errorWeb('Formato de catálogo no válido');
+  const destacados = Array.isArray(d.destacados) ? [...new Set(d.destacados.map(String))] : [];
+  if (destacados.length > 20) throw errorWeb('Demasiados destacados');
+  destacados.forEach(id => { if (!RE_ID_SERVICIO.test(id)) throw errorWeb('Servicio no válido: ' + id); });
+  const ofertasEntrada = d.ofertas && typeof d.ofertas === 'object' && !Array.isArray(d.ofertas) ? d.ofertas : {};
+  const ids = Object.keys(ofertasEntrada);
+  if (ids.length > 20) throw errorWeb('Demasiadas ofertas');
+  const ofertas = {};
+  ids.forEach(id => {
+    if (!RE_ID_SERVICIO.test(id)) throw errorWeb('Servicio no válido: ' + id);
+    const o = ofertasEntrada[id] || {};
+    const descuento = Number(o.descuento);
+    if (!Number.isInteger(descuento) || descuento < 1 || descuento > 90) throw errorWeb('El descuento de «' + id + '» tiene que ser un número entero entre 1 y 90');
+    const fin = new Date(o.fin);
+    if (!o.fin || isNaN(fin.getTime())) throw errorWeb('Falta la fecha de fin de la oferta de «' + id + '»');
+    ofertas[id] = { descuento, fin: fin.toISOString() };
+  });
+  return { destacados, ofertas };
+}
+async function imagenesExistenWeb(conn, ids) {
+  const unicos = [...new Set(ids.filter(Boolean))];
+  if (!unicos.length) return true;
+  const [filas] = await conn.query('SELECT id FROM web_imagenes WHERE id IN (?)', [unicos]);
+  return filas.length === unicos.length;
+}
+// Guardar una versión nueva (también la usa «restaurar»). Transacción con
+// bloqueo de la fila: comprueba la versión de partida, escribe, deja copia
+// en el historial y poda las copias más antiguas.
+async function guardarContenidoWeb(conn, clave, datos, versionBase, asesorId) {
+  await conn.beginTransaction();
+  try {
+    const [actual] = await conn.execute('SELECT version FROM web_contenido WHERE clave = ? FOR UPDATE', [clave]);
+    const versionActual = actual.length ? actual[0].version : 0;
+    if (Number(versionBase) !== versionActual) {
+      await conn.rollback();
+      return { conflicto: true, versionActual };
+    }
+    const nueva = versionActual + 1;
+    const texto = JSON.stringify(datos);
+    if (actual.length) {
+      await conn.execute('UPDATE web_contenido SET datos = ?, version = ?, actualizado_en = NOW(), actualizado_por_asesor_id = ? WHERE clave = ?', [texto, nueva, asesorId, clave]);
+    } else {
+      await conn.execute('INSERT INTO web_contenido (clave, datos, version, actualizado_por_asesor_id) VALUES (?,?,?,?)', [clave, texto, nueva, asesorId]);
+    }
+    await conn.execute('INSERT INTO web_contenido_historial (clave, version, datos, guardado_por_asesor_id) VALUES (?,?,?,?)', [clave, nueva, texto, asesorId]);
+    await conn.execute('DELETE FROM web_contenido_historial WHERE clave = ? AND version <= ?', [clave, nueva - HISTORIAL_WEB_MAX]);
+    await conn.commit();
+    return { version: nueva };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  }
+}
+async function validarContenidoWeb(conn, clave, datos) {
+  const limpio = clave === 'marca' ? validarMarcaWeb(datos) : validarCatalogoWeb(datos);
+  if (clave === 'marca' && !(await imagenesExistenWeb(conn, [limpio.logo, ...limpio.equipo.map(p => p.foto)]))) {
+    throw errorWeb('Alguna imagen no está subida. Vuelve a elegirla.');
+  }
+  return limpio;
+}
+
+// --- Público: lo que lee la web ---
+app.get('/api/web/contenido', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT clave, datos, version FROM web_contenido');
+    const salida = { marca: null, catalogo: null, versiones: {} };
+    filas.forEach(f => {
+      if (!CLAVES_WEB.includes(f.clave)) return;
+      try { salida[f.clave] = JSON.parse(f.datos); salida.versiones[f.clave] = f.version; } catch (e) { /* fila corrupta: se ignora */ }
+    });
+    res.set('Cache-Control', 'no-cache'); // el navegador revalida siempre (ETag), así los cambios se ven al momento
+    res.json(salida);
+  } catch (err) {
+    console.error('Error al leer el contenido de la web:', err);
+    res.status(500).json({ error: 'No se pudo leer el contenido' });
+  } finally {
+    conn.release();
+  }
+});
+app.get('/api/web/imagen/:id', async (req, res) => {
+  const id = String(req.params.id || '').replace(/\.[a-z]+$/, '');
+  if (!RE_ID_IMAGEN.test(id)) return res.status(404).end();
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT tipo, datos FROM web_imagenes WHERE id = ?', [id]);
+    if (!filas.length) return res.status(404).end();
+    // El id es la huella del contenido: una imagen nueva siempre tiene id
+    // nuevo, así que esta puede guardarse en caché para siempre.
+    res.set('Content-Type', filas[0].tipo);
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+    if (filas[0].tipo === 'image/svg+xml') res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox");
+    res.end(filas[0].datos);
+  } catch (err) {
+    console.error('Error al servir una imagen de la web:', err);
+    res.status(500).end();
+  } finally {
+    conn.release();
+  }
+});
+
+// --- Panel (solo administradores) ---
+app.get('/api/admin/web', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT w.clave, w.datos, w.version, w.actualizado_en, a.nombre AS actualizado_por
+       FROM web_contenido w LEFT JOIN asesores a ON a.id = w.actualizado_por_asesor_id`
+    );
+    const salida = {};
+    CLAVES_WEB.forEach(c => { salida[c] = { datos: null, version: 0, actualizado_en: null, actualizado_por: null }; });
+    filas.forEach(f => {
+      if (!CLAVES_WEB.includes(f.clave)) return;
+      salida[f.clave] = { datos: JSON.parse(f.datos), version: f.version, actualizado_en: f.actualizado_en, actualizado_por: f.actualizado_por };
+    });
+    res.json(salida);
+  } finally {
+    conn.release();
+  }
+});
+app.put('/api/admin/web/:clave', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const clave = req.params.clave;
+  if (!CLAVES_WEB.includes(clave)) return res.status(404).json({ error: 'Bloque desconocido' });
+  const cuerpo = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const limpio = await validarContenidoWeb(conn, clave, cuerpo.datos);
+    const r = await guardarContenidoWeb(conn, clave, limpio, cuerpo.version_base, req.asesor.id);
+    if (r.conflicto) return res.status(409).json({ error: 'Alguien ha guardado cambios mientras editabas. Recarga para ver la versión actual.', version_actual: r.versionActual });
+    res.json({ ok: true, version: r.version, datos: limpio });
+  } catch (err) {
+    if (err.esValidacion) return res.status(400).json({ error: err.message });
+    console.error('Error al guardar el contenido de la web:', err);
+    res.status(500).json({ error: 'No se pudo guardar' });
+  } finally {
+    conn.release();
+  }
+});
+app.get('/api/admin/web/:clave/historial', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  if (!CLAVES_WEB.includes(req.params.clave)) return res.status(404).json({ error: 'Bloque desconocido' });
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT h.version, h.guardado_en, a.nombre AS guardado_por
+       FROM web_contenido_historial h LEFT JOIN asesores a ON a.id = h.guardado_por_asesor_id
+       WHERE h.clave = ? ORDER BY h.version DESC`, [req.params.clave]
+    );
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+app.get('/api/admin/web/:clave/historial/:version', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  if (!CLAVES_WEB.includes(req.params.clave)) return res.status(404).json({ error: 'Bloque desconocido' });
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT datos FROM web_contenido_historial WHERE clave = ? AND version = ?', [req.params.clave, Number(req.params.version)]);
+    if (!filas.length) return res.status(404).json({ error: 'Esa versión ya no está en el historial' });
+    res.json({ datos: JSON.parse(filas[0].datos) });
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/web/:clave/restaurar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const clave = req.params.clave;
+  if (!CLAVES_WEB.includes(clave)) return res.status(404).json({ error: 'Bloque desconocido' });
+  const cuerpo = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute('SELECT datos FROM web_contenido_historial WHERE clave = ? AND version = ?', [clave, Number(cuerpo.version)]);
+    if (!filas.length) return res.status(404).json({ error: 'Esa versión ya no está en el historial' });
+    const limpio = await validarContenidoWeb(conn, clave, JSON.parse(filas[0].datos));
+    const r = await guardarContenidoWeb(conn, clave, limpio, cuerpo.version_base, req.asesor.id);
+    if (r.conflicto) return res.status(409).json({ error: 'Alguien ha guardado cambios mientras tanto. Recarga y vuelve a intentarlo.', version_actual: r.versionActual });
+    res.json({ ok: true, version: r.version, datos: limpio });
+  } catch (err) {
+    if (err.esValidacion) return res.status(400).json({ error: err.message });
+    console.error('Error al restaurar el contenido de la web:', err);
+    res.status(500).json({ error: 'No se pudo restaurar' });
+  } finally {
+    conn.release();
+  }
+});
+// Subida de una imagen (logo o foto), ya reducida en el navegador. Se
+// comprueba que el contenido sea de verdad la imagen que dice ser; un SVG
+// con código dentro se rechaza (y aun así se sirve con una política que
+// impide ejecutar nada). El id es la huella SHA-256: subir dos veces la
+// misma imagen no la duplica.
+app.post('/api/admin/web/imagen', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const cuerpo = req.body || {};
+  const tipo = String(cuerpo.tipo || '');
+  if (!TIPOS_IMAGEN_WEB[tipo]) return res.status(400).json({ error: 'Formato no admitido. Usa JPG, PNG, WebP o SVG.' });
+  let buffer;
+  try { buffer = Buffer.from(String(cuerpo.datos_base64 || ''), 'base64'); } catch (e) { buffer = null; }
+  if (!buffer || !buffer.length) return res.status(400).json({ error: 'La imagen llegó vacía' });
+  if (buffer.length > MAX_BYTES_IMAGEN_WEB) return res.status(400).json({ error: 'La imagen pesa demasiado (máximo 600 KB tras reducirla).' });
+  const firma = buffer.subarray(0, 12);
+  const esJpg = firma[0] === 0xFF && firma[1] === 0xD8 && firma[2] === 0xFF;
+  const esPng = firma.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+  const esWebp = firma.subarray(0, 4).toString('latin1') === 'RIFF' && firma.subarray(8, 12).toString('latin1') === 'WEBP';
+  if (tipo === 'image/jpeg' && !esJpg) return res.status(400).json({ error: 'El archivo no es un JPG válido' });
+  if (tipo === 'image/png' && !esPng) return res.status(400).json({ error: 'El archivo no es un PNG válido' });
+  if (tipo === 'image/webp' && !esWebp) return res.status(400).json({ error: 'El archivo no es un WebP válido' });
+  if (tipo === 'image/svg+xml') {
+    const texto = buffer.toString('utf8');
+    if (!/<svg[\s>]/i.test(texto)) return res.status(400).json({ error: 'El archivo no es un SVG válido' });
+    if (/<script|javascript:|<foreignObject|<iframe|<embed|<object|<!ENTITY|\son[a-z]+\s*=/i.test(texto)) {
+      return res.status(400).json({ error: 'Ese SVG lleva código o elementos no permitidos. Expórtalo de nuevo como imagen simple.' });
+    }
+  }
+  const id = crypto.createHash('sha256').update(buffer).digest('hex').slice(0, 32);
+  const conn = await pool.getConnection();
+  try {
+    await conn.execute('INSERT IGNORE INTO web_imagenes (id, tipo, datos, bytes, creado_por_asesor_id) VALUES (?,?,?,?,?)', [id, tipo, buffer, buffer.length, req.asesor.id]);
+    res.json({ ok: true, id, bytes: buffer.length });
+  } catch (err) {
+    console.error('Error al guardar una imagen de la web:', err);
+    res.status(500).json({ error: 'No se pudo guardar la imagen' });
   } finally {
     conn.release();
   }
