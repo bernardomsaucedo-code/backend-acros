@@ -178,6 +178,24 @@ async function enviarCorreo(destinatario, asunto, html) {
     htmlContent: html,
   }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
 }
+// ================================================================
+// AVISOS AL MÓVIL POR NTFY (06/10)
+// Decidido en septiembre y nunca programado hasta ahora. Cada aviso lleva
+// solo un título genérico, SIN datos personales (ntfy es un servicio
+// externo y el canal es público para quien conozca su nombre): para ver
+// quién es, se abre el panel. Sin NTFY_TOPIC en Railway no se envía nada.
+// Se publica en JSON para que los acentos y emojis lleguen bien. Nunca
+// bloquea ni rompe la petición que lo dispara.
+// ================================================================
+const NTFY_TOPIC = (process.env.NTFY_TOPIC || '').trim();
+const NTFY_SERVER = (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '');
+function avisar(titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } = {}) {
+  if (!NTFY_TOPIC) return Promise.resolve(false);
+  return axios.post(NTFY_SERVER + '/', { topic: NTFY_TOPIC, title: titulo, message: mensaje || 'Ábrelo en el panel de Acros.', priority: prioridad, tags: [etiqueta] }, { timeout: 5000 })
+    .then(() => true)
+    .catch(err => { console.error('Aviso ntfy no enviado:', err.message); return false; });
+}
+
 function enlaceArea(ruta, token, parametro = 'token') {
   // Sin SITE_URL configurada todavía (no hay dominio público real), el
   // correo incluye el token en texto en vez de un enlace clicable — se
@@ -498,7 +516,29 @@ async function asegurarEsquema() {
         )
       `);
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública).');
+      // Chat cliente–asesor (06/10): un hilo por encargo y servicio. «Borrado
+      // espejo» (decisión de septiembre): quien escribe un mensaje puede
+      // borrarlo y desaparece para los dos; la conversación no se borra entera.
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS mensajes (
+          id            INT AUTO_INCREMENT PRIMARY KEY,
+          propuesta_id  INT          NOT NULL,
+          cliente_id    INT          NOT NULL,
+          servicio      VARCHAR(50)  NOT NULL DEFAULT 'general',
+          autor         ENUM('cliente','asesor') NOT NULL,
+          asesor_id     INT NULL,
+          texto         TEXT         NOT NULL,
+          leido_en      DATETIME NULL,
+          creado_en     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (propuesta_id) REFERENCES propuestas(id),
+          FOREIGN KEY (cliente_id) REFERENCES clientes(id),
+          FOREIGN KEY (asesor_id) REFERENCES asesores(id)
+        )
+      `);
+      await creaIndiceSiFalta('idx_mensajes_hilo ON mensajes (propuesta_id, servicio, creado_en)');
+      await creaIndiceSiFalta('idx_mensajes_sin_leer ON mensajes (autor, leido_en)');
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -562,6 +602,7 @@ app.post('/api/llamada', async (req, res) => {
       'INSERT INTO solicitudes_llamada (nombre, telefono, origen) VALUES (?, ?, ?)',
       [nombre.trim(), telefono.trim(), origen]
     );
+    avisar('📞 Alguien pide que le llaméis', 'Tenéis una petición de llamada nueva en el panel.', { prioridad: 5, etiqueta: 'telephone_receiver' });
     res.status(201).json({ ok: true });
   } catch (err) {
     console.error('Error al guardar la solicitud de llamada:', err);
@@ -602,6 +643,7 @@ app.post('/api/presupuesto', async (req, res) => {
         (cuestionario && Object.keys(cuestionario).length) ? JSON.stringify(cuestionario) : null,
       ]
     );
+    avisar('📝 Nueva solicitud de presupuesto', 'Está en «Nuevas solicitudes» del panel.', { etiqueta: 'memo' });
     res.status(201).json({ ok: true });
   } catch (err) {
     console.error('Error al guardar la solicitud de presupuesto:', err);
@@ -944,6 +986,7 @@ app.post('/api/empresas', async (req, res) => {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
       [datos.razon, datos.cif, datos.tipo, datos.tipoOtro, datos.contacto, datos.telefono, datos.correo, datos.canal, datos.comentario, idioma, utm, origen]
     );
+    avisar('🏢 Nueva empresa registrada', 'Está en el bloque «Empresas» del panel.', { etiqueta: 'office' });
     res.status(201).json({ ok: true });
   } catch (err) {
     console.error('Error al guardar el alta de empresa:', err);
@@ -1189,6 +1232,7 @@ app.post('/api/propuestas/:token/aceptar', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'enviada') return res.status(409).json({ error: `No se puede aceptar: estado actual "${p.estado}"` });
     await conn.execute('UPDATE propuestas SET estado = ? WHERE id = ?', ['aceptada', p.id]);
+    avisar('✅ Un cliente ha aceptado su propuesta', 'El siguiente paso es su pago.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'aceptada' });
   } finally {
     conn.release();
@@ -1203,6 +1247,7 @@ app.post('/api/propuestas/:token/rechazar', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'enviada') return res.status(409).json({ error: `No se puede rechazar: estado actual "${p.estado}"` });
     await conn.execute('UPDATE propuestas SET estado = ?, motivo_rechazo = ? WHERE id = ?', ['rechazada', motivo, p.id]);
+    avisar('❌ Un cliente ha rechazado su propuesta', 'Mira el motivo en su ficha.', { etiqueta: 'x' });
     res.json({ ok: true, estado: 'rechazada' });
   } finally {
     conn.release();
@@ -1245,6 +1290,7 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
       [p.id, metodo, (hash_transaccion || '').trim() || null, metodo === 'cripto' ? red : null,
        metodo === 'cripto' ? moneda_cripto : null, metodo === 'cripto' ? String(importe_cripto) : null]
     );
+    avisar('💶 Un cliente ha declarado un pago', 'Confírmalo en «Pagos pendientes de confirmar».', { prioridad: 4, etiqueta: 'euro' });
     res.status(201).json({ ok: true, pago_id: r.insertId, estado: 'autodeclarado' });
   } finally {
     conn.release();
@@ -1649,6 +1695,7 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
     );
     await conn.execute('UPDATE clientes SET tipo_documento = ?, numero_documento = ? WHERE id = ?',
       [b.tipo_documento, b.numero_documento || null, p.cliente_id]);
+    avisar('🪪 Un cliente ha enviado su cuestionario de alta', 'Revísalo en «Diligencias pendientes».', { etiqueta: 'identification_card' });
     res.status(201).json({ ok: true, estado: 'revision' });
   } finally {
     conn.release();
@@ -1751,7 +1798,8 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id) AS docs_total,
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado IN ('pendiente','rechazado')) AS docs_pendientes, -- rechazado = hay que volver a subirlo
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'enviado') AS docs_por_revisar,
-              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'valido') AS docs_validos
+              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'valido') AS docs_validos,
+              (SELECT COUNT(*) FROM mensajes ms WHERE ms.propuesta_id = p.id AND ms.autor = 'cliente' AND ms.leido_en IS NULL) AS mensajes_sin_leer
        FROM propuestas p JOIN clientes c ON c.id = p.cliente_id
        ORDER BY p.creado_en DESC
        LIMIT 500`
@@ -1929,6 +1977,7 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
        WHERE id = ?`,
       [clave, iv, clave_cifrada, tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), req.params.id]
     );
+    avisar('📄 Un cliente ha subido un documento', 'Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
     res.json({ ok: true, estado: 'enviado' });
   } catch (err) {
     console.error('Error al subir un documento fiscal:', err);
@@ -2488,6 +2537,175 @@ app.post('/api/admin/web/imagen', requiereSesionAsesor, requiereAdminWeb, async 
   } finally {
     conn.release();
   }
+});
+
+// ================================================================
+// CHAT CLIENTE–ASESOR (06/10)
+// Antes solo existía en la maqueta del Área. Un hilo por encargo
+// (propuesta) y servicio. El cliente entra con el token de su propuesta,
+// como en el resto del Área; el asesor, con su sesión. Cuando el cliente
+// escribe: aviso ntfy (sin datos, y como mucho uno cada 5 minutos por
+// encargo). Cuando el asesor contesta: correo al cliente con el enlace a
+// su área, sin el texto del mensaje.
+// ================================================================
+const MAX_TEXTO_MENSAJE = 4000;
+const ultimoAvisoMensaje = new Map(); // propuesta_id → ms del último aviso
+function serviciosDePropuesta(p) {
+  let lista; try { lista = JSON.parse(p.servicios); } catch (e) { lista = []; }
+  return (Array.isArray(lista) ? lista : []).map(x => typeof x === 'string' ? x : (x && x.id)).filter(Boolean);
+}
+function servicioDeHilo(p, servicio) {
+  const s = String(servicio || '').trim();
+  const lista = serviciosDePropuesta(p);
+  if (s && (lista.includes(s) || s === 'general')) return s;
+  return lista[0] || 'general';
+}
+function textoMensaje(t) {
+  return typeof t === 'string' ? t.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim().slice(0, MAX_TEXTO_MENSAJE) : '';
+}
+
+// --- Cliente ---
+app.get('/api/propuestas/:token/mensajes', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [filas] = await conn.execute(
+      `SELECT m.id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor
+       FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
+       WHERE m.propuesta_id = ? ORDER BY m.creado_en, m.id`, [p.id]);
+    // Al abrir el chat, lo que escribió el asesor queda leído
+    await conn.execute("UPDATE mensajes SET leido_en = NOW() WHERE propuesta_id = ? AND autor = 'asesor' AND leido_en IS NULL", [p.id]);
+    res.json({ servicios: serviciosDePropuesta(p), mensajes: filas });
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/propuestas/:token/mensajes', async (req, res) => {
+  const texto = textoMensaje(req.body && req.body.texto);
+  if (!texto) return res.status(400).json({ error: 'El mensaje está vacío' });
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (p.estado === 'rechazada' || p.estado === 'caducada') return res.status(409).json({ error: 'Esta propuesta ya no está activa' });
+    const servicio = servicioDeHilo(p, req.body.servicio);
+    const [r] = await conn.execute(
+      "INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, texto) VALUES (?, ?, ?, 'cliente', ?)",
+      [p.id, p.cliente_id, servicio, texto]);
+    const ahoraMs = Date.now();
+    if (ahoraMs - (ultimoAvisoMensaje.get(p.id) || 0) > 5 * 60 * 1000) {
+      ultimoAvisoMensaje.set(p.id, ahoraMs);
+      avisar('💬 Mensaje nuevo de un cliente', 'Contéstale desde «Mensajes sin leer» en el panel.', { prioridad: 4, etiqueta: 'speech_balloon' });
+    }
+    res.status(201).json({ ok: true, id: r.insertId, servicio });
+  } finally {
+    conn.release();
+  }
+});
+app.delete('/api/propuestas/:token/mensajes/:id', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [r] = await conn.execute("DELETE FROM mensajes WHERE id = ? AND propuesta_id = ? AND autor = 'cliente'", [Number(req.params.id), p.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solo puedes borrar tus propios mensajes' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+
+// --- Asesor ---
+app.get('/api/admin/mensajes/sin-leer', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.query(
+      `SELECT m.propuesta_id, m.servicio, c.id AS cliente_id, c.nombre, c.apellidos, c.correo,
+              COUNT(*) AS sin_leer, MAX(m.creado_en) AS ultimo,
+              SUBSTRING((SELECT m2.texto FROM mensajes m2 WHERE m2.propuesta_id = m.propuesta_id AND m2.servicio = m.servicio
+                         AND m2.autor = 'cliente' ORDER BY m2.creado_en DESC, m2.id DESC LIMIT 1), 1, 140) AS extracto
+       FROM mensajes m JOIN clientes c ON c.id = m.cliente_id
+       WHERE m.autor = 'cliente' AND m.leido_en IS NULL
+       GROUP BY m.propuesta_id, m.servicio, c.id, c.nombre, c.apellidos, c.correo
+       ORDER BY ultimo DESC`);
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+app.get('/api/admin/clientes/:id/mensajes', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute(
+      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, m.asesor_id, a.nombre AS asesor
+       FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
+       WHERE m.cliente_id = ? ORDER BY m.creado_en, m.id`, [Number(req.params.id)]);
+    res.json(filas);
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/propuestas/:id/mensajes/leidos', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const servicio = req.body && req.body.servicio ? String(req.body.servicio) : null;
+    await conn.execute(
+      "UPDATE mensajes SET leido_en = NOW() WHERE propuesta_id = ? AND autor = 'cliente' AND leido_en IS NULL" + (servicio ? ' AND servicio = ?' : ''),
+      servicio ? [Number(req.params.id), servicio] : [Number(req.params.id)]);
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/propuestas/:id/mensajes', requiereSesionAsesor, async (req, res) => {
+  const texto = textoMensaje(req.body && req.body.texto);
+  if (!texto) return res.status(400).json({ error: 'El mensaje está vacío' });
+  const conn = await pool.getConnection();
+  try {
+    const [ps] = await conn.execute('SELECT p.*, c.correo FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?', [Number(req.params.id)]);
+    if (!ps.length) return res.status(404).json({ error: 'Encargo no encontrado' });
+    const p = ps[0];
+    const servicio = servicioDeHilo(p, req.body.servicio);
+    const [r] = await conn.execute(
+      "INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, asesor_id, texto) VALUES (?, ?, ?, 'asesor', ?, ?)",
+      [p.id, p.cliente_id, servicio, req.asesor.id, texto]);
+    // Contestar implica haber leído lo del cliente en ese hilo
+    await conn.execute("UPDATE mensajes SET leido_en = NOW() WHERE propuesta_id = ? AND servicio = ? AND autor = 'cliente' AND leido_en IS NULL", [p.id, servicio]);
+    let correo = 'sin_correo';
+    if (p.correo) {
+      const enlace = SITE_URL ? `${SITE_URL}/acros_area.html?login=1` : null;
+      try {
+        await enviarCorreo(p.correo, 'Tienes un mensaje de tu asesor de Acros',
+          `<p>Hola,</p><p>Tu asesor de Acros te ha escrito en tu área de cliente.</p>` +
+          (enlace ? `<p><a href="${enlace}">Entra en tu área para leerlo y contestar</a>.</p>` : `<p>Entra en tu área de cliente para leerlo y contestar.</p>`) +
+          `<p>Por tu privacidad, el mensaje no va en este correo.</p><p>— Acros</p>`);
+        correo = 'enviado';
+      } catch (err) {
+        console.error('Correo de mensaje nuevo no enviado:', err.message);
+        correo = 'fallo';
+      }
+    }
+    res.status(201).json({ ok: true, id: r.insertId, servicio, correo });
+  } finally {
+    conn.release();
+  }
+});
+app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [r] = await conn.execute("DELETE FROM mensajes WHERE id = ? AND autor = 'asesor'", [Number(req.params.id)]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solo se pueden borrar mensajes del asesor' });
+    res.json({ ok: true });
+  } finally {
+    conn.release();
+  }
+});
+app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
+  if (!NTFY_TOPIC) return res.status(400).json({ error: 'Falta la variable NTFY_TOPIC en Railway: sin ella no se envía ningún aviso.' });
+  const ok = await avisar('🔔 Aviso de prueba de Acros', 'Si ves esto, los avisos funcionan. Lo ha enviado ' + req.asesor.nombre + ' desde el panel.', { etiqueta: 'tada' });
+  if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso. Revisa el nombre del canal en NTFY_TOPIC.' });
+  res.json({ ok: true });
 });
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
