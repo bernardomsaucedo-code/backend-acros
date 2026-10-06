@@ -1749,7 +1749,7 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
               (SELECT pg.estado FROM pagos pg WHERE pg.propuesta_id = p.id ORDER BY pg.id DESC LIMIT 1) AS estado_pago,
               (SELECT d.estado FROM diligencias d WHERE d.propuesta_id = p.id ORDER BY d.id DESC LIMIT 1) AS estado_diligencia,
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id) AS docs_total,
-              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'pendiente') AS docs_pendientes,
+              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado IN ('pendiente','rechazado')) AS docs_pendientes, -- rechazado = hay que volver a subirlo
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'enviado') AS docs_por_revisar,
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'valido') AS docs_validos
        FROM propuestas p JOIN clientes c ON c.id = p.cliente_id
@@ -1760,6 +1760,57 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
   } catch (err) {
     console.error('Error al listar los encargos:', err);
     res.status(500).json({ error: 'No se pudo cargar la lista de clientes' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Ficha de un cliente (06/10): su expediente completo en una sola
+// llamada — datos, cada encargo con sus pagos, diligencia y documentos, y
+// las solicitudes que hizo desde la web (por su correo o su teléfono).
+// No incluye nada cifrado: los documentos se abren desde sus colas, con
+// la clave privada del navegador del asesor.
+app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Cliente no válido' });
+  const conn = await pool.getConnection();
+  try {
+    const [cli] = await conn.execute(
+      'SELECT id, correo, telefono, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en FROM clientes WHERE id = ?', [id]);
+    if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+    const cliente = cli[0];
+    const [propuestas] = await conn.execute(
+      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en
+       FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC`, [id]);
+    const ids = propuestas.map(p => p.id);
+    let pagos = [], diligencias = [], documentos = [];
+    if (ids.length) {
+      [pagos] = await conn.query('SELECT id, propuesta_id, metodo, estado, creado_en FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+      [diligencias] = await conn.query('SELECT id, propuesta_id, estado, coherencia, nota_asesor, resuelto_en, creado_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+      [documentos] = await conn.query(
+        `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en
+         FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en`, [ids]);
+    }
+    const telefonoLimpio = String(cliente.telefono || '').replace(/\D/g, '').slice(-9);
+    const [solicitudes] = await conn.query(
+      `SELECT id, servicios, detalle, cuestionario, telefono, correo, atendida, creado_en
+       FROM solicitudes_presupuesto
+       WHERE (correo IS NOT NULL AND LOWER(correo) = LOWER(?))
+          OR (? <> '' AND RIGHT(REGEXP_REPLACE(telefono, '[^0-9]', ''), 9) = ?)
+       ORDER BY creado_en DESC LIMIT 50`, [cliente.correo, telefonoLimpio, telefonoLimpio]);
+    res.json({
+      cliente,
+      encargos: propuestas.map(p => ({
+        ...p,
+        pagos: pagos.filter(x => x.propuesta_id === p.id),
+        diligencia: diligencias.filter(x => x.propuesta_id === p.id).pop() || null,
+        documentos: documentos.filter(x => x.propuesta_id === p.id),
+      })),
+      solicitudes,
+    });
+  } catch (err) {
+    console.error('Error al cargar la ficha del cliente:', err);
+    res.status(500).json({ error: 'No se pudo cargar la ficha' });
   } finally {
     conn.release();
   }
