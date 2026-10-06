@@ -1735,6 +1735,36 @@ app.post('/api/admin/diligencias/:id/resolver', requiereSesionAsesor, async (req
 // los que de verdad tiene sentido pedirles un documento fiscal (antes de
 // eso, la sección de Documentación en su área sigue bloqueada). Sirve
 // para el desplegable de "pedir documento nuevo" del panel.
+// Lista real de encargos para la tabla principal del panel (06/10): una
+// fila por propuesta con su cliente y en qué punto está (pago, diligencia,
+// documentos). Sustituye a los clientes de demostración que traía el HTML.
+// La etapa y el porcentaje los calcula el panel a partir de estos estados.
+app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.query(
+      `SELECT p.id AS propuesta_id, p.servicios, p.importe_centimos, p.estado AS estado_propuesta,
+              p.creado_en, p.actualizado_en,
+              c.id AS cliente_id, c.nombre, c.apellidos, c.correo, c.telefono,
+              (SELECT pg.estado FROM pagos pg WHERE pg.propuesta_id = p.id ORDER BY pg.id DESC LIMIT 1) AS estado_pago,
+              (SELECT d.estado FROM diligencias d WHERE d.propuesta_id = p.id ORDER BY d.id DESC LIMIT 1) AS estado_diligencia,
+              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id) AS docs_total,
+              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'pendiente') AS docs_pendientes,
+              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'enviado') AS docs_por_revisar,
+              (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado = 'valido') AS docs_validos
+       FROM propuestas p JOIN clientes c ON c.id = p.cliente_id
+       ORDER BY p.creado_en DESC
+       LIMIT 500`
+    );
+    res.json(filas);
+  } catch (err) {
+    console.error('Error al listar los encargos:', err);
+    res.status(500).json({ error: 'No se pudo cargar la lista de clientes' });
+  } finally {
+    conn.release();
+  }
+});
+
 app.get('/api/admin/clientes-activos', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
