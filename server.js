@@ -537,6 +537,15 @@ async function asegurarEsquema() {
       `);
       await creaIndiceSiFalta('idx_mensajes_hilo ON mensajes (propuesta_id, servicio, creado_en)');
       await creaIndiceSiFalta('idx_mensajes_sin_leer ON mensajes (autor, leido_en)');
+      // Cuándo se avisó por última vez al cliente de un encargo (06/10): el
+      // correo «tu asesor te ha escrito» sale tras un rato sin escribirle.
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS avisos_chat (
+          propuesta_id    INT PRIMARY KEY,
+          ultimo_aviso_en DATETIME NOT NULL,
+          FOREIGN KEY (propuesta_id) REFERENCES propuestas(id)
+        )
+      `);
 
       console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes).');
       return;
@@ -2672,21 +2681,11 @@ app.post('/api/admin/propuestas/:id/mensajes', requiereSesionAsesor, async (req,
       [p.id, p.cliente_id, servicio, req.asesor.id, texto]);
     // Contestar implica haber leído lo del cliente en ese hilo
     await conn.execute("UPDATE mensajes SET leido_en = NOW() WHERE propuesta_id = ? AND servicio = ? AND autor = 'cliente' AND leido_en IS NULL", [p.id, servicio]);
-    let correo = 'sin_correo';
-    if (p.correo) {
-      const enlace = SITE_URL ? `${SITE_URL}/acros_area.html?login=1` : null;
-      try {
-        await enviarCorreo(p.correo, 'Tienes un mensaje de tu asesor de Acros',
-          `<p>Hola,</p><p>Tu asesor de Acros te ha escrito en tu área de cliente.</p>` +
-          (enlace ? `<p><a href="${enlace}">Entra en tu área para leerlo y contestar</a>.</p>` : `<p>Entra en tu área de cliente para leerlo y contestar.</p>`) +
-          `<p>Por tu privacidad, el mensaje no va en este correo.</p><p>— Acros</p>`);
-        correo = 'enviado';
-      } catch (err) {
-        console.error('Correo de mensaje nuevo no enviado:', err.message);
-        correo = 'fallo';
-      }
-    }
-    res.status(201).json({ ok: true, id: r.insertId, servicio, correo });
+    // El correo de aviso ya no sale al momento (06/10): lo envía la tarea
+    // de avisos cuando lleváis un rato sin escribirle y él no lo ha leído,
+    // así tres mensajes seguidos = un solo correo.
+    const correo = p.correo ? 'programado' : 'sin_correo';
+    res.status(201).json({ ok: true, id: r.insertId, servicio, correo, minutos_aviso: Math.round(SEGUNDOS_AVISO_CHAT / 60) });
   } finally {
     conn.release();
   }
@@ -2701,6 +2700,54 @@ app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => 
     conn.release();
   }
 });
+// --- Aviso por correo al cliente, agrupado (06/10) ---
+// Cada minuto: para cada encargo con mensajes del asesor SIN LEER cuyo
+// último mensaje tiene ya más de SEGUNDOS_AVISO_CHAT (5 min por defecto)
+// y que no se le ha avisado desde entonces, sale un único correo «Tu
+// asesor te ha escrito». Si el cliente los lee antes (entra a su área), no
+// recibe nada. Se guarda en la base (avisos_chat), así que un reinicio de
+// Railway no pierde ni repite avisos.
+const SEGUNDOS_AVISO_CHAT = Math.max(1, Number(process.env.CHAT_AVISO_SEGUNDOS) || 300);
+const MS_TAREA_AVISOS = Math.max(1000, Number(process.env.CHAT_TAREA_MS) || 60000);
+let tareaAvisosEnMarcha = false;
+async function enviarAvisosChatPendientes() {
+  if (tareaAvisosEnMarcha) return;
+  tareaAvisosEnMarcha = true;
+  const conn = await pool.getConnection();
+  try {
+    const [pendientes] = await conn.query(
+      `SELECT m.propuesta_id, c.correo, MAX(m.creado_en) AS ultimo, a.ultimo_aviso_en
+       FROM mensajes m
+       JOIN clientes c ON c.id = m.cliente_id
+       LEFT JOIN avisos_chat a ON a.propuesta_id = m.propuesta_id
+       WHERE m.autor = 'asesor' AND m.leido_en IS NULL
+       GROUP BY m.propuesta_id, c.correo, a.ultimo_aviso_en
+       HAVING MAX(m.creado_en) <= NOW() - INTERVAL ? SECOND
+          AND (a.ultimo_aviso_en IS NULL OR MAX(m.creado_en) > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
+    for (const f of pendientes) {
+      // Se marca antes de enviar: si el correo fallara, no se reintenta en bucle cada minuto
+      await conn.execute(
+        'INSERT INTO avisos_chat (propuesta_id, ultimo_aviso_en) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE ultimo_aviso_en = NOW()', [f.propuesta_id]);
+      if (!f.correo) continue;
+      const enlace = SITE_URL ? `${SITE_URL}/acros_area.html?login=1` : null;
+      try {
+        await enviarCorreo(f.correo, 'Tu asesor de Acros te ha escrito',
+          `<p>Hola,</p><p>Tu asesor de Acros te ha escrito en tu área de cliente.</p>` +
+          (enlace ? `<p><a href="${enlace}">Entra en tu área para leerlo y contestar</a>.</p>` : `<p>Entra en tu área de cliente para leerlo y contestar.</p>`) +
+          `<p>Por tu privacidad, los mensajes no van en este correo.</p><p>— Acros</p>`);
+      } catch (err) {
+        console.error('Correo de aviso de chat no enviado (encargo ' + f.propuesta_id + '):', err.message);
+      }
+    }
+  } catch (err) {
+    console.error('Tarea de avisos del chat:', err.message);
+  } finally {
+    conn.release();
+    tareaAvisosEnMarcha = false;
+  }
+}
+setInterval(enviarAvisosChatPendientes, MS_TAREA_AVISOS);
+
 app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
   if (!NTFY_TOPIC) return res.status(400).json({ error: 'Falta la variable NTFY_TOPIC en Railway: sin ella no se envía ningún aviso.' });
   const ok = await avisar('🔔 Aviso de prueba de Acros', 'Si ves esto, los avisos funcionan. Lo ha enviado ' + req.asesor.nombre + ' desde el panel.', { etiqueta: 'tada' });
