@@ -2140,7 +2140,17 @@ app.post('/api/acceso/solicitar', async (req, res) => {
         }
       }
       if (algunCanalReal) return res.json({ ok: true, expira_en: expira.toISOString() });
-      return res.json({ ok: true, token_demo: token, expira_en: expira.toISOString() });
+      // 06/10 — FALLO DE SEGURIDAD CORREGIDO: si el correo no salía (Brevo
+      // sin configurar o con error), se devolvía el código de acceso a quien
+      // lo pidiera, y cualquiera que escribiera el correo de un cliente
+      // podía entrar en su área. Ahora el código solo se devuelve en modo
+      // de pruebas explícito (MODO_DEMO=1, nunca en producción); si no,
+      // la respuesta es la misma que para un correo desconocido, queda en
+      // el registro y os llega un aviso para revisar el correo.
+      if (process.env.MODO_DEMO === '1') return res.json({ ok: true, token_demo: token, expira_en: expira.toISOString() });
+      console.error('ACCESO: el enlace de un cliente no ha salido por ningún canal (¿Brevo sin configurar o con error?).');
+      avisar('⚠️ Un cliente no ha recibido su enlace de acceso', 'El correo no ha salido: revisa Brevo en Railway (BREVO_API_KEY y BREVO_REMITENTE) y el registro.', { prioridad: 4, etiqueta: 'warning' });
+      return res.json({ ok: true });
     }
     // Mismo "ok" tanto si el correo existe como si no: no hay que confirmar
     // a un desconocido qué correos son clientes.
