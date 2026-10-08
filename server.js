@@ -40,6 +40,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const mysql = require('mysql2/promise');
 
 const app = express();
@@ -101,7 +102,7 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 // cliente (RSA + AES, ver /api/propuestas/:token/documento-identidad) —
 // este servidor nunca ve el contenido en claro, y R2 tampoco.
 // ================================================================
-const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const r2 = new S3Client({
   region: 'auto',
   endpoint: process.env.R2_ENDPOINT,
@@ -547,7 +548,24 @@ async function asegurarEsquema() {
         )
       `);
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes).');
+      // Registro de las copias de la base de datos (07/10)
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS copias_bd (
+          id         INT AUTO_INCREMENT PRIMARY KEY,
+          fecha      DATE         NOT NULL,
+          clave_r2   VARCHAR(200) NULL,
+          bytes      INT          NULL,
+          tablas     INT          NULL,
+          filas      INT          NULL,
+          estado     ENUM('ok','error') NOT NULL,
+          error      TEXT         NULL,
+          manual     TINYINT(1)   NOT NULL DEFAULT 0,
+          creado_en  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await creaIndiceSiFalta('idx_copias_fecha ON copias_bd (fecha, estado)');
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes, copias).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -2757,6 +2775,169 @@ async function enviarAvisosChatPendientes() {
   }
 }
 setInterval(enviarAvisosChatPendientes, MS_TAREA_AVISOS);
+
+// ================================================================
+// COPIA DE LA BASE DE DATOS FUERA DE RAILWAY (07/10)
+// Cada noche (a partir de las 03:30, hora de Madrid) se exportan TODAS las
+// tablas a JSON, se comprimen y se cifran con la clave pública de los
+// documentos (la misma de acros_area.html): AES-256-GCM con una clave al
+// azar, y esa clave cifrada con RSA-OAEP/SHA-256. Solo la clave privada de
+// Vikn la abre. Se guarda en Cloudflare R2 (proveedor distinto de Railway)
+// en copias-bd/, se conservan las últimas 30 y se registra en copias_bd.
+// Si falla: aviso ntfy y correo a los administradores (sin datos). La
+// tarea revisa cada 10 minutos, así que un reinicio no se salta la noche.
+// Restaurar: herramientas/restaurar_copia_bd.js (ver su cabecera).
+// ================================================================
+const CLAVE_PUBLICA_COPIAS = (process.env.CLAVE_PUBLICA_DOCUMENTOS || `-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAuzFJ8P/sO7sXP7HQOb+h
+D6DsyVWJkulZjMOfENXWmCP2HgKckHsAktiHLzIASMKZZo7ACl1HFU5e8aKhOceN
+MMmckwlKtL2/TnCx7aXRlj0W/w2PGvimTnTnQ1AR7bhiwFIKu78DM17ToiltrOH1
+eLg1njzE9p73ehwB0s3J3GUBzIFNNQtaP2kHh4PKy8Jmq38YtxisFcEpAbj1i8W0
+i0llwvs710c5Dc1/mrsyHM/J3tXgx5K26zr7rpX0wMwqlLP8AVFosPv8BHCgjWeF
+K2icGTb3fWjd1ll1whgjoR0f5dSf+tI0TKEe2N1icFgnqI02AVzPpOc6wIIAnMcI
+kwA2VPRLOV4v3jdCmfzvHX3nV4IKEtjKINv7mC6Vx7WxhF+mOZmhoz5ViykL65XB
+ssKuKI23YWH7PnmUgQhFwB8873UGD7AzmZDDBn+/fyDojwd4l5Ie5XpsH0QFrNMt
+7bsRaCf56EaCGGweSCNxy+aF+gZpyojBAxVektfxfvPMJ5TxFR+JE9kw39ECCTem
+9ogvE9NFdzAisOI/tY0r+OHwYMjPW4rFOb8aw6zn8n33mQASEPBAaD6K3CLNV9E8
++UhjJZEWY0XhNyRIbKsgH6YOxAd3dDZGRibtIGBtgBzzt5YaemixS4ASozdq/+kk
+c/gQd8O27Q13qdk2E3RYKecCAwEAAQ==
+-----END PUBLIC KEY-----`).replace(/\\n/g, '\n');
+const COPIAS_A_CONSERVAR = 30;
+let copiaEnMarcha = false;
+
+function fechaMadrid(d = new Date()) {
+  const partes = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+  const v = t => partes.find(p => p.type === t).value;
+  return { fecha: `${v('year')}-${v('month')}-${v('day')}`, hora: Number(v('hour')) % 24, minuto: Number(v('minute')) };
+}
+async function exportarBaseDeDatos(conn) {
+  const [tablas] = await conn.query('SHOW TABLES');
+  const salida = { formato: 'acros-bd-v1', creado_en: new Date().toISOString(), tablas: {} };
+  let filasTotal = 0;
+  for (const t of tablas) {
+    const nombre = Object.values(t)[0];
+    const [filas] = await conn.query({ sql: 'SELECT * FROM `' + nombre.replace(/`/g, '') + '`', dateStrings: true });
+    salida.tablas[nombre] = filas.map(f => {
+      const o = {};
+      for (const [k, v] of Object.entries(f)) o[k] = Buffer.isBuffer(v) ? { __b64: v.toString('base64') } : v;
+      return o;
+    });
+    filasTotal += filas.length;
+  }
+  return { datos: salida, tablas: tablas.length, filas: filasTotal };
+}
+function cifrarCopia(buffer) {
+  const claveAES = crypto.randomBytes(32), iv = crypto.randomBytes(12);
+  const cifrador = crypto.createCipheriv('aes-256-gcm', claveAES, iv);
+  const cifrado = Buffer.concat([cifrador.update(buffer), cifrador.final(), cifrador.getAuthTag()]); // como Web Crypto: etiqueta al final
+  const claveCifrada = crypto.publicEncrypt({ key: CLAVE_PUBLICA_COPIAS, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, claveAES);
+  return Buffer.from(JSON.stringify({
+    formato: 'acros-copia-bd-cifrada-v1', algoritmo: 'AES-256-GCM + RSA-OAEP/SHA-256 (gzip dentro)',
+    creado_en: new Date().toISOString(), iv: iv.toString('base64'), clave_cifrada: claveCifrada.toString('base64'), datos: cifrado.toString('base64'),
+  }));
+}
+async function avisarFalloCopia(mensaje) {
+  avisar('⚠️ La copia de la base de datos ha fallado', 'Mira el registro de Railway. Se reintenta cada hora.', { prioridad: 4, etiqueta: 'floppy_disk' });
+  if (!brevoActivo()) return;
+  const conn = await pool.getConnection();
+  try {
+    const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
+    for (const a of admins) {
+      try {
+        await enviarCorreo(a.correo, '⚠️ La copia de seguridad de Acros ha fallado',
+          '<p>La copia nocturna de la base de datos de Acros no se ha podido hacer.</p>' +
+          '<p>Motivo técnico: <code>' + String(mensaje).replace(/[<>&]/g, '') .slice(0, 300) + '</code></p>' +
+          '<p>El sistema lo reintenta cada hora. Si mañana sigue fallando, revisa el registro de Railway o las variables de Cloudflare R2.</p><p>— Acros</p>');
+      } catch (e) { console.error('Correo de fallo de copia no enviado:', e.message); }
+    }
+  } finally { conn.release(); }
+}
+async function hacerCopiaBaseDeDatos({ manual = false } = {}) {
+  if (copiaEnMarcha) throw new Error('Ya hay una copia en marcha');
+  copiaEnMarcha = true;
+  const { fecha } = fechaMadrid();
+  const conn = await pool.getConnection();
+  try {
+    const exp = await exportarBaseDeDatos(conn);
+    const comprimido = zlib.gzipSync(Buffer.from(JSON.stringify(exp.datos)));
+    const cifrado = cifrarCopia(comprimido);
+    const clave = 'copias-bd/' + new Date().toISOString().replace(/[:.]/g, '-') + '.acros-bd.json';
+    await subirAR2(clave, cifrado, 'application/json');
+    const [r] = await conn.execute(
+      "INSERT INTO copias_bd (fecha, clave_r2, bytes, tablas, filas, estado, manual) VALUES (?, ?, ?, ?, ?, 'ok', ?)",
+      [fecha, clave, cifrado.length, exp.tablas, exp.filas, manual ? 1 : 0]);
+    // Conservar solo las últimas
+    const [viejas] = await conn.query("SELECT id, clave_r2 FROM copias_bd WHERE estado = 'ok' ORDER BY creado_en DESC, id DESC LIMIT 1000 OFFSET ?", [COPIAS_A_CONSERVAR]);
+    for (const v of viejas) {
+      try { await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: v.clave_r2 })); } catch (e) { console.error('No se pudo borrar la copia antigua', v.clave_r2, e.message); continue; }
+      await conn.execute('DELETE FROM copias_bd WHERE id = ?', [v.id]);
+    }
+    await conn.execute("DELETE FROM copias_bd WHERE estado = 'error' AND creado_en < NOW() - INTERVAL 60 DAY");
+    console.log(`Copia de la base de datos hecha: ${clave} (${exp.tablas} tablas, ${exp.filas} filas, ${cifrado.length} bytes)`);
+    return { id: r.insertId, clave, bytes: cifrado.length, tablas: exp.tablas, filas: exp.filas };
+  } catch (err) {
+    console.error('COPIA BD: ha fallado:', err.message);
+    try { await conn.execute("INSERT INTO copias_bd (fecha, estado, error, manual) VALUES (?, 'error', ?, ?)", [fecha, String(err.message).slice(0, 2000), manual ? 1 : 0]); } catch (e) { /* sin base no hay registro */ }
+    throw err;
+  } finally {
+    conn.release();
+    copiaEnMarcha = false;
+  }
+}
+// Revisión periódica: ¿toca la copia de hoy? (03:30 o más tarde, sin copia
+// correcta hoy, y como mucho un intento por hora si ha fallado)
+async function revisarCopiaNocturna() {
+  if (copiaEnMarcha || !R2_BUCKET) return;
+  const ahoraM = fechaMadrid();
+  if (ahoraM.hora < 3 || (ahoraM.hora === 3 && ahoraM.minuto < 30)) return;
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    const [hoy] = await conn.execute("SELECT estado, creado_en FROM copias_bd WHERE fecha = ? AND manual = 0 ORDER BY id DESC", [ahoraM.fecha]);
+    if (hoy.some(f => f.estado === 'ok')) return;
+    const [recientes] = await conn.execute("SELECT COUNT(*) AS n FROM copias_bd WHERE fecha = ? AND manual = 0 AND estado = 'error' AND creado_en > NOW() - INTERVAL 55 MINUTE", [ahoraM.fecha]);
+    if (recientes[0].n > 0) return;
+    const fallosPrevios = hoy.filter(f => f.estado === 'error').length;
+    conn.release(); conn = null;
+    try { await hacerCopiaBaseDeDatos(); }
+    catch (err) { if (fallosPrevios === 0) await avisarFalloCopia(err.message); } // un aviso por noche, no uno por reintento
+  } catch (err) {
+    console.error('Revisión de la copia nocturna:', err.message);
+  } finally { if (conn) conn.release(); }
+}
+setInterval(revisarCopiaNocturna, Math.max(5000, Number(process.env.COPIA_REVISION_MS) || 10 * 60 * 1000));
+setTimeout(revisarCopiaNocturna, 60 * 1000);
+
+app.get('/api/admin/copias-bd', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.query('SELECT id, fecha, bytes, tablas, filas, estado, error, manual, creado_en FROM copias_bd ORDER BY creado_en DESC, id DESC LIMIT 60');
+    res.json({ copias: filas, conservadas: COPIAS_A_CONSERVAR, r2_configurado: !!R2_BUCKET });
+  } finally { conn.release(); }
+});
+app.post('/api/admin/copias-bd/ahora', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  try {
+    const r = await hacerCopiaBaseDeDatos({ manual: true });
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    res.status(500).json({ error: 'La copia ha fallado: ' + err.message });
+  }
+});
+app.get('/api/admin/copias-bd/:id/descargar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [filas] = await conn.execute("SELECT clave_r2, fecha FROM copias_bd WHERE id = ? AND estado = 'ok'", [Number(req.params.id)]);
+    if (!filas.length) return res.status(404).json({ error: 'Esa copia no existe' });
+    const { buffer } = await bajarDeR2(filas[0].clave_r2);
+    const nombre = 'acros-bd-' + String(filas[0].fecha).slice(0, 10) + '-' + req.params.id + '.acros-bd.json';
+    res.set('Content-Type', 'application/json');
+    res.set('Content-Disposition', 'attachment; filename="' + nombre + '"');
+    res.send(buffer);
+  } catch (err) {
+    console.error('Descarga de copia:', err.message);
+    res.status(500).json({ error: 'No se pudo descargar la copia' });
+  } finally { conn.release(); }
+});
 
 app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
   if (!NTFY_TOPIC) return res.status(400).json({ error: 'Falta la variable NTFY_TOPIC en Railway: sin ella no se envía ningún aviso.' });
