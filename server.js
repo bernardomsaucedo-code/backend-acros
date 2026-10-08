@@ -627,8 +627,36 @@ async function asegurarEsquema() {
         ' `creado_en` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP)'
       );
       await creaIndiceSiFalta('idx_copias_fecha ON copias_bd (`fecha`, `estado`)');
+      // 09/10: el cuestionario de Empieza aquí puede llegar después de la
+      // solicitud; esta clave de un solo uso permite añadirlo sin sesión.
+      await agregaColumnaSiFalta('solicitudes_presupuesto', '`token_cuestionario`', 'CHAR(32) NULL');
 
-      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes, copias).');
+      // Informes entregados al cliente (fase 2, 08/10): solo la versión final
+      // (los borradores no se guardan). Cada corrección es una versión nueva;
+      // el cliente ve la última y las anteriores se conservan. Su conformidad
+      // da el servicio por terminado.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS entregas (' +
+        ' `id`             INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `propuesta_id`   INT          NOT NULL,' +
+        ' `cliente_id`     INT          NOT NULL,' +
+        ' `servicio`       VARCHAR(50)  NOT NULL,' +
+        ' `version`        INT          NOT NULL DEFAULT 1,' +
+        ' `nombre_archivo` VARCHAR(255) NOT NULL,' +
+        ' `tipo`           VARCHAR(100) NOT NULL,' +
+        ' `bytes`          INT          NOT NULL,' +
+        ' `clave_r2`       VARCHAR(300) NOT NULL,' +
+        ' `subido_por`     INT          NULL,' +
+        ' `subido_en`      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        " `estado`         ENUM('entregado','conforme','cambios') NOT NULL DEFAULT 'entregado'," +
+        ' `comentario`     TEXT         NULL,' +
+        ' `respondido_en`  DATETIME     NULL,' +
+        ' FOREIGN KEY (`propuesta_id`) REFERENCES propuestas(`id`),' +
+        ' FOREIGN KEY (`cliente_id`) REFERENCES clientes(`id`))'
+      );
+      await creaIndiceSiFalta('idx_entregas_servicio ON entregas (`propuesta_id`, `servicio`, `version`)');
+
+      console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes, copias, entregas).');
       return;
     } catch (err) {
       console.error(`Intento ${intento}/${INTENTOS} de preparar la base de datos falló:`, err.message);
@@ -720,9 +748,11 @@ app.post('/api/presupuesto', async (req, res) => {
   if (esSpam(req.body)) return res.status(201).json({ ok: true }); // honeypot: no se guarda, pero no se delata
   const { servicios, detalle, telefono, correo, cuestionario } = req.body;
   const { utm, origen } = resolverAtribucion(req.body);
+  const conCuestionario = !!(cuestionario && Object.keys(cuestionario).length);
+  const tokenCuest = conCuestionario ? null : crypto.randomBytes(16).toString('hex');
   try {
-    await pool.execute(
-      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    const [ins] = await pool.execute(
+      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `token_cuestionario`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [
         Array.isArray(servicios) ? JSON.stringify(servicios) : servicios.toString().trim(),
         detalle ? detalle.toString().trim() : null,
@@ -730,15 +760,32 @@ app.post('/api/presupuesto', async (req, res) => {
         correo ? correo.toString().trim() : null,
         utm,
         origen,
-        (cuestionario && Object.keys(cuestionario).length) ? JSON.stringify(cuestionario) : null,
+        conCuestionario ? JSON.stringify(cuestionario) : null,
+        tokenCuest,
       ]
     );
-    avisar('📝 Nueva solicitud de presupuesto', 'Está en «Nuevas solicitudes» del panel.', { etiqueta: 'memo' });
-    res.status(201).json({ ok: true });
+    avisar('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
+    // Sin cuestionario: se devuelve con qué añadirlo luego desde la misma página
+    res.status(201).json(conCuestionario ? { ok: true } : { ok: true, id: ins.insertId, token_cuestionario: tokenCuest });
   } catch (err) {
     console.error('Error al guardar la solicitud de presupuesto:', err);
     res.status(500).json({ error: 'No se pudo guardar la solicitud' });
   }
+});
+
+// 09/10: el cliente que dijo «Ahora no» completa el cuestionario después.
+// Solo una vez: al guardarlo, la clave deja de valer.
+app.post('/api/presupuesto/:id/cuestionario', async (req, res) => {
+  const { token, cuestionario } = req.body || {};
+  if (!token || !cuestionario || typeof cuestionario !== 'object' || !Object.keys(cuestionario).length) return res.status(400).json({ error: 'Falta el cuestionario' });
+  const texto = JSON.stringify(cuestionario);
+  if (texto.length > 20000) return res.status(413).json({ error: 'Cuestionario demasiado largo' });
+  const [r] = await pool.execute(
+    'UPDATE solicitudes_presupuesto SET cuestionario = ?, `token_cuestionario` = NULL WHERE id = ? AND `token_cuestionario` = ? AND cuestionario IS NULL',
+    [texto, Number(req.params.id), String(token)]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Esta solicitud ya tiene su cuestionario o no existe' });
+  avisar('📝 Un cliente ha completado su cuestionario', 'Lo tienes en su solicitud, en «Nuevas solicitudes».', { etiqueta: 'memo' });
+  res.json({ ok: true });
 });
 
 // ================================================================
@@ -1275,7 +1322,14 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       );
       documentos = filas;
     }
+    const [entregasCli] = await conn.execute(
+      'SELECT e.`id`, e.`propuesta_id`, e.`servicio`, e.`version`, e.`nombre_archivo`, e.`bytes`, e.`subido_en`, e.`estado`, e.`comentario`, e.`respondido_en`, p2.`creado_en` AS propuesta_creada ' +
+      'FROM entregas e JOIN propuestas p2 ON p2.`id` = e.`propuesta_id` ' +
+      'WHERE e.`cliente_id` = ? AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`) ' +
+      'ORDER BY e.`subido_en` DESC', [p.cliente_id]);
     res.json({
+      entregas: entregasCli.filter(e => e.propuesta_id === p.id),
+      entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
@@ -1905,6 +1959,19 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
        ORDER BY p.creado_en DESC
        LIMIT 500`
     );
+    // Última entrega de cada servicio (fase 2): cuántos servicios están
+    // esperando conformidad, con cambios pedidos o terminados
+    if (filas.length) {
+      const [ult] = await conn.query(
+        'SELECT e.`propuesta_id`, e.`estado` FROM entregas e WHERE e.`propuesta_id` IN (?) AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`)',
+        [filas.map(f => f.propuesta_id)]);
+      filas.forEach(f => {
+        const suyas = ult.filter(u => u.propuesta_id === f.propuesta_id);
+        f.entregas_esperando = suyas.filter(u => u.estado === 'entregado').length;
+        f.entregas_cambios = suyas.filter(u => u.estado === 'cambios').length;
+        f.entregas_conformes = suyas.filter(u => u.estado === 'conforme').length;
+      });
+    }
     res.json(filas);
   } catch (err) {
     console.error('Error al listar los encargos:', err);
@@ -1932,13 +1999,14 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
       `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en
        FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC`, [id]);
     const ids = propuestas.map(p => p.id);
-    let pagos = [], diligencias = [], documentos = [];
+    let pagos = [], diligencias = [], documentos = [], entregasF = [];
     if (ids.length) {
       [pagos] = await conn.query('SELECT id, propuesta_id, metodo, estado, creado_en FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [diligencias] = await conn.query('SELECT id, propuesta_id, estado, coherencia, nota_asesor, resuelto_en, creado_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [documentos] = await conn.query(
         `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en
          FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en`, [ids]);
+      [entregasF] = await conn.query('SELECT `id`, `propuesta_id`, `servicio`, `version`, `nombre_archivo`, `bytes`, `subido_en`, `estado`, `comentario`, `respondido_en` FROM entregas WHERE `propuesta_id` IN (?) ORDER BY `servicio`, `version` DESC', [ids]);
     }
     const telefonoLimpio = String(cliente.telefono || '').replace(/\D/g, '').slice(-9);
     const [solicitudes] = await conn.query(
@@ -1954,6 +2022,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
         pagos: pagos.filter(x => x.propuesta_id === p.id),
         diligencia: diligencias.filter(x => x.propuesta_id === p.id).pop() || null,
         documentos: documentos.filter(x => x.propuesta_id === p.id),
+        entregas: entregasF.filter(x => x.propuesta_id === p.id),
       })),
       solicitudes,
     });
@@ -2810,6 +2879,119 @@ app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => 
     conn.release();
   }
 });
+// ================================================================
+// INFORMES ENTREGADOS (fase 2, 08/10)
+// El asesor sube la versión final de cada servicio desde la ficha; el
+// cliente la descarga en su área y da su conformidad («Todo correcto»,
+// el servicio queda terminado) o pide un cambio (su comentario va al chat
+// de ese servicio y el informe vuelve al asesor). Los archivos se guardan
+// en R2 en privado (sin enlace público): solo se descargan con la sesión
+// del cliente o desde el panel. Los clientes ven siempre sus informes,
+// también los de encargos anteriores.
+// ================================================================
+const TIPOS_ENTREGA = { 'application/pdf': 'pdf', 'application/zip': 'zip', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx', 'application/vnd.ms-excel': 'xls', 'text/csv': 'csv', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx' };
+const MAX_BYTES_ENTREGA = 10 * 1024 * 1024; // en base64 ocupa ~13,4 MB: cabe en el límite de 15 MB de express.json
+const nombreSeguro = n => String(n || 'informe').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 180);
+
+app.post('/api/admin/propuestas/:id/entregas', requiereSesionAsesor, async (req, res) => {
+  const { servicio, nombre, tipo, datos_base64 } = req.body || {};
+  if (!TIPOS_ENTREGA[tipo]) return res.status(400).json({ error: 'Formato no admitido (PDF, Excel, Word, CSV o ZIP)' });
+  const buffer = Buffer.from(String(datos_base64 || ''), 'base64');
+  if (!buffer.length) return res.status(400).json({ error: 'El archivo está vacío' });
+  if (buffer.length > MAX_BYTES_ENTREGA) return res.status(413).json({ error: 'El archivo supera los 10 MB' });
+  if (!R2_BUCKET) return res.status(500).json({ error: 'El almacenamiento (R2) no está configurado' });
+  const conn = await pool.getConnection();
+  try {
+    const [ps] = await conn.execute('SELECT p.*, c.`correo`, c.`nombre` AS cliente_nombre FROM propuestas p JOIN clientes c ON c.`id` = p.`cliente_id` WHERE p.`id` = ?', [Number(req.params.id)]);
+    if (!ps.length) return res.status(404).json({ error: 'Encargo no encontrado' });
+    const p = ps[0];
+    const serv = servicioDeHilo(p, servicio);
+    const [v] = await conn.execute('SELECT COALESCE(MAX(`version`), 0) + 1 AS v FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ?', [p.id, serv]);
+    const version = v[0].v;
+    const nombreArch = nombreSeguro(nombre);
+    const clave = `entregas/${p.id}/${serv}/v${version}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${TIPOS_ENTREGA[tipo]}`;
+    await subirAR2(clave, buffer, tipo);
+    const [r] = await conn.execute(
+      'INSERT INTO entregas (`propuesta_id`, `cliente_id`, `servicio`, `version`, `nombre_archivo`, `tipo`, `bytes`, `clave_r2`, `subido_por`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [p.id, p.cliente_id, serv, version, nombreArch, tipo, buffer.length, clave, req.asesor.id]);
+    let correo = 'sin_correo';
+    if (p.correo && brevoActivo()) {
+      const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+      const c = plantillaCorreo({
+        titulo: version > 1 ? 'Tu informe corregido está listo' : 'Tu informe está listo',
+        parrafos: [p.cliente_nombre ? `Hola, ${ESC_HTML(p.cliente_nombre)}:` : 'Hola:',
+          (version > 1 ? 'Tu asesor ha subido la versión corregida de tu informe.' : 'Tu asesor ha terminado tu informe y ya lo tienes en tu área de cliente.') +
+          ' Descárgalo, revísalo y, si todo está bien, danos tu conformidad con un clic. Si tienes cualquier duda, pídenos el cambio desde ahí mismo.'],
+        boton: enlace ? { texto: 'Ver mi informe', url: enlace } : null,
+        nota: 'Por tu privacidad, el informe no viaja por correo: está guardado en tu área y podrás descargarlo siempre que lo necesites.',
+      });
+      try { await enviarCorreo(p.correo, version > 1 ? 'Tu informe corregido de Acros está listo' : 'Tu informe de Acros está listo', c.html, c.texto); correo = 'enviado'; }
+      catch (err) { console.error('Correo de entrega no enviado:', err.message); correo = 'fallo'; }
+    }
+    res.status(201).json({ ok: true, id: r.insertId, version, servicio: serv, correo });
+  } finally { conn.release(); }
+});
+async function enviarArchivoEntrega(res, e) {
+  const { buffer, tipoMime } = await bajarDeR2(e.clave_r2);
+  res.set('Content-Type', tipoMime || e.tipo || 'application/octet-stream');
+  res.set('Content-Disposition', 'attachment; filename*=UTF-8\'\'' + encodeURIComponent(e.nombre_archivo));
+  res.send(buffer);
+}
+app.get('/api/admin/entregas/:id/descargar', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT * FROM entregas WHERE `id` = ?', [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'No encontrado' });
+    await enviarArchivoEntrega(res, f[0]);
+  } finally { conn.release(); }
+});
+// Cliente: descargar cualquiera de SUS informes (de este encargo o de anteriores)
+app.get('/api/propuestas/:token/entregas/:id/descargar', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [f] = await conn.execute('SELECT * FROM entregas WHERE `id` = ? AND `cliente_id` = ?', [Number(req.params.id), p.cliente_id]);
+    if (!f.length) return res.status(404).json({ error: 'No encontrado' });
+    await enviarArchivoEntrega(res, f[0]);
+  } finally { conn.release(); }
+});
+async function entregaDelCliente(conn, token, id) {
+  const p = await propuestaVigente(conn, token);
+  if (!p) return { error: [404, 'Propuesta no encontrada'] };
+  const [f] = await conn.execute('SELECT * FROM entregas WHERE `id` = ? AND `propuesta_id` = ?', [Number(id), p.id]);
+  if (!f.length) return { error: [404, 'Informe no encontrado'] };
+  const [ult] = await conn.execute('SELECT MAX(`id`) AS m FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ?', [p.id, f[0].servicio]);
+  if (ult[0].m !== f[0].id) return { error: [409, 'Hay una versión más reciente de este informe'] };
+  if (f[0].estado !== 'entregado') return { error: [409, 'Ya respondiste a este informe'] };
+  return { p, e: f[0] };
+}
+app.post('/api/propuestas/:token/entregas/:id/conformidad', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const r = await entregaDelCliente(conn, req.params.token, req.params.id);
+    if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    await conn.execute("UPDATE entregas SET `estado` = 'conforme', `respondido_en` = NOW() WHERE `id` = ?", [r.e.id]);
+    avisar('✅ Un cliente ha dado su conformidad a su informe', 'Ese servicio queda terminado.', { etiqueta: 'white_check_mark' });
+    res.json({ ok: true, estado: 'conforme' });
+  } finally { conn.release(); }
+});
+app.post('/api/propuestas/:token/entregas/:id/cambios', async (req, res) => {
+  const comentario = textoMensaje(req.body && req.body.comentario);
+  if (!comentario) return res.status(400).json({ error: 'Cuéntanos qué quieres cambiar' });
+  const conn = await pool.getConnection();
+  try {
+    const r = await entregaDelCliente(conn, req.params.token, req.params.id);
+    if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    await conn.execute("UPDATE entregas SET `estado` = 'cambios', `comentario` = ?, `respondido_en` = NOW() WHERE `id` = ?", [comentario, r.e.id]);
+    // El comentario va también al chat de ese servicio, para hablarlo ahí
+    await conn.execute("INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, texto) VALUES (?, ?, ?, 'cliente', ?)",
+      [r.p.id, r.p.cliente_id, r.e.servicio, 'Sobre el informe entregado (versión ' + r.e.version + '): ' + comentario]);
+    avisar('✏️ Un cliente pide un cambio en su informe', 'Lo tienes en «Mensajes sin leer» y en su ficha.', { prioridad: 4, etiqueta: 'pencil2' });
+    res.json({ ok: true, estado: 'cambios' });
+  } finally { conn.release(); }
+});
+
 // --- Aviso por correo al cliente, agrupado (06/10) ---
 // Cada minuto: para cada encargo con mensajes del asesor SIN LEER cuyo
 // último mensaje tiene ya más de SEGUNDOS_AVISO_CHAT (5 min por defecto)
