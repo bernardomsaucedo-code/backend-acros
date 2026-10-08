@@ -561,7 +561,8 @@ async function asegurarEsquema() {
 
       // Registro de las copias de la base de datos (07/10). 08/10: la columna
       // se llamaba «manual», que es palabra reservada en MySQL 8.4+ (Railway)
-      // aunque MariaDB la acepte: ahora «es_manual», y todo entre comillas.
+      // aunque MariaDB la acepte: ahora «es_manual», y todo entre comillas
+      // (también los alias: «AS manual» sin comillas rompía la lista).
       await pool.execute(
         'CREATE TABLE IF NOT EXISTS copias_bd (' +
         ' `id`        INT AUTO_INCREMENT PRIMARY KEY,' +
@@ -2923,7 +2924,7 @@ setTimeout(revisarCopiaNocturna, 60 * 1000);
 app.get('/api/admin/copias-bd', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [filas] = await conn.query('SELECT `id`, `fecha`, `bytes`, `tablas`, `filas`, `estado`, `error`, `es_manual` AS manual, `creado_en` FROM copias_bd ORDER BY `creado_en` DESC, `id` DESC LIMIT 60');
+    const [filas] = await conn.query('SELECT `id`, `fecha`, `bytes`, `tablas`, `filas`, `estado`, `error`, `es_manual` AS `manual`, `creado_en` FROM copias_bd ORDER BY `creado_en` DESC, `id` DESC LIMIT 60');
     res.json({ copias: filas, conservadas: COPIAS_A_CONSERVAR, r2_configurado: !!R2_BUCKET });
   } finally { conn.release(); }
 });
