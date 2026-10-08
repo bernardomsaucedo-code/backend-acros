@@ -181,15 +181,63 @@ const DIAS_VIGENCIA_SESION_CLIENTE = 7;
 const MINUTOS_VIGENCIA_ACCESO = 15;
 const brevoActivo = () => !!(BREVO_API_KEY && BREVO_REMITENTE);
 
-async function enviarCorreo(destinatario, asunto, html) {
+async function enviarCorreo(destinatario, asunto, html, texto) {
   const url = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
-  await axios.post(url, {
+  const cuerpo = {
     sender: { email: BREVO_REMITENTE, name: 'Acros' },
     to: [{ email: destinatario }],
     subject: asunto,
     htmlContent: html,
-  }, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
+  };
+  if (texto) cuerpo.textContent = texto; // versión en texto plano: mejor entrega y lectores sin HTML
+  await axios.post(url, cuerpo, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
 }
+
+// ================================================================
+// PLANTILLA DE CORREO CON LA MARCA (08/10)
+// Todos los correos a clientes salen con la misma cara: logo y nombre
+// arriba, título, texto cercano, botón naranja con la montaña y, debajo,
+// en pequeño y gris, el enlace en claro por si el botón no funciona.
+// HTML de correo «a la antigua» (tablas y estilos en línea) para que se
+// vea igual en Gmail, Outlook y el móvil. Las imágenes se sirven desde la
+// web (SITE_URL/marca/…); si el programa de correo las bloquea, el texto
+// ACROS y el botón siguen viéndose. Va con versión en texto plano.
+// ================================================================
+const ESC_HTML = t => String(t == null ? '' : t).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+function plantillaCorreo({ titulo, parrafos = [], boton, nota }) {
+  const img = n => SITE_URL ? `${SITE_URL}/marca/${n}` : null;
+  const fuenteTit = "Georgia, 'Times New Roman', serif";
+  const fuente = 'Helvetica, Arial, sans-serif';
+  const logo = img('correo-logo.png');
+  const icono = img('correo-boton.png');
+  const html = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${ESC_HTML(titulo)}</title></head>
+<body style="margin:0; padding:0; background:#FBF8F2;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBF8F2;"><tr><td align="center" style="padding:28px 14px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px; background:#FFFFFF; border:1px solid #E6DCCD; border-top:4px solid #D2601F; border-radius:14px;">
+    <tr><td style="padding:24px 30px 6px;">
+      <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+        ${logo ? `<td style="padding-right:10px; vertical-align:middle;"><img src="${logo}" width="30" height="24" alt="" style="display:block; border:0;"></td>` : ''}
+        <td style="vertical-align:middle; font-family:${fuenteTit}; font-size:19px; letter-spacing:4px; color:#23402F;">ACROS</td>
+      </tr></table>
+    </td></tr>
+    <tr><td style="padding:18px 30px 0; font-family:${fuenteTit}; font-size:23px; line-height:1.25; color:#23402F;">${ESC_HTML(titulo)}</td></tr>
+    ${parrafos.map(p => `<tr><td style="padding:12px 30px 0; font-family:${fuente}; font-size:15px; line-height:1.55; color:#423F3A;">${p}</td></tr>`).join('')}
+    ${boton ? `<tr><td style="padding:24px 30px 6px;">
+      <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="background:#B9541B; border-radius:10px;">
+        <a href="${ESC_HTML(boton.url)}" style="display:inline-block; padding:13px 22px; font-family:${fuente}; font-size:15px; font-weight:bold; color:#FFFFFF; text-decoration:none; border-radius:10px;">${icono ? `<img src="${icono}" width="18" height="18" alt="" style="vertical-align:-3px; margin-right:8px; border:0;">` : ''}${ESC_HTML(boton.texto)}</a>
+      </td></tr></table>
+    </td></tr>
+    <tr><td style="padding:10px 30px 0; font-family:${fuente}; font-size:12px; line-height:1.5; color:#8A8378;">¿El botón no funciona? Copia este enlace en tu navegador:<br><a href="${ESC_HTML(boton.url)}" style="color:#8A8378; word-break:break-all;">${ESC_HTML(boton.url)}</a></td></tr>` : ''}
+    ${nota ? `<tr><td style="padding:18px 30px 0; font-family:${fuente}; font-size:13px; line-height:1.5; color:#6B655C;">${nota}</td></tr>` : ''}
+    <tr><td style="padding:24px 30px 24px;"><div style="border-top:1px solid #E6DCCD; padding-top:14px; font-family:${fuente}; font-size:11.5px; line-height:1.5; color:#8A8378;">Acros · Fiscal cripto · <a href="${SITE_URL || 'https://acrosfi.es'}" style="color:#8A8378;">acrosfi.es</a> · 668 170 020</div></td></tr>
+  </table>
+</td></tr></table>
+</body></html>`;
+  const sinEtiquetas = t => String(t).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
+  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros · acrosfi.es · 668 170 020'].join('\n');
+  return { html, texto };
+}
+
 // ================================================================
 // AVISOS AL MÓVIL POR NTFY (06/10)
 // Decidido en septiembre y nunca programado hasta ahora. Cada aviso lleva
@@ -1147,11 +1195,22 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     if (brevoActivo()) {
       const enlace = enlaceArea('area', token);
       const importeTexto = (normalizado.importe_centimos / 100).toFixed(2) + ' €';
-      const cuerpo = enlace
-        ? `<p>Hola,</p><p>Tu asesor te ha enviado una propuesta por ${importeTexto}. Puedes verla y aceptarla aquí:</p><p><a href="${enlace}">${enlace}</a></p><p>Válida durante 14 días.</p>`
-        : `<p>Hola,</p><p>Tu asesor te ha enviado una propuesta por ${importeTexto}. Tu código de acceso es:</p><p><strong>${token}</strong></p><p>Válida durante 14 días.</p>`;
+      const correoP = plantillaCorreo(enlace ? {
+        titulo: 'Tu propuesta está lista',
+        parrafos: [
+          'Hola:',
+          `Tu asesor de Acros ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
+        ],
+        boton: { texto: 'Ver mi propuesta', url: enlace },
+        nota: 'La propuesta es válida durante 14 días. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 170 020.',
+      } : {
+        titulo: 'Tu propuesta está lista',
+        parrafos: ['Hola:', `Tu asesor de Acros ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
+        nota: 'La propuesta es válida durante 14 días.',
+      });
       try {
-        await enviarCorreo(correo, 'Tu propuesta de Acros', cuerpo);
+        await enviarCorreo(correo, 'Tu propuesta de Acros está lista', correoP.html, correoP.texto);
+
       } catch (err) {
         console.error('Error al enviar el correo de propuesta (Brevo):', err.response?.data || err.message);
       }
@@ -1200,7 +1259,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento FROM clientes WHERE id = ?', [p.cliente_id]);
+    const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento, creado_en FROM clientes WHERE id = ?', [p.cliente_id]);
     const [pagos] = await conn.execute('SELECT metodo, estado, hash_transaccion, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
     const [diligencias] = await conn.execute('SELECT estado, coherencia, resuelto_en FROM diligencias WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
     // Solo interesa mandar la lista de documentos una vez la diligencia está
@@ -1217,7 +1276,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       documentos = filas;
     }
     res.json({
-      propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en },
+      propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
       diligencia: diligencias[0] || null,
@@ -2145,11 +2204,19 @@ app.post('/api/acceso/solicitar', async (req, res) => {
       const enlace = enlaceArea('area', token, 'acceso');
       let algunCanalReal = false;
       if (brevoActivo()) {
-        const cuerpo = enlace
-          ? `<p>Hola,</p><p>Aquí tienes tu acceso, válido durante 15 minutos:</p><p><a href="${enlace}">${enlace}</a></p>`
-          : `<p>Hola,</p><p>Tu código de acceso (válido 15 minutos) es:</p><p><strong>${token}</strong></p>`;
+        const saludo = cliente.nombre ? `Hola, ${ESC_HTML(cliente.nombre)}:` : 'Hola:';
+        const correoA = plantillaCorreo(enlace ? {
+          titulo: 'Entra en tu área',
+          parrafos: [saludo, 'Aquí tienes tu enlace para entrar en tu área de cliente de Acros. Es personal, sirve una sola vez y caduca en 15 minutos.'],
+          boton: { texto: 'Entra en tu área', url: enlace },
+          nota: 'Si no lo has pedido tú, no tienes que hacer nada: sin este correo nadie puede entrar en tu área.',
+        } : {
+          titulo: 'Entra en tu área',
+          parrafos: [saludo, `Tu código de acceso es <strong>${ESC_HTML(token)}</strong>. Sirve una sola vez y caduca en 15 minutos.`],
+        });
         try {
-          await enviarCorreo(correo, 'Tu acceso a Acros', cuerpo);
+          await enviarCorreo(correo, 'Tu enlace para entrar en Acros', correoA.html, correoA.texto);
+
           algunCanalReal = true;
         } catch (err) {
           console.error('Error al enviar el correo de acceso (Brevo):', err.response?.data || err.message);
@@ -2774,10 +2841,13 @@ async function enviarAvisosChatPendientes() {
       if (!f.correo) continue;
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
       try {
-        await enviarCorreo(f.correo, 'Tu asesor de Acros te ha escrito',
-          `<p>Hola,</p><p>Tu asesor de Acros te ha escrito en tu área de cliente.</p>` +
-          (enlace ? `<p><a href="${enlace}">Entra en tu área para leerlo y contestar</a>.</p>` : `<p>Entra en tu área de cliente para leerlo y contestar.</p>`) +
-          `<p>Por tu privacidad, los mensajes no van en este correo.</p><p>— Acros</p>`);
+        const correoC = plantillaCorreo({
+          titulo: 'Tienes un mensaje de tu asesor',
+          parrafos: ['Hola:', 'Tu asesor de Acros te ha escrito en tu área de cliente. Por tu privacidad, los mensajes no viajan por correo: entra para leerlo y contestarle.'],
+          boton: enlace ? { texto: 'Leer el mensaje', url: enlace } : null,
+          nota: enlace ? null : 'Entra en tu área de cliente desde acrosfi.es para leerlo.',
+        });
+        await enviarCorreo(f.correo, 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto);
       } catch (err) {
         console.error('Correo de aviso de chat no enviado (encargo ' + f.propuesta_id + '):', err.message);
       }
