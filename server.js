@@ -208,6 +208,8 @@ function avisar(titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } = {}) {
     .catch(err => { console.error('Aviso ntfy no enviado:', err.message); return false; });
 }
 
+// 08/10: las páginas tienen direcciones limpias (acrosfi.es/area); los
+// nombres antiguos (acros_area.html…) siguen funcionando con páginas de paso.
 function enlaceArea(ruta, token, parametro = 'token') {
   // Sin SITE_URL configurada todavía (no hay dominio público real), el
   // correo incluye el token en texto en vez de un enlace clicable — se
@@ -1143,7 +1145,7 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     );
     await conn.commit();
     if (brevoActivo()) {
-      const enlace = enlaceArea('acros_area.html', token);
+      const enlace = enlaceArea('area', token);
       const importeTexto = (normalizado.importe_centimos / 100).toFixed(2) + ' €';
       const cuerpo = enlace
         ? `<p>Hola,</p><p>Tu asesor te ha enviado una propuesta por ${importeTexto}. Puedes verla y aceptarla aquí:</p><p><a href="${enlace}">${enlace}</a></p><p>Válida durante 14 días.</p>`
@@ -2140,7 +2142,7 @@ app.post('/api/acceso/solicitar', async (req, res) => {
         'INSERT INTO tokens_acceso (cliente_id, token, expira_en) VALUES (?, ?, ?)',
         [cliente.id, token, aSQLDatetime(expira)]
       );
-      const enlace = enlaceArea('acros_area.html', token, 'acceso');
+      const enlace = enlaceArea('area', token, 'acceso');
       let algunCanalReal = false;
       if (brevoActivo()) {
         const cuerpo = enlace
@@ -2770,7 +2772,7 @@ async function enviarAvisosChatPendientes() {
       await conn.execute(
         'INSERT INTO avisos_chat (propuesta_id, ultimo_aviso_en) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE ultimo_aviso_en = NOW()', [f.propuesta_id]);
       if (!f.correo) continue;
-      const enlace = SITE_URL ? `${SITE_URL}/acros_area.html?login=1` : null;
+      const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
       try {
         await enviarCorreo(f.correo, 'Tu asesor de Acros te ha escrito',
           `<p>Hola,</p><p>Tu asesor de Acros te ha escrito en tu área de cliente.</p>` +
