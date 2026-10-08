@@ -44,6 +44,17 @@ const zlib = require('zlib');
 const mysql = require('mysql2/promise');
 
 const app = express();
+// 08/10: en Express 4, si una ruta async falla (error de base de datos,
+// etc.) el error no llega a Express: la petición se queda colgada y el
+// panel esperando. Se envuelven todas las rutas para que cualquier fallo
+// acabe en el gestor de errores de abajo, que responde con un JSON 500.
+for (const metodo of ['get', 'post', 'put', 'delete', 'patch']) {
+  const original = app[metodo].bind(app);
+  app[metodo] = (ruta, ...manejadores) => original(ruta, ...manejadores.map(h =>
+    (typeof h === 'function' && h.length < 4)
+      ? (req, res, next) => { try { const r = h(req, res, next); if (r && typeof r.catch === 'function') r.catch(next); } catch (e) { next(e); } }
+      : h));
+}
 
 // Red de seguridad (10/09, encontrado mientras se probaba lo de asesores):
 // un error async que escape de una ruta sin pasar por su propio
@@ -548,22 +559,23 @@ async function asegurarEsquema() {
         )
       `);
 
-      // Registro de las copias de la base de datos (07/10)
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS copias_bd (
-          id         INT AUTO_INCREMENT PRIMARY KEY,
-          fecha      DATE         NOT NULL,
-          clave_r2   VARCHAR(200) NULL,
-          bytes      INT          NULL,
-          tablas     INT          NULL,
-          filas      INT          NULL,
-          estado     ENUM('ok','error') NOT NULL,
-          error      TEXT         NULL,
-          manual     TINYINT(1)   NOT NULL DEFAULT 0,
-          creado_en  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await creaIndiceSiFalta('idx_copias_fecha ON copias_bd (fecha, estado)');
+      // Registro de las copias de la base de datos (07/10). 08/10: la columna
+      // se llamaba «manual», que es palabra reservada en MySQL 8.4+ (Railway)
+      // aunque MariaDB la acepte: ahora «es_manual», y todo entre comillas.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS copias_bd (' +
+        ' `id`        INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `fecha`     DATE         NOT NULL,' +
+        ' `clave_r2`  VARCHAR(200) NULL,' +
+        ' `bytes`     INT          NULL,' +
+        ' `tablas`    INT          NULL,' +
+        ' `filas`     INT          NULL,' +
+        " `estado`    ENUM('ok','error') NOT NULL," +
+        ' `error`     TEXT         NULL,' +
+        ' `es_manual` TINYINT(1)   NOT NULL DEFAULT 0,' +
+        ' `creado_en` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP)'
+      );
+      await creaIndiceSiFalta('idx_copias_fecha ON copias_bd (`fecha`, `estado`)');
 
       console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes, copias).');
       return;
@@ -2864,20 +2876,20 @@ async function hacerCopiaBaseDeDatos({ manual = false } = {}) {
     const clave = 'copias-bd/' + new Date().toISOString().replace(/[:.]/g, '-') + '.acros-bd.json';
     await subirAR2(clave, cifrado, 'application/json');
     const [r] = await conn.execute(
-      "INSERT INTO copias_bd (fecha, clave_r2, bytes, tablas, filas, estado, manual) VALUES (?, ?, ?, ?, ?, 'ok', ?)",
+      "INSERT INTO copias_bd (`fecha`, `clave_r2`, `bytes`, `tablas`, `filas`, `estado`, `es_manual`) VALUES (?, ?, ?, ?, ?, 'ok', ?)",
       [fecha, clave, cifrado.length, exp.tablas, exp.filas, manual ? 1 : 0]);
     // Conservar solo las últimas
-    const [viejas] = await conn.query("SELECT id, clave_r2 FROM copias_bd WHERE estado = 'ok' ORDER BY creado_en DESC, id DESC LIMIT 1000 OFFSET ?", [COPIAS_A_CONSERVAR]);
+    const [viejas] = await conn.query("SELECT `id`, `clave_r2` FROM copias_bd WHERE `estado` = 'ok' ORDER BY `creado_en` DESC, `id` DESC LIMIT 1000 OFFSET ?", [COPIAS_A_CONSERVAR]);
     for (const v of viejas) {
       try { await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: v.clave_r2 })); } catch (e) { console.error('No se pudo borrar la copia antigua', v.clave_r2, e.message); continue; }
-      await conn.execute('DELETE FROM copias_bd WHERE id = ?', [v.id]);
+      await conn.execute('DELETE FROM copias_bd WHERE `id` = ?', [v.id]);
     }
-    await conn.execute("DELETE FROM copias_bd WHERE estado = 'error' AND creado_en < NOW() - INTERVAL 60 DAY");
+    await conn.execute("DELETE FROM copias_bd WHERE `estado` = 'error' AND `creado_en` < NOW() - INTERVAL 60 DAY");
     console.log(`Copia de la base de datos hecha: ${clave} (${exp.tablas} tablas, ${exp.filas} filas, ${cifrado.length} bytes)`);
     return { id: r.insertId, clave, bytes: cifrado.length, tablas: exp.tablas, filas: exp.filas };
   } catch (err) {
     console.error('COPIA BD: ha fallado:', err.message);
-    try { await conn.execute("INSERT INTO copias_bd (fecha, estado, error, manual) VALUES (?, 'error', ?, ?)", [fecha, String(err.message).slice(0, 2000), manual ? 1 : 0]); } catch (e) { /* sin base no hay registro */ }
+    try { await conn.execute("INSERT INTO copias_bd (`fecha`, `estado`, `error`, `es_manual`) VALUES (?, 'error', ?, ?)", [fecha, String(err.message).slice(0, 2000), manual ? 1 : 0]); } catch (e) { /* sin base no hay registro */ }
     throw err;
   } finally {
     conn.release();
@@ -2893,9 +2905,9 @@ async function revisarCopiaNocturna() {
   let conn;
   try {
     conn = await pool.getConnection();
-    const [hoy] = await conn.execute("SELECT estado, creado_en FROM copias_bd WHERE fecha = ? AND manual = 0 ORDER BY id DESC", [ahoraM.fecha]);
+    const [hoy] = await conn.execute("SELECT `estado`, `creado_en` FROM copias_bd WHERE `fecha` = ? AND `es_manual` = 0 ORDER BY `id` DESC", [ahoraM.fecha]);
     if (hoy.some(f => f.estado === 'ok')) return;
-    const [recientes] = await conn.execute("SELECT COUNT(*) AS n FROM copias_bd WHERE fecha = ? AND manual = 0 AND estado = 'error' AND creado_en > NOW() - INTERVAL 55 MINUTE", [ahoraM.fecha]);
+    const [recientes] = await conn.execute("SELECT COUNT(*) AS n FROM copias_bd WHERE `fecha` = ? AND `es_manual` = 0 AND `estado` = 'error' AND `creado_en` > NOW() - INTERVAL 55 MINUTE", [ahoraM.fecha]);
     if (recientes[0].n > 0) return;
     const fallosPrevios = hoy.filter(f => f.estado === 'error').length;
     conn.release(); conn = null;
@@ -2911,7 +2923,7 @@ setTimeout(revisarCopiaNocturna, 60 * 1000);
 app.get('/api/admin/copias-bd', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [filas] = await conn.query('SELECT id, fecha, bytes, tablas, filas, estado, error, manual, creado_en FROM copias_bd ORDER BY creado_en DESC, id DESC LIMIT 60');
+    const [filas] = await conn.query('SELECT `id`, `fecha`, `bytes`, `tablas`, `filas`, `estado`, `error`, `es_manual` AS manual, `creado_en` FROM copias_bd ORDER BY `creado_en` DESC, `id` DESC LIMIT 60');
     res.json({ copias: filas, conservadas: COPIAS_A_CONSERVAR, r2_configurado: !!R2_BUCKET });
   } finally { conn.release(); }
 });
@@ -2926,7 +2938,7 @@ app.post('/api/admin/copias-bd/ahora', requiereSesionAsesor, requiereAdminWeb, a
 app.get('/api/admin/copias-bd/:id/descargar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [filas] = await conn.execute("SELECT clave_r2, fecha FROM copias_bd WHERE id = ? AND estado = 'ok'", [Number(req.params.id)]);
+    const [filas] = await conn.execute("SELECT `clave_r2`, `fecha` FROM copias_bd WHERE `id` = ? AND `estado` = 'ok'", [Number(req.params.id)]);
     if (!filas.length) return res.status(404).json({ error: 'Esa copia no existe' });
     const { buffer } = await bajarDeR2(filas[0].clave_r2);
     const nombre = 'acros-bd-' + String(filas[0].fecha).slice(0, 10) + '-' + req.params.id + '.acros-bd.json';
@@ -2955,7 +2967,10 @@ app.use((err, req, res, next) => {
   if (err.type === 'entity.too.large') {
     return res.status(413).json({ error: 'El archivo es demasiado grande (máximo 15 MB por subida).' });
   }
-  next(err);
+  // 08/10: cualquier otro error de una ruta (ver el envoltorio junto a «const app»)
+  console.error('Error en ' + req.method + ' ' + req.path + ':', err.message || err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Error interno del servidor. Inténtalo de nuevo en un momento.' });
 });
 
 const PUERTO = process.env.PORT || 3000;
