@@ -674,6 +674,24 @@ async function asegurarEsquema() {
         ' FOREIGN KEY (`asesor_id`) REFERENCES asesores(`id`))'
       );
       await migrarEquipoAPersonas();
+      await agregaColumnaSiFalta('personas', '`por_defecto`', 'TINYINT(1) NOT NULL DEFAULT 0');
+      await agregaColumnaSiFalta('solicitudes_presupuesto', '`asesor_preferido_id`', 'INT NULL');
+      // Fase C (10/10): valoración del asesor al terminar el encargo
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS valoraciones (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `propuesta_id` INT NOT NULL UNIQUE,' +
+        ' `cliente_id` INT NOT NULL,' +
+        ' `persona_id` INT NULL,' +
+        ' `atencion` TINYINT NULL, `calidad` TINYINT NULL, `rapidez` TINYINT NULL,' +
+        ' `comentario` TEXT NULL, `comentario_revisado` TEXT NULL,' +
+        " `nombre_publico` ENUM('completo','nombre_inicial','inicial_apellido','iniciales') NULL," +
+        ' `nombre_mostrado` VARCHAR(160) NULL,' +
+        " `estado` ENUM('omitida','por_revisar','revisada') NOT NULL," +
+        ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' `revisado_en` DATETIME NULL, `revisado_por` INT NULL, `recordatorio_en` DATETIME NULL,' +
+        ' FOREIGN KEY (`propuesta_id`) REFERENCES propuestas(`id`))'
+      );
       // Fase B (10/10): el asesor de cada cliente y los cambios que pide
       await agregaColumnaSiFalta('clientes', '`asesor_persona_id`', 'INT NULL');
       await pool.execute(
@@ -839,7 +857,7 @@ app.post('/api/presupuesto', async (req, res) => {
   const tokenCuest = conCuestionario ? null : crypto.randomBytes(16).toString('hex');
   try {
     const [ins] = await pool.execute(
-      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `token_cuestionario`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `token_cuestionario`, `asesor_preferido_id`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         Array.isArray(servicios) ? JSON.stringify(servicios) : servicios.toString().trim(),
         detalle ? detalle.toString().trim() : null,
@@ -849,6 +867,7 @@ app.post('/api/presupuesto', async (req, res) => {
         origen,
         conCuestionario ? JSON.stringify(cuestionario) : null,
         tokenCuest,
+        Number.isInteger(Number(req.body.asesor_preferido)) && Number(req.body.asesor_preferido) > 0 ? Number(req.body.asesor_preferido) : null,
       ]
     );
     avisar('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
@@ -1350,6 +1369,10 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     await conn.execute(
       'UPDATE clientes c JOIN personas q ON q.`asesor_id` = ? AND q.`atiende_clientes` = 1 AND q.`activa` = 1 SET c.`asesor_persona_id` = q.`id` WHERE c.`id` = ? AND c.`asesor_persona_id` IS NULL',
       [req.asesor.id, cliente.id]);
+    // 10/10: si quien envía no atiende clientes, el asesor por defecto
+    await conn.execute(
+      'UPDATE clientes c JOIN personas q ON q.`por_defecto` = 1 AND q.`atiende_clientes` = 1 AND q.`activa` = 1 SET c.`asesor_persona_id` = q.`id` WHERE c.`id` = ? AND c.`asesor_persona_id` IS NULL',
+      [cliente.id]);
     const token = generarToken();
     const expira = sumarDias(ahora(), 14);
     const [r] = await conn.execute(
@@ -1450,11 +1473,13 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
     const asesorCli = await personaDeCliente(p.cliente_id, conn).catch(() => null);
     const [dispo] = await conn.query('SELECT * FROM personas WHERE `activa` = 1 AND `atiende_clientes` = 1 ORDER BY `orden`, `id`');
     const [camb] = await conn.execute("SELECT `a_persona_id`, `creado_en` FROM cambios_asesor WHERE `cliente_id` = ? AND `estado` = 'pendiente' ORDER BY `id` DESC LIMIT 1", [p.cliente_id]);
-    const personaPublica = q => q ? { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' }, foto: q.foto } : null;
+    const personaPublica = q => { if (!q) return null; let esp = []; try { esp = JSON.parse(q.especialidades || '[]'); } catch (e) {} return { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' }, foto: q.foto, especialidades: Array.isArray(esp) ? esp : [] }; };
+    const [valor] = await conn.execute('SELECT `estado` FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
     res.json({
       asesor: personaPublica(asesorCli),
       asesores_disponibles: dispo.map(personaPublica),
       cambio_asesor_pendiente: camb[0] || null,
+      valoracion: valor[0] ? valor[0].estado : null,
       entregas: entregasCli.filter(e => e.propuesta_id === p.id),
       entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en },
@@ -3066,7 +3091,7 @@ function personaParaPanel(q) {
   let esp = []; try { esp = JSON.parse(q.especialidades || '[]'); } catch (e) {}
   return { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' },
     foto: q.foto, especialidades: Array.isArray(esp) ? esp : [], atiende_clientes: !!q.atiende_clientes, asesor_id: q.asesor_id,
-    asesor_nombre: q.asesor_nombre || null, asesor_correo: q.asesor_correo || null, ntfy_topic: q.ntfy_topic || '', activa: !!q.activa, orden: q.orden };
+    asesor_nombre: q.asesor_nombre || null, asesor_correo: q.asesor_correo || null, ntfy_topic: q.ntfy_topic || '', activa: !!q.activa, orden: q.orden, por_defecto: !!q.por_defecto };
 }
 app.get('/api/admin/personas', requiereSesionAsesor, async (req, res) => {
   const [filas] = await pool.query('SELECT p.*, a.`nombre` AS asesor_nombre, a.`correo` AS asesor_correo FROM personas p LEFT JOIN asesores a ON a.`id` = p.`asesor_id` ORDER BY p.`activa` DESC, p.`orden`, p.`id`');
@@ -3094,12 +3119,15 @@ async function guardarPersona(req, res, id) {
     if (topic && !RE_TOPIC_NTFY.test(topic)) return res.status(400).json({ error: 'El canal de ntfy solo admite letras, números, «-» y «_» (6 a 64)' });
     const valores = [nombre, puesto.es || null, puesto.en || null, bio.es || null, bio.en || null, foto, JSON.stringify(esp),
       b.atiende_clientes ? 1 : 0, asesorId, topic || null, b.activa === false ? 0 : 1, Number.isInteger(b.orden) ? b.orden : 0];
+    if (b.por_defecto && b.atiende_clientes && b.activa !== false) await conn.execute('UPDATE personas SET `por_defecto` = 0 WHERE `id` <> ?', [id || 0]);
+    const porDefecto = b.por_defecto && b.atiende_clientes && b.activa !== false ? 1 : 0;
     if (id) {
+      await conn.execute('UPDATE personas SET `por_defecto` = ? WHERE `id` = ?', [porDefecto, id]);
       const [r] = await conn.execute('UPDATE personas SET `nombre`=?, `puesto_es`=?, `puesto_en`=?, `bio_es`=?, `bio_en`=?, `foto`=?, `especialidades`=?, `atiende_clientes`=?, `asesor_id`=?, `ntfy_topic`=?, `activa`=?, `orden`=? WHERE `id`=?', [...valores, id]);
       if (!r.affectedRows) return res.status(404).json({ error: 'Persona no encontrada' });
       return res.json({ ok: true, id });
     }
-    const [r] = await conn.execute('INSERT INTO personas (`nombre`, `puesto_es`, `puesto_en`, `bio_es`, `bio_en`, `foto`, `especialidades`, `atiende_clientes`, `asesor_id`, `ntfy_topic`, `activa`, `orden`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', valores);
+    const [r] = await conn.execute('INSERT INTO personas (`nombre`, `puesto_es`, `puesto_en`, `bio_es`, `bio_en`, `foto`, `especialidades`, `atiende_clientes`, `asesor_id`, `ntfy_topic`, `activa`, `orden`, `por_defecto`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', [...valores, porDefecto]);
     res.status(201).json({ ok: true, id: r.insertId });
   } finally { conn.release(); }
 }
@@ -3191,6 +3219,113 @@ app.put('/api/admin/clientes/:id/asesor', requiereSesionAsesor, requiereAdminWeb
     await conn.execute("UPDATE cambios_asesor SET estado = 'rechazado', respuesta = 'Asignado directamente desde el panel', resuelto_en = NOW(), resuelto_por = ? WHERE cliente_id = ? AND estado = 'pendiente'", [req.asesor.id, Number(req.params.id)]);
     res.json({ ok: true });
   } finally { conn.release(); }
+});
+
+// ================================================================
+// VALORACIONES (fase C, 10/10)
+// Al dar la conformidad al último informe de un encargo, el cliente valora
+// a su asesor: atención y trato, calidad del trabajo, rapidez y plazos (1-5)
+// y un comentario opcional, y elige cómo saldría su nombre. Puede decir
+// «Prefiero no valorar»: entonces recibe UN recordatorio a los 3 días. Los
+// comentarios pasan por revisión (tachado de palabras malsonantes) y, por
+// ahora, son internos. Nunca bloquea nada: la conformidad ya está dada.
+// ================================================================
+const MALSONANTES = ['joder', 'jodido', 'jodida', 'mierda', 'puta', 'puto', 'putada', 'gilipollas', 'gilipollez', 'cabron', 'cabrón', 'cabrona', 'coño', 'hostia', 'hostias', 'imbecil', 'imbécil', 'idiota', 'subnormal', 'capullo', 'pendejo', 'cojones', 'carajo', 'mamon', 'mamón', 'zorra', 'maricon', 'maricón', 'estupido', 'estúpido', 'estafadores', 'ladrones', 'chorizos', 'fuck', 'shit', 'bitch', 'asshole', 'bastard'];
+function nombreParaMostrar(c, forma) {
+  const n = String(c.nombre || '').trim(), a = String(c.apellidos || '').trim();
+  const ini = t => t ? t.charAt(0).toUpperCase() + '.' : '';
+  const primerApellido = a.split(/\s+/)[0] || '';
+  if (forma === 'completo') return [n, a].filter(Boolean).join(' ');
+  if (forma === 'nombre_inicial') return [n, ini(primerApellido)].filter(Boolean).join(' ');
+  if (forma === 'inicial_apellido') return [ini(n), primerApellido].filter(Boolean).join(' ');
+  return [ini(n), ini(primerApellido)].filter(Boolean).join(' ');
+}
+async function encargoTerminado(conn, p) {
+  const servicios = serviciosDePropuesta(p);
+  if (!servicios.length) return false;
+  const [ult] = await conn.execute('SELECT e.`servicio`, e.`estado` FROM entregas e WHERE e.`propuesta_id` = ? AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`)', [p.id]);
+  return servicios.every(sv => ult.some(u => u.servicio === sv && u.estado === 'conforme'));
+}
+app.post('/api/propuestas/:token/valoracion', async (req, res) => {
+  const b = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (!(await encargoTerminado(conn, p))) return res.status(409).json({ error: 'Podrás valorar cuando hayas dado tu conformidad a todos tus informes' });
+    const [ya] = await conn.execute('SELECT `estado` FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
+    if (ya.length && ya[0].estado !== 'omitida') return res.status(409).json({ error: 'Ya valoraste este encargo. ¡Gracias!' });
+    const asesor = await personaDeCliente(p.cliente_id, conn);
+    if (b.omitir) {
+      if (!ya.length) await conn.execute("INSERT INTO valoraciones (`propuesta_id`, `cliente_id`, `persona_id`, `estado`) VALUES (?, ?, ?, 'omitida')", [p.id, p.cliente_id, asesor ? asesor.id : null]);
+      return res.json({ ok: true, estado: 'omitida' });
+    }
+    const nota = v => { const n = Number(v); return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null; };
+    const at = nota(b.atencion), ca = nota(b.calidad), ra = nota(b.rapidez);
+    if (!at || !ca || !ra) return res.status(400).json({ error: 'Puntúa las tres preguntas (de 1 a 5 estrellas)' });
+    const forma = ['completo', 'nombre_inicial', 'inicial_apellido', 'iniciales'].includes(b.nombre_publico) ? b.nombre_publico : 'iniciales';
+    const [cl] = await conn.execute('SELECT nombre, apellidos FROM clientes WHERE id = ?', [p.cliente_id]);
+    const comentario = textoMensaje(b.comentario || '').slice(0, 2000) || null;
+    const valores = [asesor ? asesor.id : null, at, ca, ra, comentario, forma, nombreParaMostrar(cl[0] || {}, forma), comentario ? 'por_revisar' : 'revisada'];
+    if (ya.length) await conn.execute('UPDATE valoraciones SET `persona_id`=?, `atencion`=?, `calidad`=?, `rapidez`=?, `comentario`=?, `nombre_publico`=?, `nombre_mostrado`=?, `estado`=?, `creado_en`=NOW() WHERE `propuesta_id`=?', [...valores, p.id]);
+    else await conn.execute('INSERT INTO valoraciones (`persona_id`, `atencion`, `calidad`, `rapidez`, `comentario`, `nombre_publico`, `nombre_mostrado`, `estado`, `propuesta_id`, `cliente_id`) VALUES (?,?,?,?,?,?,?,?,?,?)', [...valores, p.id, p.cliente_id]);
+    const media = ((at + ca + ra) / 3).toFixed(1).replace('.', ',');
+    avisarCliente(p.cliente_id, '⭐', 'un cliente te ha valorado', 'Media ' + media + '/5' + (comentario ? ' · con comentario por revisar' : '') + '.', { etiqueta: 'star' });
+    res.status(201).json({ ok: true });
+  } finally { conn.release(); }
+});
+// Panel: revisión de comentarios y listado (solo administradores)
+app.get('/api/admin/valoraciones', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const soloRevisar = req.query.estado === 'por_revisar';
+  const [filas] = await pool.query(
+    'SELECT v.*, q.nombre AS asesor_nombre, c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.correo FROM valoraciones v ' +
+    'LEFT JOIN personas q ON q.id = v.persona_id JOIN clientes c ON c.id = v.cliente_id ' +
+    "WHERE v.estado <> 'omitida'" + (soloRevisar ? " AND v.estado = 'por_revisar'" : '') + ' ORDER BY v.creado_en DESC LIMIT 200');
+  res.json({ valoraciones: filas, malsonantes: MALSONANTES });
+});
+app.post('/api/admin/valoraciones/:id/revisar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const tachar = Array.isArray(req.body && req.body.tachar) ? req.body.tachar.map(Number).filter(Number.isInteger) : [];
+  const [f] = await pool.execute("SELECT comentario FROM valoraciones WHERE id = ? AND estado = 'por_revisar'", [Number(req.params.id)]);
+  if (!f.length) return res.status(404).json({ error: 'Esa valoración ya está revisada' });
+  // Solo se tachan palabras enteras (por su posición): el texto no se puede editar
+  let k = -1;
+  const revisado = String(f[0].comentario || '').replace(/[\p{L}\p{N}]+/gu, w => { k++; return tachar.includes(k) ? w.charAt(0) + '*'.repeat(Math.max(1, w.length - 1)) : w; });
+  await pool.execute("UPDATE valoraciones SET comentario_revisado = ?, estado = 'revisada', revisado_en = NOW(), revisado_por = ? WHERE id = ?", [revisado, req.asesor.id, Number(req.params.id)]);
+  res.json({ ok: true, comentario_revisado: revisado });
+});
+// Recordatorio único a quien dijo «Prefiero no valorar» (a los 3 días)
+async function enviarRecordatoriosValoracion() {
+  if (!brevoActivo()) return;
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    const [filas] = await conn.query("SELECT v.id, v.cliente_id, c.correo, c.nombre FROM valoraciones v JOIN clientes c ON c.id = v.cliente_id WHERE v.estado = 'omitida' AND v.recordatorio_en IS NULL AND v.creado_en <= NOW() - INTERVAL ? SECOND",
+      [Math.max(60, Number(process.env.VALORACION_RECORDATORIO_SEGUNDOS) || 3 * 24 * 3600)]);
+    for (const f of filas) {
+      await conn.execute('UPDATE valoraciones SET recordatorio_en = NOW() WHERE id = ?', [f.id]);
+      if (!f.correo) continue;
+      const asesor = await personaDeCliente(f.cliente_id, conn).catch(() => null);
+      const quien = asesor ? asesor.nombre : 'tu asesor';
+      const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+      const c = plantillaCorreo({
+        titulo: `¿Qué tal con ${quien}?`,
+        parrafos: [f.nombre ? `Hola, ${ESC_HTML(f.nombre)}:` : 'Hola:', `Hace unos días terminamos tu encargo. Si tienes un minuto, nos ayudaría mucho saber qué tal te ha atendido ${ESC_HTML(quien)}: son tres preguntas de estrellas.`],
+        boton: enlace ? { texto: 'Valorar en un minuto', url: enlace } : null,
+        nota: 'Es el único recordatorio que te enviaremos.',
+      });
+      enviarCorreo(f.correo, `¿Qué tal con ${quien}? · Acros`, c.html, c.texto).catch(err => console.error('Recordatorio de valoración no enviado:', err.message));
+    }
+  } catch (err) { console.error('Recordatorios de valoración:', err.message); }
+  finally { if (conn) conn.release(); }
+}
+setInterval(enviarRecordatoriosValoracion, Math.max(5000, Number(process.env.CHAT_TAREA_MS) || 60000) * 30);
+
+// Página pública «Equipo» (fase C): las personas activas, sin datos internos
+app.get('/api/web/equipo', async (req, res) => {
+  const [filas] = await pool.query('SELECT * FROM personas WHERE `activa` = 1 ORDER BY `orden`, `id`');
+  res.set('Cache-Control', 'no-cache');
+  res.json(filas.map(q => { let esp = []; try { esp = JSON.parse(q.especialidades || '[]'); } catch (e) {}
+    return { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' }, foto: q.foto, especialidades: Array.isArray(esp) ? esp : [], atiende_clientes: !!q.atiende_clientes }; }));
 });
 
 // ================================================================
