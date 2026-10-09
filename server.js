@@ -249,11 +249,30 @@ function plantillaCorreo({ titulo, parrafos = [], boton, nota }) {
 // ================================================================
 const NTFY_TOPIC = (process.env.NTFY_TOPIC || '').trim();
 const NTFY_SERVER = (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '');
-function avisar(titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } = {}) {
-  if (!NTFY_TOPIC) return Promise.resolve(false);
-  return axios.post(NTFY_SERVER + '/', { topic: NTFY_TOPIC, title: titulo, message: mensaje || 'Ábrelo en el panel de Acros.', priority: prioridad, tags: [etiqueta] }, { timeout: 5000 })
+function avisarEn(topic, titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } = {}) {
+  if (!topic) return Promise.resolve(false);
+  return axios.post(NTFY_SERVER + '/', { topic, title: titulo, message: mensaje || 'Ábrelo en el panel de Acros.', priority: prioridad, tags: [etiqueta] }, { timeout: 5000 })
     .then(() => true)
     .catch(err => { console.error('Aviso ntfy no enviado:', err.message); return false; });
+}
+function avisar(titulo, mensaje, opciones) { return avisarEn(NTFY_TOPIC, titulo, mensaje, opciones); }
+// Fase B (10/10): lo de un cliente concreto va con el nombre de su asesor
+// («💬 Bernardo, un cliente te ha escrito») al canal general (el admin lo
+// ve todo) y, además, al canal propio de ese asesor. Sin asesor asignado:
+// «💬 Un cliente te ha escrito», solo al general. Nunca bloquea.
+async function personaDeCliente(clienteId, conn) {
+  const ejecutar = conn || pool;
+  const [f] = await ejecutar.execute('SELECT p.* FROM clientes c JOIN personas p ON p.`id` = c.`asesor_persona_id` WHERE c.`id` = ? AND p.`activa` = 1', [clienteId]);
+  return f[0] || null;
+}
+function avisarCliente(clienteId, emoji, accion, mensaje, opciones) {
+  (async () => {
+    let q = null;
+    try { q = clienteId ? await personaDeCliente(clienteId) : null; } catch (e) { q = null; }
+    const titulo = emoji + ' ' + (q ? q.nombre + ', ' + accion : accion.charAt(0).toUpperCase() + accion.slice(1));
+    await avisar(titulo, mensaje, opciones);
+    if (q && q.ntfy_topic && q.ntfy_topic !== NTFY_TOPIC) await avisarEn(q.ntfy_topic, titulo, mensaje, opciones);
+  })().catch(() => {});
 }
 
 // 08/10: las páginas tienen direcciones limpias (acrosfi.es/area); los
@@ -655,6 +674,22 @@ async function asegurarEsquema() {
         ' FOREIGN KEY (`asesor_id`) REFERENCES asesores(`id`))'
       );
       await migrarEquipoAPersonas();
+      // Fase B (10/10): el asesor de cada cliente y los cambios que pide
+      await agregaColumnaSiFalta('clientes', '`asesor_persona_id`', 'INT NULL');
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS cambios_asesor (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `cliente_id` INT NOT NULL,' +
+        ' `desde_persona_id` INT NULL,' +
+        ' `a_persona_id` INT NOT NULL,' +
+        ' `motivo` TEXT NULL,' +
+        " `estado` ENUM('pendiente','aceptado','rechazado') NOT NULL DEFAULT 'pendiente'," +
+        ' `respuesta` TEXT NULL,' +
+        ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' `resuelto_en` DATETIME NULL,' +
+        ' `resuelto_por` INT NULL,' +
+        ' FOREIGN KEY (`cliente_id`) REFERENCES clientes(`id`))'
+      );
       await pool.execute('CREATE TABLE IF NOT EXISTS resumenes_diarios (`fecha` DATE PRIMARY KEY, `enviado_en` DATETIME NOT NULL, `elementos` INT NOT NULL DEFAULT 0)');
 
       // Informes entregados al cliente (fase 2, 08/10): solo la versión final
@@ -1310,6 +1345,11 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
   try {
     await conn.beginTransaction();
     const cliente = await obtenerOCrearCliente(conn, { correo, telefono });
+    // Fase B (10/10): sin asesor todavía → el que le envía la propuesta (si es
+    // una persona del equipo que atiende clientes)
+    await conn.execute(
+      'UPDATE clientes c JOIN personas q ON q.`asesor_id` = ? AND q.`atiende_clientes` = 1 AND q.`activa` = 1 SET c.`asesor_persona_id` = q.`id` WHERE c.`id` = ? AND c.`asesor_persona_id` IS NULL',
+      [req.asesor.id, cliente.id]);
     const token = generarToken();
     const expira = sumarDias(ahora(), 14);
     const [r] = await conn.execute(
@@ -1320,17 +1360,19 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     if (brevoActivo()) {
       const enlace = enlaceArea('area', token);
       const importeTexto = (normalizado.importe_centimos / 100).toFixed(2) + ' €';
+      const asesorP = await personaDeCliente(cliente.id).catch(() => null);
+      const quienP = asesorP ? `${ESC_HTML(asesorP.nombre)}, tu asesor de Acros,` : 'Tu asesor de Acros';
       const correoP = plantillaCorreo(enlace ? {
         titulo: 'Tu propuesta está lista',
         parrafos: [
           'Hola:',
-          `Tu asesor de Acros ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
+          `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
         ],
         boton: { texto: 'Ver mi propuesta', url: enlace },
         nota: 'La propuesta es válida durante 14 días. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 170 020.',
       } : {
         titulo: 'Tu propuesta está lista',
-        parrafos: ['Hola:', `Tu asesor de Acros ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
+        parrafos: ['Hola:', `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
         nota: 'La propuesta es válida durante 14 días.',
       });
       try {
@@ -1405,7 +1447,14 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       'FROM entregas e JOIN propuestas p2 ON p2.`id` = e.`propuesta_id` ' +
       'WHERE e.`cliente_id` = ? AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`) ' +
       'ORDER BY e.`subido_en` DESC', [p.cliente_id]);
+    const asesorCli = await personaDeCliente(p.cliente_id, conn).catch(() => null);
+    const [dispo] = await conn.query('SELECT * FROM personas WHERE `activa` = 1 AND `atiende_clientes` = 1 ORDER BY `orden`, `id`');
+    const [camb] = await conn.execute("SELECT `a_persona_id`, `creado_en` FROM cambios_asesor WHERE `cliente_id` = ? AND `estado` = 'pendiente' ORDER BY `id` DESC LIMIT 1", [p.cliente_id]);
+    const personaPublica = q => q ? { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' }, foto: q.foto } : null;
     res.json({
+      asesor: personaPublica(asesorCli),
+      asesores_disponibles: dispo.map(personaPublica),
+      cambio_asesor_pendiente: camb[0] || null,
       entregas: entregasCli.filter(e => e.propuesta_id === p.id),
       entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en },
@@ -1465,7 +1514,7 @@ app.post('/api/propuestas/:token/aceptar', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'enviada') return res.status(409).json({ error: `No se puede aceptar: estado actual "${p.estado}"` });
     await conn.execute('UPDATE propuestas SET estado = ? WHERE id = ?', ['aceptada', p.id]);
-    avisar('✅ Un cliente ha aceptado su propuesta', 'El siguiente paso es su pago.', { etiqueta: 'white_check_mark' });
+    avisarCliente(p.cliente_id, '✅', 'un cliente ha aceptado su propuesta', 'El siguiente paso es su pago.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'aceptada' });
   } finally {
     conn.release();
@@ -1480,7 +1529,7 @@ app.post('/api/propuestas/:token/rechazar', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'enviada') return res.status(409).json({ error: `No se puede rechazar: estado actual "${p.estado}"` });
     await conn.execute('UPDATE propuestas SET estado = ?, motivo_rechazo = ? WHERE id = ?', ['rechazada', motivo, p.id]);
-    avisar('❌ Un cliente ha rechazado su propuesta', 'Mira el motivo en su ficha.', { etiqueta: 'x' });
+    avisarCliente(p.cliente_id, '❌', 'un cliente ha rechazado su propuesta', 'Mira el motivo en su ficha.', { etiqueta: 'x' });
     res.json({ ok: true, estado: 'rechazada' });
   } finally {
     conn.release();
@@ -1523,7 +1572,7 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
       [p.id, metodo, (hash_transaccion || '').trim() || null, metodo === 'cripto' ? red : null,
        metodo === 'cripto' ? moneda_cripto : null, metodo === 'cripto' ? String(importe_cripto) : null]
     );
-    avisar('💶 Un cliente ha declarado un pago', 'Confírmalo en «Pagos pendientes de confirmar».', { prioridad: 4, etiqueta: 'euro' });
+    avisarCliente(p.cliente_id, '💶', 'un cliente ha declarado un pago', 'Confírmalo en «Pagos pendientes de confirmar».', { prioridad: 4, etiqueta: 'euro' });
     res.status(201).json({ ok: true, pago_id: r.insertId, estado: 'autodeclarado' });
   } finally {
     conn.release();
@@ -1930,7 +1979,7 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
     // (el Área no lo manda aquí) y se perdía el que dio al darse de alta.
     await conn.execute('UPDATE clientes SET tipo_documento = COALESCE(NULLIF(?, \'\'), tipo_documento), numero_documento = COALESCE(NULLIF(?, \'\'), numero_documento) WHERE id = ?',
       [b.tipo_documento || '', (b.numero_documento || '').trim(), p.cliente_id]);
-    avisar('🪪 Un cliente ha enviado su cuestionario de alta', 'Revísalo en «Diligencias pendientes».', { etiqueta: 'identification_card' });
+    avisarCliente(p.cliente_id, '🪪', 'un cliente ha enviado su cuestionario de alta', 'Revísalo en «Diligencias pendientes».', { etiqueta: 'identification_card' });
     res.status(201).json({ ok: true, estado: 'revision' });
   } finally {
     conn.release();
@@ -2028,6 +2077,8 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
       `SELECT p.id AS propuesta_id, p.servicios, p.importe_centimos, p.estado AS estado_propuesta,
               p.creado_en, p.actualizado_en,
               c.id AS cliente_id, c.nombre, c.apellidos, c.correo, c.telefono,
+              (SELECT q.nombre FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_nombre,
+              (SELECT q.asesor_id FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_cuenta_id,
               (SELECT pg.estado FROM pagos pg WHERE pg.propuesta_id = p.id ORDER BY pg.id DESC LIMIT 1) AS estado_pago,
               (SELECT d.estado FROM diligencias d WHERE d.propuesta_id = p.id ORDER BY d.id DESC LIMIT 1) AS estado_diligencia,
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id) AS docs_total,
@@ -2052,6 +2103,7 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
         f.entregas_conformes = suyas.filter(u => u.estado === 'conforme').length;
       });
     }
+    filas.forEach(f => { f.es_mio = f.asesor_cuenta_id === req.asesor.id; });
     res.json(filas);
   } catch (err) {
     console.error('Error al listar los encargos:', err);
@@ -2072,7 +2124,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [cli] = await conn.execute(
-      'SELECT id, correo, telefono, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en FROM clientes WHERE id = ?', [id]);
+      'SELECT id, correo, telefono, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id` FROM clientes WHERE id = ?', [id]);
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
@@ -2105,6 +2157,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
         entregas: entregasF.filter(x => x.propuesta_id === p.id),
       })),
       solicitudes,
+      cambios_asesor: (await conn.execute('SELECT ca.*, qd.nombre AS desde_nombre, qa.nombre AS a_nombre FROM cambios_asesor ca LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.cliente_id = ? ORDER BY ca.id DESC LIMIT 10', [id]))[0],
     });
   } catch (err) {
     console.error('Error al cargar la ficha del cliente:', err);
@@ -2236,7 +2289,7 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
        WHERE id = ?`,
       [clave, iv, clave_cifrada, tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), req.params.id]
     );
-    avisar('📄 Un cliente ha subido un documento', 'Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
+    avisarCliente(p.cliente_id, '📄', 'un cliente ha subido un documento', 'Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
     res.json({ ok: true, estado: 'enviado' });
   } catch (err) {
     console.error('Error al subir un documento fiscal:', err);
@@ -2887,7 +2940,7 @@ app.post('/api/propuestas/:token/mensajes', async (req, res) => {
     const ahoraMs = Date.now();
     if (ahoraMs - (ultimoAvisoMensaje.get(p.id) || 0) > 5 * 60 * 1000) {
       ultimoAvisoMensaje.set(p.id, ahoraMs);
-      avisar('💬 Mensaje nuevo de un cliente', 'Contéstale desde «Mensajes sin leer» en el panel.', { prioridad: 4, etiqueta: 'speech_balloon' });
+      avisarCliente(p.cliente_id, '💬', 'un cliente te ha escrito', 'Contéstale desde «Mensajes sin leer» en el panel.', { prioridad: 4, etiqueta: 'speech_balloon' });
     }
     res.status(201).json({ ok: true, id: r.insertId, servicio });
   } finally {
@@ -3054,6 +3107,93 @@ app.post('/api/admin/personas', requiereSesionAsesor, requiereAdminWeb, (req, re
 app.put('/api/admin/personas/:id', requiereSesionAsesor, requiereAdminWeb, (req, res) => guardarPersona(req, res, Number(req.params.id)));
 
 // ================================================================
+// ASESOR ASIGNADO (fase B, 10/10)
+// El cliente pide el cambio desde su área; se confirma desde el panel; al
+// resolverlo, el cliente recibe un correo. Un administrador también puede
+// asignar directamente desde la ficha.
+// ================================================================
+async function personaAtiende(conn, id) {
+  const [f] = await conn.execute('SELECT * FROM personas WHERE `id` = ? AND `activa` = 1 AND `atiende_clientes` = 1', [Number(id)]);
+  return f[0] || null;
+}
+app.post('/api/propuestas/:token/cambio-asesor', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const destino = await personaAtiende(conn, req.body && req.body.persona_id);
+    if (!destino) return res.status(400).json({ error: 'Esa persona no está disponible' });
+    const actual = await personaDeCliente(p.cliente_id, conn);
+    if (actual && actual.id === destino.id) return res.status(400).json({ error: 'Ya es tu asesor' });
+    const [pend] = await conn.execute("SELECT id FROM cambios_asesor WHERE cliente_id = ? AND estado = 'pendiente'", [p.cliente_id]);
+    if (pend.length) return res.status(409).json({ error: 'Ya tienes un cambio pendiente de confirmar' });
+    const motivo = textoMensaje(req.body.motivo || '').slice(0, 1000) || null;
+    await conn.execute('INSERT INTO cambios_asesor (cliente_id, desde_persona_id, a_persona_id, motivo) VALUES (?, ?, ?, ?)', [p.cliente_id, actual ? actual.id : null, destino.id, motivo]);
+    avisar('🔁 Un cliente pide cambiar de asesor', (actual ? 'De ' + actual.nombre + ' a ' : 'A ') + destino.nombre + '. Confírmalo en «Cambios de asesor pendientes».', { prioridad: 4, etiqueta: 'arrows_counterclockwise' });
+    res.status(201).json({ ok: true });
+  } finally { conn.release(); }
+});
+app.get('/api/admin/cambios-asesor', requiereSesionAsesor, async (req, res) => {
+  const [filas] = await pool.query(
+    `SELECT ca.id, ca.cliente_id, ca.motivo, ca.creado_en, c.nombre, c.apellidos, c.correo, qd.nombre AS desde_nombre, qa.nombre AS a_nombre
+     FROM cambios_asesor ca JOIN clientes c ON c.id = ca.cliente_id
+     LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id
+     WHERE ca.estado = 'pendiente' ORDER BY ca.creado_en`);
+  res.json(filas);
+});
+async function asignarAsesor(conn, clienteId, persona, motivoTexto) {
+  await conn.execute('UPDATE clientes SET `asesor_persona_id` = ? WHERE id = ?', [persona ? persona.id : null, clienteId]);
+  if (persona) {
+    const t = '🤝 ' + persona.nombre + ', tienes un cliente nuevo';
+    const m = (motivoTexto || 'Te lo han asignado') + '. Lo tienes en «Clientes y encargos».';
+    avisar(t, m, { etiqueta: 'handshake' });
+    if (persona.ntfy_topic && persona.ntfy_topic !== NTFY_TOPIC) avisarEn(persona.ntfy_topic, t, m, { etiqueta: 'handshake' });
+  }
+}
+app.post('/api/admin/cambios-asesor/:id/resolver', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const accion = req.body && req.body.accion;
+  if (!['aceptar', 'rechazar'].includes(accion)) return res.status(400).json({ error: 'Acción no válida' });
+  const respuesta = textoMensaje((req.body && req.body.respuesta) || '').slice(0, 1000) || null;
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute("SELECT ca.*, c.correo, c.nombre AS cliente_nombre FROM cambios_asesor ca JOIN clientes c ON c.id = ca.cliente_id WHERE ca.id = ? AND ca.estado = 'pendiente'", [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'Ese cambio ya está resuelto o no existe' });
+    const cambio = f[0];
+    const destino = await personaAtiende(conn, cambio.a_persona_id);
+    if (accion === 'aceptar' && !destino) return res.status(409).json({ error: 'Esa persona ya no atiende clientes: recházalo o asígnale otra desde su ficha' });
+    await conn.execute("UPDATE cambios_asesor SET estado = ?, respuesta = ?, resuelto_en = NOW(), resuelto_por = ? WHERE id = ?", [accion === 'aceptar' ? 'aceptado' : 'rechazado', respuesta, req.asesor.id, cambio.id]);
+    if (accion === 'aceptar') await asignarAsesor(conn, cambio.cliente_id, destino, 'El cliente lo pidió');
+    if (cambio.correo && brevoActivo()) {
+      const actual = await personaDeCliente(cambio.cliente_id, conn);
+      const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+      const c = plantillaCorreo(accion === 'aceptar' ? {
+        titulo: `${destino.nombre} es tu nuevo asesor`,
+        parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Hemos atendido tu petición: a partir de ahora te atenderá <strong>${ESC_HTML(destino.nombre)}</strong>. Tu documentación, tus mensajes y tus informes siguen donde estaban.`].concat(respuesta ? ['«' + ESC_HTML(respuesta) + '»'] : []),
+        boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
+      } : {
+        titulo: 'Sobre tu cambio de asesor',
+        parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Por ahora no hemos podido hacer el cambio que pediste${actual ? ` y seguirá atendiéndote <strong>${ESC_HTML(actual.nombre)}</strong>` : ''}.`].concat(respuesta ? ['«' + ESC_HTML(respuesta) + '»'] : []).concat(['Si quieres comentarlo, escríbenos desde tu área o llámanos al 668 170 020.']),
+        boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
+      });
+      enviarCorreo(cambio.correo, accion === 'aceptar' ? `${destino.nombre} es tu nuevo asesor de Acros` : 'Sobre tu cambio de asesor en Acros', c.html, c.texto).catch(err => console.error('Correo de cambio de asesor no enviado:', err.message));
+    }
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
+app.put('/api/admin/clientes/:id/asesor', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const pid = req.body && req.body.persona_id;
+    const persona = pid ? await personaAtiende(conn, pid) : null;
+    if (pid && !persona) return res.status(400).json({ error: 'Esa persona no atiende clientes' });
+    await asignarAsesor(conn, Number(req.params.id), persona, 'Te lo ha asignado ' + req.asesor.nombre);
+    // Un cambio pendiente queda resuelto por la asignación directa
+    await conn.execute("UPDATE cambios_asesor SET estado = 'rechazado', respuesta = 'Asignado directamente desde el panel', resuelto_en = NOW(), resuelto_por = ? WHERE cliente_id = ? AND estado = 'pendiente'", [req.asesor.id, Number(req.params.id)]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
+
+// ================================================================
 // INFORMES ENTREGADOS (fase 2, 08/10)
 // El asesor sube la versión final de cada servicio desde la ficha; el
 // cliente la descarga en su área y da su conformidad («Todo correcto»,
@@ -3091,10 +3231,12 @@ app.post('/api/admin/propuestas/:id/entregas', requiereSesionAsesor, async (req,
     let correo = 'sin_correo';
     if (p.correo && brevoActivo()) {
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+      const asesorE = await personaDeCliente(p.cliente_id, conn).catch(() => null);
+      const quienE = asesorE ? ESC_HTML(asesorE.nombre) : 'Tu asesor';
       const c = plantillaCorreo({
         titulo: version > 1 ? 'Tu informe corregido está listo' : 'Tu informe está listo',
         parrafos: [p.cliente_nombre ? `Hola, ${ESC_HTML(p.cliente_nombre)}:` : 'Hola:',
-          (version > 1 ? 'Tu asesor ha subido la versión corregida de tu informe.' : 'Tu asesor ha terminado tu informe y ya lo tienes en tu área de cliente.') +
+          (version > 1 ? `${quienE} ha subido la versión corregida de tu informe.` : `${quienE} ha terminado tu informe y ya lo tienes en tu área de cliente.`) +
           ' Descárgalo, revísalo y, si todo está bien, danos tu conformidad con un clic. Si tienes cualquier duda, pídenos el cambio desde ahí mismo.'],
         boton: enlace ? { texto: 'Ver mi informe', url: enlace } : null,
         nota: 'Por tu privacidad, el informe no viaja por correo: está guardado en tu área y podrás descargarlo siempre que lo necesites.',
@@ -3146,7 +3288,7 @@ app.post('/api/propuestas/:token/entregas/:id/conformidad', async (req, res) => 
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
     await conn.execute("UPDATE entregas SET `estado` = 'conforme', `respondido_en` = NOW() WHERE `id` = ?", [r.e.id]);
-    avisar('✅ Un cliente ha dado su conformidad a su informe', 'Ese servicio queda terminado.', { etiqueta: 'white_check_mark' });
+    avisarCliente(r.e.cliente_id, '✅', 'un cliente ha dado su conformidad a su informe', 'Ese servicio queda terminado.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'conforme' });
   } finally { conn.release(); }
 });
@@ -3161,7 +3303,7 @@ app.post('/api/propuestas/:token/entregas/:id/cambios', async (req, res) => {
     // El comentario va también al chat de ese servicio, para hablarlo ahí
     await conn.execute("INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, texto) VALUES (?, ?, ?, 'cliente', ?)",
       [r.p.id, r.p.cliente_id, r.e.servicio, 'Sobre el informe entregado (versión ' + r.e.version + '): ' + comentario]);
-    avisar('✏️ Un cliente pide un cambio en su informe', 'Lo tienes en «Mensajes sin leer» y en su ficha.', { prioridad: 4, etiqueta: 'pencil2' });
+    avisarCliente(r.p.cliente_id, '✏️', 'un cliente pide un cambio en su informe', 'Lo tienes en «Mensajes sin leer» y en su ficha.', { prioridad: 4, etiqueta: 'pencil2' });
     res.json({ ok: true, estado: 'cambios' });
   } finally { conn.release(); }
 });
@@ -3182,12 +3324,12 @@ async function enviarAvisosChatPendientes() {
   const conn = await pool.getConnection();
   try {
     const [pendientes] = await conn.query(
-      `SELECT m.propuesta_id, c.correo, MAX(m.creado_en) AS ultimo, a.ultimo_aviso_en
+      `SELECT m.propuesta_id, c.id AS cliente_id, c.correo, MAX(m.creado_en) AS ultimo, a.ultimo_aviso_en
        FROM mensajes m
        JOIN clientes c ON c.id = m.cliente_id
        LEFT JOIN avisos_chat a ON a.propuesta_id = m.propuesta_id
        WHERE m.autor = 'asesor' AND m.leido_en IS NULL
-       GROUP BY m.propuesta_id, c.correo, a.ultimo_aviso_en
+       GROUP BY m.propuesta_id, c.id, c.correo, a.ultimo_aviso_en
        HAVING MAX(m.creado_en) <= NOW() - INTERVAL ? SECOND
           AND (a.ultimo_aviso_en IS NULL OR MAX(m.creado_en) > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
     for (const f of pendientes) {
@@ -3197,13 +3339,14 @@ async function enviarAvisosChatPendientes() {
       if (!f.correo) continue;
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
       try {
+        const asesorC = await personaDeCliente(f.cliente_id, conn).catch(() => null);
         const correoC = plantillaCorreo({
-          titulo: 'Tienes un mensaje de tu asesor',
-          parrafos: ['Hola:', 'Tu asesor de Acros te ha escrito en tu área de cliente. Por tu privacidad, los mensajes no viajan por correo: entra para leerlo y contestarle.'],
+          titulo: asesorC ? `${asesorC.nombre} te ha escrito` : 'Tienes un mensaje de tu asesor',
+          parrafos: ['Hola:', (asesorC ? `${ESC_HTML(asesorC.nombre)}, tu asesor de Acros,` : 'Tu asesor de Acros') + ' te ha escrito en tu área de cliente. Por tu privacidad, los mensajes no viajan por correo: entra para leerlo y contestarle.'],
           boton: enlace ? { texto: 'Leer el mensaje', url: enlace } : null,
           nota: enlace ? null : 'Entra en tu área de cliente desde acrosfi.es para leerlo.',
         });
-        await enviarCorreo(f.correo, 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto);
+        await enviarCorreo(f.correo, asesorC ? `${asesorC.nombre}, tu asesor de Acros, te ha escrito` : 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto);
       } catch (err) {
         console.error('Correo de aviso de chat no enviado (encargo ' + f.propuesta_id + '):', err.message);
       }
@@ -3228,11 +3371,11 @@ async function enviarAvisosDocumentosPendientes() {
   const conn = await pool.getConnection();
   try {
     const [props] = await conn.query(
-      `SELECT d.propuesta_id, c.correo, c.nombre AS cliente_nombre, MAX(d.creado_en) AS ultimo, a.ultimo_aviso_en
+      `SELECT d.propuesta_id, c.id AS cliente_id, c.correo, c.nombre AS cliente_nombre, MAX(d.creado_en) AS ultimo, a.ultimo_aviso_en
        FROM documentos_fiscales d JOIN clientes c ON c.id = d.cliente_id
        LEFT JOIN avisos_documentos a ON a.propuesta_id = d.propuesta_id
        WHERE d.estado = 'pendiente'
-       GROUP BY d.propuesta_id, c.correo, c.nombre, a.ultimo_aviso_en
+       GROUP BY d.propuesta_id, c.id, c.correo, c.nombre, a.ultimo_aviso_en
        HAVING MAX(d.creado_en) <= NOW() - INTERVAL ? SECOND
           AND (a.ultimo_aviso_en IS NULL OR MAX(d.creado_en) > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
     for (const f of props) {
@@ -3241,16 +3384,18 @@ async function enviarAvisosDocumentosPendientes() {
       const [docs] = await conn.execute("SELECT nombre, urgente FROM documentos_fiscales WHERE propuesta_id = ? AND estado = 'pendiente' ORDER BY creado_en", [f.propuesta_id]);
       if (!docs.length) continue;
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+      const asesorD = await personaDeCliente(f.cliente_id, conn).catch(() => null);
+      const quienD = asesorD ? ESC_HTML(asesorD.nombre) : 'tu asesor';
       const c = plantillaCorreo({
-        titulo: 'Tu asesor necesita documentación',
+        titulo: asesorD ? `${asesorD.nombre} necesita documentación` : 'Tu asesor necesita documentación',
         parrafos: [f.cliente_nombre ? `Hola, ${ESC_HTML(f.cliente_nombre)}:` : 'Hola:',
-          docs.length === 1 ? 'Para seguir con tu encargo, tu asesor necesita este documento:' : 'Para seguir con tu encargo, tu asesor necesita estos documentos:',
+          docs.length === 1 ? `Para seguir con tu encargo, ${quienD} necesita este documento:` : `Para seguir con tu encargo, ${quienD} necesita estos documentos:`,
           '<strong>' + docs.map(d => ESC_HTML(d.nombre) + (d.urgente ? ' (urgente)' : '')).join('<br>') + '</strong>',
           'Súbelos desde tu área de cliente; viajan y se guardan cifrados.'],
         boton: enlace ? { texto: 'Subir documentación', url: enlace } : null,
         nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
       });
-      try { await enviarCorreo(f.correo, 'Tu asesor de Acros necesita documentación', c.html, c.texto); }
+      try { await enviarCorreo(f.correo, asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación', c.html, c.texto); }
       catch (err) { console.error('Correo de documentación pedida no enviado:', err.message); }
     }
   } catch (err) {
@@ -3289,7 +3434,8 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
     const [llams] = await conn.execute('SELECT nombre, telefono FROM solicitudes_llamada WHERE creado_en >= ? AND creado_en < ? ORDER BY creado_en', rango);
     const [emps] = await conn.execute('SELECT razon_social, contacto_nombre AS contacto FROM empresas WHERE creado_en >= ? AND creado_en < ? ORDER BY creado_en', rango).catch(() => [[]]);
     const [cuests] = await conn.execute('SELECT telefono, correo FROM solicitudes_presupuesto WHERE `cuestionario_en` >= ? AND `cuestionario_en` < ?', rango);
-    const total = sols.length + llams.length + emps.length + cuests.length;
+    const [cambs] = await conn.execute('SELECT c.nombre, c.apellidos, c.correo, qd.nombre AS desde_nombre, qa.nombre AS a_nombre, ca.estado FROM cambios_asesor ca JOIN clientes c ON c.id = ca.cliente_id LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.creado_en >= ? AND ca.creado_en < ?', rango);
+    const total = sols.length + llams.length + emps.length + cuests.length + cambs.length;
     await conn.execute('INSERT INTO resumenes_diarios (fecha, enviado_en, elementos) VALUES (?, NOW(), ?) ON DUPLICATE KEY UPDATE enviado_en = NOW(), elementos = ?', [hoy, total, total]);
     if (!total || !brevoActivo()) return { total, enviado: false };
     const servs = x => { try { const l = JSON.parse(x); return Array.isArray(l) ? l.join(', ') : String(x); } catch (e) { return String(x || ''); } };
@@ -3298,7 +3444,8 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
     const html = bloque('Solicitudes de presupuesto', sols.map(x => ESC_HTML(servs(x.servicios)) + ' · ' + ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : '') + (x.con_cuest ? ' · con cuestionario' : ' · <em>sin cuestionario</em>'))) +
       bloque('Peticiones de llamada', llams.map(x => ESC_HTML(x.nombre || '') + ' · ' + ESC_HTML(x.telefono || ''))) +
       bloque('Empresas registradas', emps.map(x => ESC_HTML(x.razon_social || '') + (x.contacto ? ' · ' + ESC_HTML(x.contacto) : ''))) +
-      bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : '')));
+      bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : ''))) +
+      bloque('Cambios de asesor pedidos', cambs.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · de ' + ESC_HTML(x.desde_nombre || 'sin asesor') + ' a ' + ESC_HTML(x.a_nombre || '?') + (x.estado === 'pendiente' ? ' · <em>pendiente</em>' : ' · ' + x.estado)));
     const c = plantillaCorreo({ titulo: 'Resumen de ayer', parrafos: ['Esto es lo que entró el ' + fechaBonita + ':', html, 'Lo tenéis todo en el panel.'] });
     const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
     for (const a of admins) {
