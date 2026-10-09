@@ -675,6 +675,22 @@ async function asegurarEsquema() {
       );
       await migrarEquipoAPersonas();
       await agregaColumnaSiFalta('personas', '`por_defecto`', 'TINYINT(1) NOT NULL DEFAULT 0');
+      // 10/10: el cliente pide expresamente que empecemos ya (desistimiento)
+      await agregaColumnaSiFalta('propuestas', '`inicio_inmediato_en`', 'DATETIME NULL');
+      // Empresas parte 2 (10/10): notas de contacto. Inalterables: no hay
+      // ninguna ruta para editarlas ni borrarlas, y solo se escriben con la
+      // sesión de un asesor (queda quién y cuándo; la clave maestra no
+      // sirve). Van en la copia nocturna como el resto de tablas.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS empresa_notas (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `empresa_id` INT NOT NULL,' +
+        ' `asesor_id` INT NOT NULL,' +
+        " `canal` ENUM('llamada','correo','whatsapp','reunion','otro') NOT NULL DEFAULT 'otro'," +
+        ' `texto` TEXT NOT NULL,' +
+        ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' FOREIGN KEY (`empresa_id`) REFERENCES empresas(`id`), FOREIGN KEY (`asesor_id`) REFERENCES asesores(`id`))'
+      );
       await agregaColumnaSiFalta('solicitudes_presupuesto', '`asesor_preferido_id`', 'INT NULL');
       // Fase C (10/10): valoración del asesor al terminar el encargo
       await pool.execute(
@@ -691,6 +707,18 @@ async function asegurarEsquema() {
         ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
         ' `revisado_en` DATETIME NULL, `revisado_por` INT NULL, `recordatorio_en` DATETIME NULL,' +
         ' FOREIGN KEY (`propuesta_id`) REFERENCES propuestas(`id`))'
+      );
+      // Fase D (10/10): colaboraciones entre asesores en un encargo
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS colaboraciones (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `propuesta_id` INT NOT NULL,' +
+        ' `persona_id` INT NOT NULL,' +
+        ' `descripcion` VARCHAR(300) NULL,' +
+        " `estado` ENUM('pendiente','confirmada') NOT NULL DEFAULT 'pendiente'," +
+        ' `anotado_por` INT NULL, `confirmado_por` INT NULL,' +
+        ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, `confirmado_en` DATETIME NULL,' +
+        ' FOREIGN KEY (`propuesta_id`) REFERENCES propuestas(`id`), FOREIGN KEY (`persona_id`) REFERENCES personas(`id`))'
       );
       // Fase B (10/10): el asesor de cada cliente y los cambios que pide
       await agregaColumnaSiFalta('clientes', '`asesor_persona_id`', 'INT NULL');
@@ -1002,6 +1030,15 @@ app.post('/api/admin/solicitudes-presupuesto/:id/desatender', requiereSesionAses
 const generarToken = () => crypto.randomBytes(16).toString('hex');
 const ahora = () => new Date();
 const sumarDias = (fecha, dias) => new Date(fecha.getTime() + dias * 86400000);
+// 10/10: validez de la propuesta = 15 días contando el de recepción: hasta
+// las 23:59:59 (hora de Madrid) del día D+14. Lo usan el backend, el correo
+// («válida hasta el …») y el Área.
+function finValidezPropuesta() {
+  const d = new Date(fechaMadrid().fecha + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 15);
+  return new Date(inicioDiaMadridUTC(d.toISOString().slice(0, 10)).getTime() - 1000);
+}
+const fechaLargaES = f => new Date(f).toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Madrid' });
 const sumarMinutos = (fecha, min) => new Date(fecha.getTime() + min * 60000);
 const aSQLDatetime = fecha => fecha.toISOString().slice(0, 19).replace('T', ' ');
 
@@ -1266,7 +1303,9 @@ app.get('/api/admin/empresas', requiereSesionAsesor, async (req, res) => {
   const estado = req.query.estado;
   const conn = await pool.getConnection();
   try {
-    const base = `SELECT e.*, aa.nombre AS asesor_asignado_nombre, ac.nombre AS estado_cambiado_por_nombre
+    const base = `SELECT e.*, aa.nombre AS asesor_asignado_nombre, ac.nombre AS estado_cambiado_por_nombre,
+                  (SELECT COUNT(*) FROM empresa_notas n WHERE n.empresa_id = e.id) AS n_notas,
+                  (SELECT MAX(n.creado_en) FROM empresa_notas n WHERE n.empresa_id = e.id) AS ultima_nota_en
                   FROM empresas e
                   LEFT JOIN asesores aa ON aa.id = e.asesor_asignado_id
                   LEFT JOIN asesores ac ON ac.id = e.estado_cambiado_por_asesor_id`;
@@ -1312,6 +1351,22 @@ app.post('/api/admin/empresas/:id/asesor', requiereSesionAsesor, async (req, res
   } finally {
     conn.release();
   }
+});
+
+// Notas de contacto (Empresas parte 2, 10/10): solo leer y añadir.
+const CANALES_NOTA = ['llamada', 'correo', 'whatsapp', 'reunion', 'otro'];
+app.get('/api/admin/empresas/:id/notas', requiereSesionAsesor, async (req, res) => {
+  const [filas] = await pool.execute('SELECT n.id, n.canal, n.texto, n.creado_en, a.nombre AS asesor_nombre FROM empresa_notas n JOIN asesores a ON a.id = n.asesor_id WHERE n.empresa_id = ? ORDER BY n.creado_en DESC, n.id DESC', [Number(req.params.id)]);
+  res.json(filas);
+});
+app.post('/api/admin/empresas/:id/notas', requiereSesionAsesor, async (req, res) => {
+  const texto = String((req.body && req.body.texto) || '').trim().slice(0, 4000);
+  if (!texto) return res.status(400).json({ error: 'Escribe la nota' });
+  const canal = CANALES_NOTA.includes(req.body.canal) ? req.body.canal : 'otro';
+  const [e] = await pool.execute('SELECT id FROM empresas WHERE id = ?', [Number(req.params.id)]);
+  if (!e.length) return res.status(404).json({ error: 'Empresa no encontrada' });
+  const [r] = await pool.execute('INSERT INTO empresa_notas (empresa_id, asesor_id, canal, texto) VALUES (?, ?, ?, ?)', [Number(req.params.id), req.asesor.id, canal, texto]);
+  res.status(201).json({ ok: true, id: r.insertId });
 });
 
 async function obtenerOCrearCliente(conn, { correo, telefono }) {
@@ -1374,7 +1429,7 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
       'UPDATE clientes c JOIN personas q ON q.`por_defecto` = 1 AND q.`atiende_clientes` = 1 AND q.`activa` = 1 SET c.`asesor_persona_id` = q.`id` WHERE c.`id` = ? AND c.`asesor_persona_id` IS NULL',
       [cliente.id]);
     const token = generarToken();
-    const expira = sumarDias(ahora(), 14);
+    const expira = finValidezPropuesta();
     const [r] = await conn.execute(
       'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id) VALUES (?, ?, ?, ?, ?, ?)',
       [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id]
@@ -1392,11 +1447,11 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
           `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
         ],
         boton: { texto: 'Ver mi propuesta', url: enlace },
-        nota: 'La propuesta es válida durante 14 días. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 170 020.',
+        nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 170 020.`,
       } : {
         titulo: 'Tu propuesta está lista',
         parrafos: ['Hola:', `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
-        nota: 'La propuesta es válida durante 14 días.',
+        nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido.`,
       });
       try {
         await enviarCorreo(correo, 'Tu propuesta de Acros está lista', correoP.html, correoP.texto);
@@ -1480,9 +1535,10 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       asesores_disponibles: dispo.map(personaPublica),
       cambio_asesor_pendiente: camb[0] || null,
       valoracion: valor[0] ? valor[0].estado : null,
+      colaboradores: (await conn.execute("SELECT q.nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id WHERE co.propuesta_id = ? AND co.estado = 'confirmada' ORDER BY co.id", [p.id]))[0].map(x => x.nombre),
       entregas: entregasCli.filter(e => e.propuesta_id === p.id),
       entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
-      propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en },
+      propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en, inicio_inmediato_en: p.inicio_inmediato_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
       diligencia: diligencias[0] || null,
@@ -1538,7 +1594,11 @@ app.post('/api/propuestas/:token/aceptar', async (req, res) => {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'enviada') return res.status(409).json({ error: `No se puede aceptar: estado actual "${p.estado}"` });
-    await conn.execute('UPDATE propuestas SET estado = ? WHERE id = ?', ['aceptada', p.id]);
+    // 10/10: sin la petición expresa de inicio inmediato no se puede aceptar
+    // (art. 98.8 y 103.a TRLGDCU: es lo que permite empezar antes de que
+    // acaben los 14 días de desistimiento). Se guarda cuándo lo marcó.
+    if (!(req.body && req.body.inicio_inmediato === true)) return res.status(400).json({ error: 'Para aceptar, marca la casilla de inicio inmediato del servicio' });
+    await conn.execute('UPDATE propuestas SET estado = ?, `inicio_inmediato_en` = NOW() WHERE id = ?', ['aceptada', p.id]);
     avisarCliente(p.cliente_id, '✅', 'un cliente ha aceptado su propuesta', 'El siguiente paso es su pago.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'aceptada' });
   } finally {
@@ -2153,7 +2213,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
-      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en
+      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en
        FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC`, [id]);
     const ids = propuestas.map(p => p.id);
     let pagos = [], diligencias = [], documentos = [], entregasF = [];
@@ -2182,6 +2242,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
         entregas: entregasF.filter(x => x.propuesta_id === p.id),
       })),
       solicitudes,
+      colaboraciones: (await conn.query('SELECT co.*, q.nombre AS persona_nombre, a.nombre AS anotado_nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id LEFT JOIN asesores a ON a.id = co.anotado_por WHERE co.propuesta_id IN (SELECT id FROM propuestas WHERE cliente_id = ?) ORDER BY co.id', [id]))[0],
       cambios_asesor: (await conn.execute('SELECT ca.*, qd.nombre AS desde_nombre, qa.nombre AS a_nombre FROM cambios_asesor ca LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.cliente_id = ? ORDER BY ca.id DESC LIMIT 10', [id]))[0],
     });
   } catch (err) {
@@ -3218,6 +3279,157 @@ app.put('/api/admin/clientes/:id/asesor', requiereSesionAsesor, requiereAdminWeb
     // Un cambio pendiente queda resuelto por la asignación directa
     await conn.execute("UPDATE cambios_asesor SET estado = 'rechazado', respuesta = 'Asignado directamente desde el panel', resuelto_en = NOW(), resuelto_por = ? WHERE cliente_id = ? AND estado = 'pendiente'", [req.asesor.id, Number(req.params.id)]);
     res.json({ ok: true });
+  } finally { conn.release(); }
+});
+
+// ================================================================
+// COLABORACIONES (fase D, 10/10)
+// Cualquiera del equipo puede apuntar que ayudó en un encargo (o el titular
+// apuntar quién le ayudó). Si la apunta el titular del encargo (el asesor
+// del cliente) o un administrador, queda confirmada; si la apunta otro (p.
+// ej. el propio colaborador), queda pendiente hasta que el titular o un
+// administrador la confirme. Al colaborador le cuenta la calidad del
+// trabajo de ese encargo al 33 % (ver «Rendimiento»).
+// ================================================================
+async function personaDeAsesor(conn, asesorId) {
+  const [f] = await conn.execute('SELECT * FROM personas WHERE asesor_id = ?', [asesorId]);
+  return f[0] || null;
+}
+async function titularDePropuesta(conn, propuestaId) {
+  const [f] = await conn.execute('SELECT c.asesor_persona_id AS pid FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?', [propuestaId]);
+  return f.length ? f[0].pid : undefined;
+}
+app.post('/api/admin/propuestas/:id/colaboraciones', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const pid = Number(req.params.id);
+    const titular = await titularDePropuesta(conn, pid);
+    if (titular === undefined) return res.status(404).json({ error: 'Encargo no encontrado' });
+    const [q] = await conn.execute('SELECT id, nombre FROM personas WHERE id = ? AND activa = 1', [Number(req.body && req.body.persona_id)]);
+    if (!q.length) return res.status(400).json({ error: 'Elige una persona del equipo' });
+    if (q[0].id === titular) return res.status(400).json({ error: 'Es el titular del encargo: no cuenta como colaboración' });
+    const [ya] = await conn.execute('SELECT id FROM colaboraciones WHERE propuesta_id = ? AND persona_id = ?', [pid, q[0].id]);
+    if (ya.length) return res.status(409).json({ error: q[0].nombre + ' ya figura como colaborador de este encargo' });
+    const yo = await personaDeAsesor(conn, req.asesor.id);
+    const confirmada = req.asesor.esAdmin || (yo && yo.id === titular);
+    const descripcion = textoWeb(req.body.descripcion, 300) || null;
+    await conn.execute('INSERT INTO colaboraciones (propuesta_id, persona_id, descripcion, estado, anotado_por, confirmado_por, confirmado_en) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [pid, q[0].id, descripcion, confirmada ? 'confirmada' : 'pendiente', req.asesor.id, confirmada ? req.asesor.id : null, confirmada ? aSQLDatetime(ahora()) : null]);
+    if (!confirmada && titular) {
+      const [t] = await conn.execute('SELECT * FROM personas WHERE id = ?', [titular]);
+      if (t.length) {
+        const titulo = '🤝 ' + t[0].nombre + ', confirma una colaboración';
+        const msg = req.asesor.nombre + ' dice que ha colaborado en un encargo tuyo. Confírmalo en la ficha del cliente.';
+        avisar(titulo, msg, { etiqueta: 'handshake' });
+        if (t[0].ntfy_topic && t[0].ntfy_topic !== NTFY_TOPIC) avisarEn(t[0].ntfy_topic, titulo, msg, { etiqueta: 'handshake' });
+      }
+    }
+    res.status(201).json({ ok: true, estado: confirmada ? 'confirmada' : 'pendiente' });
+  } finally { conn.release(); }
+});
+async function colaboracionGestionable(conn, req, id) {
+  const [f] = await conn.execute('SELECT * FROM colaboraciones WHERE id = ?', [Number(id)]);
+  if (!f.length) return { error: [404, 'No encontrada'] };
+  const titular = await titularDePropuesta(conn, f[0].propuesta_id);
+  const yo = await personaDeAsesor(conn, req.asesor.id);
+  const puede = req.asesor.esAdmin || (yo && yo.id === titular);
+  return puede ? { c: f[0], yo } : { error: [403, 'Solo el titular del encargo o un administrador'] };
+}
+app.post('/api/admin/colaboraciones/:id/confirmar', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const r = await colaboracionGestionable(conn, req, req.params.id);
+    if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    await conn.execute("UPDATE colaboraciones SET estado = 'confirmada', confirmado_por = ?, confirmado_en = NOW() WHERE id = ?", [req.asesor.id, r.c.id]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
+app.delete('/api/admin/colaboraciones/:id', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const r = await colaboracionGestionable(conn, req, req.params.id);
+    // El propio colaborador también puede retirar la suya
+    const [f] = await conn.execute('SELECT persona_id FROM colaboraciones WHERE id = ?', [Number(req.params.id)]);
+    const yo = await personaDeAsesor(conn, req.asesor.id);
+    if (r.error && !(f.length && yo && f[0].persona_id === yo.id)) return res.status(r.error[0]).json({ error: r.error[1] });
+    await conn.execute('DELETE FROM colaboraciones WHERE id = ?', [Number(req.params.id)]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
+
+// ================================================================
+// RENDIMIENTO (fase D, 10/10) — solo administradores
+// Por persona y mes. Criterios (para que el equipo los conozca):
+//  · Informes entregados: versiones 1 subidas por esa persona en el mes.
+//  · Servicios terminados: conformidades del mes en encargos de sus clientes.
+//  · Valoraciones como titular: media de cada atributo.
+//  · Calidad ponderada: su calidad como titular al 100 % + la de los
+//    encargos donde colaboró (confirmado) al 33 %.
+//  · Colaboraciones hechas (confirmadas) y recibidas en sus encargos.
+//  · Respuesta en el chat: horas medias desde un mensaje del cliente hasta
+//    la primera respuesta de un asesor (se atribuye a quien responde).
+//  · Pago → entrega: días medios entre el pago y la primera versión.
+//  · Cambios pedidos: informes suyos a los que el cliente pidió cambios.
+// ================================================================
+const PESO_COLABORACION = 0.33; // 10/10: decisión de Vikn (antes 30 %)
+app.get('/api/admin/rendimiento', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || '')) ? req.query.mes : fechaMadrid().fecha.slice(0, 7);
+  const ini = inicioDiaMadridUTC(mes + '-01');
+  const [a, m] = mes.split('-').map(Number);
+  const sig = new Date(Date.UTC(a, m, 1)).toISOString().slice(0, 10);
+  const fin = inicioDiaMadridUTC(sig);
+  const rango = [sqlFecha(ini), sqlFecha(fin)];
+  const conn = await pool.getConnection();
+  try {
+    const [personas] = await conn.query('SELECT id, nombre, asesor_id, activa, atiende_clientes FROM personas ORDER BY orden, id');
+    const porAsesor = {}; personas.forEach(q => { if (q.asesor_id) porAsesor[q.asesor_id] = q.id; });
+    const filas = {}; personas.forEach(q => { filas[q.id] = { persona_id: q.id, nombre: q.nombre, activa: !!q.activa, atiende_clientes: !!q.atiende_clientes,
+      informes: 0, terminados: 0, valoraciones: 0, atencion: null, calidad: null, rapidez: null, calidad_ponderada: null,
+      colab_hechas: 0, colab_recibidas: 0, respuesta_horas: null, dias_entrega: null, cambios: 0, piden_cambio: 0, _resp: [], _dias: [], _cal: [] }; });
+    // Informes entregados (v1) y días pago → entrega
+    const [ents] = await conn.execute('SELECT e.subido_por, e.version, e.subido_en, (SELECT COALESCE(MIN(pg.confirmado_en), MIN(pg.creado_en)) FROM pagos pg WHERE pg.propuesta_id = e.propuesta_id) AS pagado_en FROM entregas e WHERE e.subido_en >= ? AND e.subido_en < ?', rango);
+    ents.forEach(e => { const f = filas[porAsesor[e.subido_por]]; if (!f || e.version !== 1) return; f.informes++; if (e.pagado_en) f._dias.push((new Date(e.subido_en) - new Date(e.pagado_en)) / 86400000); });
+    // Cambios pedidos en informes suyos
+    const [cams] = await conn.execute("SELECT subido_por FROM entregas WHERE comentario IS NOT NULL AND respondido_en >= ? AND respondido_en < ?", rango);
+    cams.forEach(e => { const f = filas[porAsesor[e.subido_por]]; if (f) f.cambios++; });
+    // Servicios terminados (conformidad del mes) en encargos de sus clientes
+    const [conf] = await conn.execute("SELECT c.asesor_persona_id AS pid FROM entregas e JOIN clientes c ON c.id = e.cliente_id WHERE e.estado = 'conforme' AND e.respondido_en >= ? AND e.respondido_en < ?", rango);
+    conf.forEach(x => { if (filas[x.pid]) filas[x.pid].terminados++; });
+    // Valoraciones del mes (titular) y calidad ponderada con las colaboraciones
+    const [vals] = await conn.execute("SELECT v.propuesta_id, v.persona_id, v.atencion, v.calidad, v.rapidez FROM valoraciones v WHERE v.estado <> 'omitida' AND v.creado_en >= ? AND v.creado_en < ?", rango);
+    const [colabsV] = vals.length ? await conn.query("SELECT propuesta_id, persona_id FROM colaboraciones WHERE estado = 'confirmada' AND propuesta_id IN (?)", [vals.map(v => v.propuesta_id)]) : [[]];
+    const media = l => l.length ? Math.round(l.reduce((x, y) => x + y, 0) / l.length * 10) / 10 : null;
+    const acum = {};
+    vals.forEach(v => {
+      const f = filas[v.persona_id];
+      if (f) { f.valoraciones++; (acum[f.persona_id] = acum[f.persona_id] || { at: [], ca: [], ra: [] }); acum[f.persona_id].at.push(v.atencion); acum[f.persona_id].ca.push(v.calidad); acum[f.persona_id].ra.push(v.rapidez); f._cal.push([v.calidad, 1]); }
+      colabsV.filter(c => c.propuesta_id === v.propuesta_id).forEach(c => { if (filas[c.persona_id]) filas[c.persona_id]._cal.push([v.calidad, PESO_COLABORACION]); });
+    });
+    Object.keys(acum).forEach(k => { filas[k].atencion = media(acum[k].at); filas[k].calidad = media(acum[k].ca); filas[k].rapidez = media(acum[k].ra); });
+    // Colaboraciones confirmadas del mes
+    const [cols] = await conn.execute("SELECT co.persona_id, c.asesor_persona_id AS titular FROM colaboraciones co JOIN propuestas p ON p.id = co.propuesta_id JOIN clientes c ON c.id = p.cliente_id WHERE co.estado = 'confirmada' AND co.confirmado_en >= ? AND co.confirmado_en < ?", rango);
+    cols.forEach(c => { if (filas[c.persona_id]) filas[c.persona_id].colab_hechas++; if (filas[c.titular]) filas[c.titular].colab_recibidas++; });
+    // Clientes que pidieron dejar a esta persona como asesor (10/10)
+    const [pcs] = await conn.execute('SELECT desde_persona_id AS pid FROM cambios_asesor WHERE desde_persona_id IS NOT NULL AND creado_en >= ? AND creado_en < ?', rango);
+    pcs.forEach(x => { if (filas[x.pid]) filas[x.pid].piden_cambio++; });
+    // Respuesta en el chat
+    const [msgs] = await conn.execute('SELECT propuesta_id, servicio, autor, asesor_id, creado_en FROM mensajes WHERE creado_en >= ? AND creado_en < ? + INTERVAL 7 DAY ORDER BY propuesta_id, servicio, creado_en, id', rango);
+    let pendiente = null;
+    msgs.forEach((x, i) => {
+      const hilo = x.propuesta_id + '|' + x.servicio;
+      if (pendiente && pendiente.hilo !== hilo) pendiente = null;
+      if (x.autor === 'cliente') { if (!pendiente && new Date(x.creado_en) < fin) pendiente = { hilo, t: new Date(x.creado_en) }; }
+      else if (pendiente) { const f = filas[porAsesor[x.asesor_id]]; if (f) f._resp.push((new Date(x.creado_en) - pendiente.t) / 3600000); pendiente = null; }
+    });
+    const salida = Object.values(filas).map(f => {
+      const pesos = f._cal.reduce((x, c) => x + c[1], 0);
+      f.calidad_ponderada = pesos ? Math.round(f._cal.reduce((x, c) => x + c[0] * c[1], 0) / pesos * 10) / 10 : null;
+      f.respuesta_horas = f._resp.length ? Math.round(f._resp.reduce((x, y) => x + y, 0) / f._resp.length * 10) / 10 : null;
+      f.dias_entrega = f._dias.length ? Math.round(f._dias.reduce((x, y) => x + y, 0) / f._dias.length * 10) / 10 : null;
+      delete f._resp; delete f._dias; delete f._cal;
+      return f;
+    }).filter(f => f.activa || f.informes || f.valoraciones || f.colab_hechas || f.piden_cambio);
+    res.json({ mes, personas: salida });
   } finally { conn.release(); }
 });
 
