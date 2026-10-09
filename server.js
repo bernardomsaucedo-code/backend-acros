@@ -630,6 +630,11 @@ async function asegurarEsquema() {
       // 09/10: el cuestionario de Empieza aquí puede llegar después de la
       // solicitud; esta clave de un solo uso permite añadirlo sin sesión.
       await agregaColumnaSiFalta('solicitudes_presupuesto', '`token_cuestionario`', 'CHAR(32) NULL');
+      await agregaColumnaSiFalta('solicitudes_presupuesto', '`cuestionario_en`', 'DATETIME NULL');
+      // Avisos al cliente de documentación pedida, agrupados (10/10)
+      await pool.execute('CREATE TABLE IF NOT EXISTS avisos_documentos (`propuesta_id` INT PRIMARY KEY, `ultimo_aviso_en` DATETIME NOT NULL)');
+      // Resumen diario para los administradores (10/10): una fila por día enviado
+      await pool.execute('CREATE TABLE IF NOT EXISTS resumenes_diarios (`fecha` DATE PRIMARY KEY, `enviado_en` DATETIME NOT NULL, `elementos` INT NOT NULL DEFAULT 0)');
 
       // Informes entregados al cliente (fase 2, 08/10): solo la versión final
       // (los borradores no se guardan). Cada corrección es una versión nueva;
@@ -765,6 +770,23 @@ app.post('/api/presupuesto', async (req, res) => {
       ]
     );
     avisar('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
+    // 09/10: confirmación al cliente si dejó su correo; si no rellenó el
+    // cuestionario, con un botón para completarlo cuando quiera
+    if (correo && brevoActivo()) {
+      const lista = Array.isArray(servicios) ? servicios : [String(servicios)];
+      const enlaceCuest = (!conCuestionario && SITE_URL) ? `${SITE_URL}/empieza-aqui?completar=${ins.insertId}&clave=${tokenCuest}` : null;
+      const c = plantillaCorreo({
+        titulo: 'Hemos recibido tu solicitud',
+        parrafos: ['Hola:', 'Gracias por confiar en Acros. Hemos recibido tu solicitud de presupuesto para:',
+          '<strong>' + lista.map(ESC_HTML).join('<br>') + '</strong>',
+          enlaceCuest ? 'Tu asesor te llamará en breve. Si quieres que tu presupuesto llegue antes, cuéntanos un poco más de tu caso: son unas pocas preguntas y no te llevará más de un minuto.'
+                      : 'Tu asesor te llamará en breve para comentar tu caso y te enviará tu propuesta a medida en menos de 24 horas.'],
+        boton: enlaceCuest ? { texto: 'Completar el cuestionario · 1 min', url: enlaceCuest } : null,
+        nota: 'Si no has pedido tú este presupuesto, ignora este correo.',
+      });
+      enviarCorreo(String(correo).trim(), 'Hemos recibido tu solicitud de presupuesto', c.html, c.texto)
+        .catch(err => console.error('Confirmación de solicitud no enviada:', err.message));
+    }
     // Sin cuestionario: se devuelve con qué añadirlo luego desde la misma página
     res.status(201).json(conCuestionario ? { ok: true } : { ok: true, id: ins.insertId, token_cuestionario: tokenCuest });
   } catch (err) {
@@ -773,6 +795,15 @@ app.post('/api/presupuesto', async (req, res) => {
   }
 });
 
+// 09/10: desde el enlace del correo de confirmación: qué servicios pidió
+// (para hacerle solo sus preguntas). Solo con la clave y si aún falta.
+app.get('/api/presupuesto/:id/pendiente', async (req, res) => {
+  const [f] = await pool.execute('SELECT servicios FROM solicitudes_presupuesto WHERE id = ? AND `token_cuestionario` = ? AND cuestionario IS NULL',
+    [Number(req.params.id), String(req.query.clave || '')]);
+  if (!f.length) return res.status(404).json({ error: 'Este cuestionario ya está completado o el enlace no es válido' });
+  let servicios; try { servicios = JSON.parse(f[0].servicios); } catch (e) { servicios = [f[0].servicios]; }
+  res.json({ servicios });
+});
 // 09/10: el cliente que dijo «Ahora no» completa el cuestionario después.
 // Solo una vez: al guardarlo, la clave deja de valer.
 app.post('/api/presupuesto/:id/cuestionario', async (req, res) => {
@@ -781,7 +812,7 @@ app.post('/api/presupuesto/:id/cuestionario', async (req, res) => {
   const texto = JSON.stringify(cuestionario);
   if (texto.length > 20000) return res.status(413).json({ error: 'Cuestionario demasiado largo' });
   const [r] = await pool.execute(
-    'UPDATE solicitudes_presupuesto SET cuestionario = ?, `token_cuestionario` = NULL WHERE id = ? AND `token_cuestionario` = ? AND cuestionario IS NULL',
+    'UPDATE solicitudes_presupuesto SET cuestionario = ?, `token_cuestionario` = NULL, `cuestionario_en` = NOW() WHERE id = ? AND `token_cuestionario` = ? AND cuestionario IS NULL',
     [texto, Number(req.params.id), String(token)]);
   if (!r.affectedRows) return res.status(404).json({ error: 'Esta solicitud ya tiene su cuestionario o no existe' });
   avisar('📝 Un cliente ha completado su cuestionario', 'Lo tienes en su solicitud, en «Nuevas solicitudes».', { etiqueta: 'memo' });
@@ -1848,8 +1879,10 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
        b.documento_ref.trim(), b.documento_iv.trim(), b.documento_clave_cifrada.trim(), b.documento_tipo_mime || 'image/jpeg',
        b.firma_nombre.trim(), aSQLDatetime(ahora())]
     );
-    await conn.execute('UPDATE clientes SET tipo_documento = ?, numero_documento = ? WHERE id = ?',
-      [b.tipo_documento, b.numero_documento || null, p.cliente_id]);
+    // 10/10: antes ponía el número a NULL si el cuestionario no lo traía
+    // (el Área no lo manda aquí) y se perdía el que dio al darse de alta.
+    await conn.execute('UPDATE clientes SET tipo_documento = COALESCE(NULLIF(?, \'\'), tipo_documento), numero_documento = COALESCE(NULLIF(?, \'\'), numero_documento) WHERE id = ?',
+      [b.tipo_documento || '', (b.numero_documento || '').trim(), p.cliente_id]);
     avisar('🪪 Un cliente ha enviado su cuestionario de alta', 'Revísalo en «Diligencias pendientes».', { etiqueta: 'identification_card' });
     res.status(201).json({ ok: true, estado: 'revision' });
   } finally {
@@ -2038,7 +2071,7 @@ app.get('/api/admin/clientes-activos', requiereSesionAsesor, async (req, res) =>
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT c.id AS cliente_id, c.correo, c.nombre, c.apellidos, d.propuesta_id
+      `SELECT c.id AS cliente_id, c.correo, c.nombre, c.apellidos, d.propuesta_id, (SELECT pr.servicios FROM propuestas pr WHERE pr.id = d.propuesta_id) AS servicios
        FROM diligencias d JOIN clientes c ON c.id = d.cliente_id
        WHERE d.estado = 'aprobado' ORDER BY d.resuelto_en DESC`
     );
@@ -2057,8 +2090,17 @@ app.post('/api/admin/documentos', requiereSesionAsesor, async (req, res) => {
   }
   const conn = await pool.getConnection();
   try {
-    const [propuestas] = await conn.execute('SELECT id, cliente_id FROM propuestas WHERE id = ?', [propuesta_id]);
+    const [propuestas] = await conn.execute('SELECT id, cliente_id, servicios FROM propuestas WHERE id = ?', [propuesta_id]);
     if (!propuestas.length) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    // 10/10: solo servicios de ese encargo (o ninguno = para todos sus servicios)
+    if (servicio && !serviciosDePropuesta(propuestas[0]).includes(String(servicio))) {
+      return res.status(400).json({ error: 'Ese servicio no está en este encargo' });
+    }
+    // 10/10: el mismo documento ya pedido y sin subir (p. ej. doble clic)
+    const [iguales] = await conn.execute(
+      "SELECT id FROM documentos_fiscales WHERE propuesta_id = ? AND LOWER(TRIM(nombre)) = LOWER(TRIM(?)) AND estado = 'pendiente' AND (servicio <=> ?)",
+      [propuesta_id, nombre, servicio || null]);
+    if (iguales.length) return res.status(409).json({ error: 'Ese documento ya está pedido y pendiente de que lo suba' });
     const [r] = await conn.execute(
       'INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, urgente, pedido_por_asesor_id) VALUES (?,?,?,?,?,?)',
       [propuestas[0].cliente_id, propuesta_id, servicio || null, nombre.trim(), urgente ? 1 : 0, req.asesor.id]
@@ -2879,6 +2921,27 @@ app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => 
     conn.release();
   }
 });
+app.post('/api/admin/resumen-diario/prueba', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const r = await enviarResumenDiario({ forzarFecha: fechaMadrid().fecha });
+  res.json(r || { error: 'No se pudo preparar el resumen' });
+});
+// 10/10: el asesor corrige los datos del cliente desde su ficha (lo que el
+// cliente pide con «Pedir un cambio a mi asesor», o un número que falte).
+// El correo no se cambia aquí: es con lo que entra en su área.
+app.put('/api/admin/clientes/:id/datos', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {};
+  const limpio = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
+  const tipos = ['dni', 'nie', 'pasaporte'];
+  if (!limpio(b.nombre, 120) || !limpio(b.apellidos, 160)) return res.status(400).json({ error: 'Nombre y apellidos no pueden quedar vacíos' });
+  if (b.tipo_documento && !tipos.includes(String(b.tipo_documento).toLowerCase())) return res.status(400).json({ error: 'Tipo de documento no válido' });
+  const [r] = await pool.execute(
+    'UPDATE clientes SET nombre = ?, apellidos = ?, telefono = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?',
+    [limpio(b.nombre, 120), limpio(b.apellidos, 160), limpio(b.telefono, 40) || null,
+     b.tipo_documento ? String(b.tipo_documento).toLowerCase() : null, limpio(b.numero_documento, 20).toUpperCase() || null, Number(req.params.id)]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Cliente no encontrado' });
+  res.json({ ok: true });
+});
+
 // ================================================================
 // INFORMES ENTREGADOS (fase 2, 08/10)
 // El asesor sube la versión final de cada servicio desde la ficha; el
@@ -3042,6 +3105,103 @@ async function enviarAvisosChatPendientes() {
   }
 }
 setInterval(enviarAvisosChatPendientes, MS_TAREA_AVISOS);
+
+// --- Documentación pedida: aviso por correo agrupado (10/10) ---
+// Igual que el chat: si se piden varios documentos seguidos, un solo correo
+// a los SEGUNDOS_AVISO_CHAT de la última petición, con la lista de lo que
+// falta. Si para entonces ya los ha subido todos, no se envía.
+let tareaDocsEnMarcha = false;
+async function enviarAvisosDocumentosPendientes() {
+  if (tareaDocsEnMarcha) return;
+  tareaDocsEnMarcha = true;
+  const conn = await pool.getConnection();
+  try {
+    const [props] = await conn.query(
+      `SELECT d.propuesta_id, c.correo, c.nombre AS cliente_nombre, MAX(d.creado_en) AS ultimo, a.ultimo_aviso_en
+       FROM documentos_fiscales d JOIN clientes c ON c.id = d.cliente_id
+       LEFT JOIN avisos_documentos a ON a.propuesta_id = d.propuesta_id
+       WHERE d.estado = 'pendiente'
+       GROUP BY d.propuesta_id, c.correo, c.nombre, a.ultimo_aviso_en
+       HAVING MAX(d.creado_en) <= NOW() - INTERVAL ? SECOND
+          AND (a.ultimo_aviso_en IS NULL OR MAX(d.creado_en) > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
+    for (const f of props) {
+      await conn.execute('INSERT INTO avisos_documentos (propuesta_id, ultimo_aviso_en) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE ultimo_aviso_en = NOW()', [f.propuesta_id]);
+      if (!f.correo || !brevoActivo()) continue;
+      const [docs] = await conn.execute("SELECT nombre, urgente FROM documentos_fiscales WHERE propuesta_id = ? AND estado = 'pendiente' ORDER BY creado_en", [f.propuesta_id]);
+      if (!docs.length) continue;
+      const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+      const c = plantillaCorreo({
+        titulo: 'Tu asesor necesita documentación',
+        parrafos: [f.cliente_nombre ? `Hola, ${ESC_HTML(f.cliente_nombre)}:` : 'Hola:',
+          docs.length === 1 ? 'Para seguir con tu encargo, tu asesor necesita este documento:' : 'Para seguir con tu encargo, tu asesor necesita estos documentos:',
+          '<strong>' + docs.map(d => ESC_HTML(d.nombre) + (d.urgente ? ' (urgente)' : '')).join('<br>') + '</strong>',
+          'Súbelos desde tu área de cliente; viajan y se guardan cifrados.'],
+        boton: enlace ? { texto: 'Subir documentación', url: enlace } : null,
+        nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
+      });
+      try { await enviarCorreo(f.correo, 'Tu asesor de Acros necesita documentación', c.html, c.texto); }
+      catch (err) { console.error('Correo de documentación pedida no enviado:', err.message); }
+    }
+  } catch (err) {
+    console.error('Tarea de avisos de documentación:', err.message);
+  } finally { conn.release(); tareaDocsEnMarcha = false; }
+}
+setInterval(enviarAvisosDocumentosPendientes, MS_TAREA_AVISOS);
+
+// --- Resumen diario para los administradores (10/10) ---
+// Cada día desde las 08:00 (Madrid), un correo con lo que entró el día
+// anterior: solicitudes de presupuesto (con o sin cuestionario), llamadas,
+// empresas y cuestionarios completados después. Si no hubo nada, no se
+// envía. Se apunta en resumenes_diarios para no repetirlo con reinicios.
+function inicioDiaMadridUTC(fechaISO) {
+  // medianoche de Madrid de esa fecha, en UTC (sirve en verano e invierno)
+  const prueba = new Date(fechaISO + 'T00:00:00Z');
+  const desfase = (new Date(prueba.toLocaleString('en-US', { timeZone: 'Europe/Madrid' })) - new Date(prueba.toLocaleString('en-US', { timeZone: 'UTC' }))) / 60000;
+  return new Date(prueba.getTime() - desfase * 60000);
+}
+const sqlFecha = d => d.toISOString().slice(0, 19).replace('T', ' ');
+let resumenEnMarcha = false;
+async function enviarResumenDiario({ forzarFecha } = {}) {
+  if (resumenEnMarcha) return null;
+  const ahoraM = fechaMadrid();
+  if (!forzarFecha && ahoraM.hora < 8) return null;
+  resumenEnMarcha = true;
+  const conn = await pool.getConnection();
+  try {
+    const hoy = forzarFecha || ahoraM.fecha;
+    if (!forzarFecha) { const [ya] = await conn.execute('SELECT fecha FROM resumenes_diarios WHERE fecha = ?', [hoy]); if (ya.length) return null; }
+    const fin = inicioDiaMadridUTC(hoy), inicio = new Date(fin.getTime() - 24 * 3600 * 1000);
+    const ayer = new Date(inicio.getTime() + 12 * 3600 * 1000).toISOString().slice(0, 10);
+    // creado_en se guarda en la hora del servidor de la base (UTC en Railway)
+    const rango = [sqlFecha(inicio), sqlFecha(fin)];
+    const [sols] = await conn.execute('SELECT servicios, telefono, correo, cuestionario IS NOT NULL AS con_cuest FROM solicitudes_presupuesto WHERE creado_en >= ? AND creado_en < ? ORDER BY creado_en', rango);
+    const [llams] = await conn.execute('SELECT nombre, telefono FROM solicitudes_llamada WHERE creado_en >= ? AND creado_en < ? ORDER BY creado_en', rango);
+    const [emps] = await conn.execute('SELECT razon_social, contacto_nombre AS contacto FROM empresas WHERE creado_en >= ? AND creado_en < ? ORDER BY creado_en', rango).catch(() => [[]]);
+    const [cuests] = await conn.execute('SELECT telefono, correo FROM solicitudes_presupuesto WHERE `cuestionario_en` >= ? AND `cuestionario_en` < ?', rango);
+    const total = sols.length + llams.length + emps.length + cuests.length;
+    await conn.execute('INSERT INTO resumenes_diarios (fecha, enviado_en, elementos) VALUES (?, NOW(), ?) ON DUPLICATE KEY UPDATE enviado_en = NOW(), elementos = ?', [hoy, total, total]);
+    if (!total || !brevoActivo()) return { total, enviado: false };
+    const servs = x => { try { const l = JSON.parse(x); return Array.isArray(l) ? l.join(', ') : String(x); } catch (e) { return String(x || ''); } };
+    const bloque = (titulo, filas) => filas.length ? `<p style="margin:18px 0 6px;"><strong>${titulo} (${filas.length})</strong></p><ul style="margin:0; padding-left:20px;">${filas.map(f => '<li style="margin:3px 0;">' + f + '</li>').join('')}</ul>` : '';
+    const fechaBonita = new Date(ayer + 'T12:00:00Z').toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'Europe/Madrid' });
+    const html = bloque('Solicitudes de presupuesto', sols.map(x => ESC_HTML(servs(x.servicios)) + ' · ' + ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : '') + (x.con_cuest ? ' · con cuestionario' : ' · <em>sin cuestionario</em>'))) +
+      bloque('Peticiones de llamada', llams.map(x => ESC_HTML(x.nombre || '') + ' · ' + ESC_HTML(x.telefono || ''))) +
+      bloque('Empresas registradas', emps.map(x => ESC_HTML(x.razon_social || '') + (x.contacto ? ' · ' + ESC_HTML(x.contacto) : ''))) +
+      bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : '')));
+    const c = plantillaCorreo({ titulo: 'Resumen de ayer', parrafos: ['Esto es lo que entró el ' + fechaBonita + ':', html, 'Lo tenéis todo en el panel.'] });
+    const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
+    for (const a of admins) {
+      try { await enviarCorreo(a.correo, 'Resumen de Acros · ' + fechaBonita + ' (' + total + ')', c.html, c.texto); }
+      catch (err) { console.error('Resumen diario no enviado a ' + a.correo + ':', err.message); }
+    }
+    return { total, enviado: true };
+  } catch (err) {
+    console.error('Resumen diario:', err.message);
+    return null;
+  } finally { conn.release(); resumenEnMarcha = false; }
+}
+setInterval(enviarResumenDiario, 10 * 60 * 1000);
+setTimeout(enviarResumenDiario, 90 * 1000);
 
 // ================================================================
 // COPIA DE LA BASE DE DATOS FUERA DE RAILWAY (07/10)
