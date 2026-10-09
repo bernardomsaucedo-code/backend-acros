@@ -634,6 +634,27 @@ async function asegurarEsquema() {
       // Avisos al cliente de documentación pedida, agrupados (10/10)
       await pool.execute('CREATE TABLE IF NOT EXISTS avisos_documentos (`propuesta_id` INT PRIMARY KEY, `ultimo_aviso_en` DATETIME NOT NULL)');
       // Resumen diario para los administradores (10/10): una fila por día enviado
+      // Equipo como personas (fase A, 10/10): cada persona del equipo, con o
+      // sin cuenta de asesor. De aquí salen Inicio, el asesor de cada cliente
+      // y, más adelante, los perfiles y las valoraciones.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS personas (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `nombre` VARCHAR(80) NOT NULL,' +
+        ' `puesto_es` VARCHAR(120) NULL, `puesto_en` VARCHAR(120) NULL,' +
+        ' `bio_es` VARCHAR(400) NULL, `bio_en` VARCHAR(400) NULL,' +
+        ' `foto` CHAR(32) NULL,' +
+        ' `especialidades` TEXT NULL,' +
+        ' `atiende_clientes` TINYINT(1) NOT NULL DEFAULT 0,' +
+        ' `asesor_id` INT NULL UNIQUE,' +
+        ' `ntfy_topic` VARCHAR(80) NULL,' +
+        ' `activa` TINYINT(1) NOT NULL DEFAULT 1,' +
+        ' `orden` INT NOT NULL DEFAULT 0,' +
+        ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,' +
+        ' FOREIGN KEY (`asesor_id`) REFERENCES asesores(`id`))'
+      );
+      await migrarEquipoAPersonas();
       await pool.execute('CREATE TABLE IF NOT EXISTS resumenes_diarios (`fecha` DATE PRIMARY KEY, `enviado_en` DATETIME NOT NULL, `elementos` INT NOT NULL DEFAULT 0)');
 
       // Informes entregados al cliente (fase 2, 08/10): solo la versión final
@@ -678,6 +699,32 @@ async function creaIndiceSiFalta(definicion) {
   } catch (err) {
     if (err.code !== 'ER_DUP_KEYNAME') throw err;
   }
+}
+// Fase A (10/10): la primera vez, las personas que ya salían en Inicio
+// (web_contenido.marca.equipo) pasan a la tabla personas, y cada entrada de
+// Inicio queda enlazada con su persona (persona_id). Si no había nada
+// guardado, se crean Bernardo y Jorge con los textos de serie.
+async function migrarEquipoAPersonas() {
+  const [hay] = await pool.execute('SELECT COUNT(*) AS n FROM personas');
+  if (hay[0].n > 0) return;
+  const [filas] = await pool.execute("SELECT datos, version FROM web_contenido WHERE clave = 'marca'");
+  let marca = null; try { marca = filas.length ? JSON.parse(filas[0].datos) : null; } catch (e) { marca = null; }
+  const equipo = (marca && Array.isArray(marca.equipo) && marca.equipo.length) ? marca.equipo : [
+    { nombre: 'Bernardo', puesto: { es: 'Asesor fiscal cripto · cofundador', en: 'Crypto tax advisor · co-founder' }, bio: { es: 'Lleva todos los casos: tu declaración, tu presupuesto y tus dudas pasan siempre por sus manos.', en: 'Handles every case: your return, your quote and your questions always go through him.' } },
+    { nombre: 'Jorge', puesto: { es: 'Asesor financiero · cofundador', en: 'Financial advisor · co-founder' }, bio: { es: 'Se asegura de que Acros sea rápido y cercano.', en: 'Makes sure Acros is fast and close to you.' } },
+  ];
+  for (let i = 0; i < equipo.length; i++) {
+    const q = equipo[i] || {};
+    const [r] = await pool.execute(
+      'INSERT INTO personas (`nombre`, `puesto_es`, `puesto_en`, `bio_es`, `bio_en`, `foto`, `orden`, `atiende_clientes`) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+      [String(q.nombre || 'Persona ' + (i + 1)).slice(0, 80), (q.puesto && q.puesto.es) || null, (q.puesto && q.puesto.en) || null,
+       (q.bio && q.bio.es) || null, (q.bio && q.bio.en) || null, q.foto || null, i]);
+    q.persona_id = r.insertId;
+  }
+  if (marca && Array.isArray(marca.equipo) && marca.equipo.length) {
+    await pool.execute("UPDATE web_contenido SET datos = ? WHERE clave = 'marca'", [JSON.stringify(marca)]);
+  }
+  console.log('Equipo pasado a personas: ' + equipo.length);
 }
 // Igual que creaIndiceSiFalta, pero para columnas nuevas en tablas que ya
 // existían antes de que esa columna se añadiera al código.
@@ -2539,7 +2586,8 @@ function validarMarcaWeb(d) {
       if (!nombre) throw errorWeb('Falta el nombre de la persona ' + (i + 1));
       const foto = persona.foto ? String(persona.foto) : null;
       if (foto && !RE_ID_IMAGEN.test(foto)) throw errorWeb('Foto no válida en la persona ' + (i + 1));
-      return { nombre, foto, puesto: bilingueWeb(persona.puesto, 120), bio: bilingueWeb(persona.bio, 400) };
+      const persona_id = Number.isInteger(Number(persona.persona_id)) && Number(persona.persona_id) > 0 ? Number(persona.persona_id) : undefined;
+      return { persona_id, nombre, foto, puesto: bilingueWeb(persona.puesto, 120), bio: bilingueWeb(persona.bio, 400) };
     }),
   };
 }
@@ -2615,6 +2663,19 @@ app.get('/api/web/contenido', async (req, res) => {
       if (!CLAVES_WEB.includes(f.clave)) return;
       try { salida[f.clave] = JSON.parse(f.datos); salida.versiones[f.clave] = f.version; } catch (e) { /* fila corrupta: se ignora */ }
     });
+    // Fase A (10/10): las personas de Inicio se leen al día de la tabla
+    // personas (lo que se edite en «Equipo» se ve sin volver a publicar);
+    // las desactivadas no salen.
+    if (salida.marca && Array.isArray(salida.marca.equipo) && salida.marca.equipo.some(x => x && x.persona_id)) {
+      const [pers] = await conn.query('SELECT * FROM personas');
+      const porId = {}; pers.forEach(x => { porId[x.id] = x; });
+      salida.marca.equipo = salida.marca.equipo.map(x => {
+        if (!x || !x.persona_id) return x;
+        const q = porId[x.persona_id];
+        if (!q || !q.activa) return null;
+        return { persona_id: q.id, nombre: q.nombre, foto: q.foto, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' } };
+      }).filter(Boolean);
+    }
     res.set('Cache-Control', 'no-cache'); // el navegador revalida siempre (ETag), así los cambios se ven al momento
     res.json(salida);
   } catch (err) {
@@ -2941,6 +3002,56 @@ app.put('/api/admin/clientes/:id/datos', requiereSesionAsesor, async (req, res) 
   if (!r.affectedRows) return res.status(404).json({ error: 'Cliente no encontrado' });
   res.json({ ok: true });
 });
+
+// ================================================================
+// EQUIPO: PERSONAS (fase A, 10/10)
+// Cualquier asesor puede ver la lista (la necesita para asignar y para la
+// ficha); solo un administrador crea o cambia personas.
+// ================================================================
+const RE_TOPIC_NTFY = /^[A-Za-z0-9_-]{6,64}$/;
+function personaParaPanel(q) {
+  let esp = []; try { esp = JSON.parse(q.especialidades || '[]'); } catch (e) {}
+  return { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' },
+    foto: q.foto, especialidades: Array.isArray(esp) ? esp : [], atiende_clientes: !!q.atiende_clientes, asesor_id: q.asesor_id,
+    asesor_nombre: q.asesor_nombre || null, asesor_correo: q.asesor_correo || null, ntfy_topic: q.ntfy_topic || '', activa: !!q.activa, orden: q.orden };
+}
+app.get('/api/admin/personas', requiereSesionAsesor, async (req, res) => {
+  const [filas] = await pool.query('SELECT p.*, a.`nombre` AS asesor_nombre, a.`correo` AS asesor_correo FROM personas p LEFT JOIN asesores a ON a.`id` = p.`asesor_id` ORDER BY p.`activa` DESC, p.`orden`, p.`id`');
+  res.json(filas.map(personaParaPanel));
+});
+async function guardarPersona(req, res, id) {
+  const b = req.body || {};
+  const nombre = textoWeb(b.nombre, 80);
+  if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+  const puesto = bilingueWeb(b.puesto, 120), bio = bilingueWeb(b.bio, 400);
+  const foto = b.foto ? String(b.foto) : null;
+  if (foto && !RE_ID_IMAGEN.test(foto)) return res.status(400).json({ error: 'Foto no válida' });
+  const conn = await pool.getConnection();
+  try {
+    if (foto && !(await imagenesExistenWeb(conn, [foto]))) return res.status(400).json({ error: 'La foto no existe' });
+    const esp = (Array.isArray(b.especialidades) ? b.especialidades : []).map(String).filter(x => RE_ID_SERVICIO.test(x)).slice(0, 30);
+    const asesorId = b.asesor_id ? Number(b.asesor_id) : null;
+    if (asesorId) {
+      const [a] = await conn.execute('SELECT id FROM asesores WHERE id = ?', [asesorId]);
+      if (!a.length) return res.status(400).json({ error: 'Esa cuenta de asesor no existe' });
+      const [otra] = await conn.execute('SELECT nombre FROM personas WHERE asesor_id = ? AND id <> ?', [asesorId, id || 0]);
+      if (otra.length) return res.status(409).json({ error: 'Esa cuenta ya está enlazada con ' + otra[0].nombre });
+    }
+    const topic = String(b.ntfy_topic || '').trim();
+    if (topic && !RE_TOPIC_NTFY.test(topic)) return res.status(400).json({ error: 'El canal de ntfy solo admite letras, números, «-» y «_» (6 a 64)' });
+    const valores = [nombre, puesto.es || null, puesto.en || null, bio.es || null, bio.en || null, foto, JSON.stringify(esp),
+      b.atiende_clientes ? 1 : 0, asesorId, topic || null, b.activa === false ? 0 : 1, Number.isInteger(b.orden) ? b.orden : 0];
+    if (id) {
+      const [r] = await conn.execute('UPDATE personas SET `nombre`=?, `puesto_es`=?, `puesto_en`=?, `bio_es`=?, `bio_en`=?, `foto`=?, `especialidades`=?, `atiende_clientes`=?, `asesor_id`=?, `ntfy_topic`=?, `activa`=?, `orden`=? WHERE `id`=?', [...valores, id]);
+      if (!r.affectedRows) return res.status(404).json({ error: 'Persona no encontrada' });
+      return res.json({ ok: true, id });
+    }
+    const [r] = await conn.execute('INSERT INTO personas (`nombre`, `puesto_es`, `puesto_en`, `bio_es`, `bio_en`, `foto`, `especialidades`, `atiende_clientes`, `asesor_id`, `ntfy_topic`, `activa`, `orden`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', valores);
+    res.status(201).json({ ok: true, id: r.insertId });
+  } finally { conn.release(); }
+}
+app.post('/api/admin/personas', requiereSesionAsesor, requiereAdminWeb, (req, res) => guardarPersona(req, res, null));
+app.put('/api/admin/personas/:id', requiereSesionAsesor, requiereAdminWeb, (req, res) => guardarPersona(req, res, Number(req.params.id)));
 
 // ================================================================
 // INFORMES ENTREGADOS (fase 2, 08/10)
