@@ -1098,6 +1098,14 @@ app.post('/api/admin/clientes/:id/fusionar', requiereSesionAsesor, requiereAdmin
   try {
     const [a] = await conn.execute('SELECT * FROM clientes WHERE id IN (?, ?)', [principal, duplicado]);
     if (a.length !== 2) return res.status(404).json({ error: 'Cliente no encontrado' });
+    // 13/10: antes de fusionar (es irreversible) se hace una copia completa de
+    // la base de datos (no existe copia por cliente). Si la copia falla, no se
+    // fusiona.
+    let copia = null;
+    if (R2_BUCKET) {
+      try { copia = await hacerCopiaBaseDeDatos({ manual: true }); }
+      catch (err) { return res.status(500).json({ error: 'No se ha fusionado: la copia de seguridad previa ha fallado (' + err.message + ')' }); }
+    }
     await conn.beginTransaction();
     for (const t of ['propuestas', 'diligencias', 'documentos_fiscales', 'mensajes', 'entregas', 'valoraciones', 'cambios_asesor', 'sesiones_cliente', 'tokens_acceso', 'sugerencias', 'actividad']) {
       await conn.execute(`UPDATE ${t} SET cliente_id = ? WHERE cliente_id = ?`, [principal, duplicado]).catch(() => {});
@@ -1107,7 +1115,7 @@ app.post('/api/admin/clientes/:id/fusionar', requiereSesionAsesor, requiereAdmin
     await conn.execute('UPDATE clientes SET telefono = COALESCE(telefono, ?), nombre = COALESCE(nombre, ?), apellidos = COALESCE(apellidos, ?), asesor_persona_id = COALESCE(asesor_persona_id, ?) WHERE id = ?', [dup.telefono, dup.nombre, dup.apellidos, dup.asesor_persona_id, principal]);
     await conn.execute("UPDATE clientes SET estado = 'inerte', correo = CONCAT('fusionado-', id, '-', correo) WHERE id = ?", [duplicado]);
     await conn.commit();
-    res.json({ ok: true, principal: pri.correo, fusionado: dup.correo });
+    res.json({ ok: true, principal: pri.correo, fusionado: dup.correo, copia: copia ? (copia.clave_r2 || copia.clave || true) : null });
   } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
 });
 
