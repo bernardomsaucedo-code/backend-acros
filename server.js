@@ -677,6 +677,50 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('personas', '`por_defecto`', 'TINYINT(1) NOT NULL DEFAULT 0');
       // 10/10: el cliente pide expresamente que empecemos ya (desistimiento)
       await agregaColumnaSiFalta('propuestas', '`inicio_inmediato_en`', 'DATETIME NULL');
+      // 10/10: «borrado espejo» como se decidió en septiembre: ningún mensaje
+      // se borra de verdad. El cliente oculta los suyos de su vista (nosotros
+      // conservamos la copia); el asesor retira los suyos (dejan de verse en
+      // el área del cliente, pero quedan en el panel).
+      // Verificación en dos pasos (10/10): obligatoria para los asesores,
+      // opcional para los clientes. Al estrenarla se cierran todas las
+      // sesiones de asesor: cada uno la configura al volver a entrar.
+      const nueva2FA = await agregaColumnaSiFalta('asesores', '`totp_activo`', 'TINYINT(1) NOT NULL DEFAULT 0');
+      await agregaColumnaSiFalta('asesores', '`totp_secreto`', 'VARCHAR(64) NULL');
+      await agregaColumnaSiFalta('asesores', '`totp_recuperacion`', 'TEXT NULL');
+      await agregaColumnaSiFalta('asesores', '`totp_activado_en`', 'DATETIME NULL');
+      if (nueva2FA) { await pool.execute('DELETE FROM sesiones_asesor'); console.log('2FA estrenado: sesiones de asesor cerradas'); }
+      await agregaColumnaSiFalta('clientes', '`totp_activo`', 'TINYINT(1) NOT NULL DEFAULT 0');
+      await agregaColumnaSiFalta('clientes', '`totp_secreto`', 'VARCHAR(64) NULL');
+      await agregaColumnaSiFalta('clientes', '`totp_recuperacion`', 'TEXT NULL');
+      await agregaColumnaSiFalta('clientes', '`totp_activado_en`', 'DATETIME NULL');
+      await agregaColumnaSiFalta('sesiones_cliente', '`dos_pasos`', 'TINYINT(1) NOT NULL DEFAULT 0');
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS pasos_login (' +
+        ' `token` CHAR(48) PRIMARY KEY, `asesor_id` INT NOT NULL, `secreto_pendiente` VARCHAR(64) NULL,' +
+        ' `intentos` INT NOT NULL DEFAULT 0, `expira_en` DATETIME NOT NULL)');
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS dispositivos_confianza (' +
+        " `id` INT AUTO_INCREMENT PRIMARY KEY, `tipo` ENUM('asesor','cliente') NOT NULL, `usuario_id` INT NOT NULL," +
+        ' `hash` CHAR(64) NOT NULL UNIQUE, `expira_en` DATETIME NOT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+      // Buzón de sugerencias (10/10): desde el Área (con o sin nombre) y desde
+      // las páginas públicas. Solo las ven los administradores.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS sugerencias (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY,' +
+        " `tipo` ENUM('idea','fallo','otro') NOT NULL DEFAULT 'idea'," +
+        ' `texto` TEXT NOT NULL,' +
+        ' `correo` VARCHAR(160) NULL,' +
+        ' `cliente_id` INT NULL,' +
+        ' `anonima` TINYINT(1) NOT NULL DEFAULT 0,' +
+        " `origen` VARCHAR(40) NULL," +
+        ' `pagina` VARCHAR(120) NULL,' +
+        ' `idioma` VARCHAR(5) NULL,' +
+        ' `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' `vista_en` DATETIME NULL, `vista_por` INT NULL)'
+      );
+      await agregaColumnaSiFalta('mensajes', '`oculto_cliente_en`', 'DATETIME NULL');
+      await agregaColumnaSiFalta('mensajes', '`retirado_en`', 'DATETIME NULL');
+      await agregaColumnaSiFalta('mensajes', '`retirado_por`', 'INT NULL');
       // Empresas parte 2 (10/10): notas de contacto. Inalterables: no hay
       // ninguna ruta para editarlas ni borrarlas, y solo se escriben con la
       // sesión de un asesor (queda quién y cuándo; la clave maestra no
@@ -812,8 +856,10 @@ async function migrarEquipoAPersonas() {
 async function agregaColumnaSiFalta(tabla, columna, definicionTipo) {
   try {
     await pool.execute(`ALTER TABLE ${tabla} ADD COLUMN ${columna} ${definicionTipo}`);
+    return true;   // 10/10: se ha creado ahora
   } catch (err) {
     if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+    return false;
   }
 }
 
@@ -859,6 +905,159 @@ app.post('/api/llamada', async (req, res) => {
     console.error('Error al guardar la solicitud de llamada:', err);
     res.status(500).json({ error: 'No se pudo guardar la solicitud' });
   }
+});
+
+// ================================================================
+// 2FA DEL CLIENTE (10/10) — opcional, la activa él desde su área.
+// Con ella activada, nada del área (ni por sesión ni por el enlace de la
+// propuesta) responde sin una sesión verificada con el código.
+// ================================================================
+app.use('/api/propuestas/:token', async (req, res, next) => {
+  try {
+    const [f] = await pool.execute('SELECT c.id, c.totp_activo FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.token = ?', [req.params.token]);
+    if (!f.length || !f[0].totp_activo) return next();
+    const t = (req.get('x-sesion-cliente') || '').trim();
+    if (t) {
+      const [ss] = await pool.execute('SELECT id FROM sesiones_cliente WHERE token = ? AND cliente_id = ? AND dos_pasos = 1 AND expira_en > NOW()', [t, f[0].id]);
+      if (ss.length) return next();
+    }
+    res.status(401).json({ error: 'Falta la verificación en dos pasos', requiere_2fa: true });
+  } catch (err) { next(err); }
+});
+const intentos2FA = new Map(); // clave → { n, hasta }: máximo 5 intentos cada 10 minutos
+function demasiadosIntentos(clave) {
+  const ahoraMs = Date.now(), x = intentos2FA.get(clave);
+  if (!x || x.hasta < ahoraMs) { intentos2FA.set(clave, { n: 1, hasta: ahoraMs + 600000 }); return false; }
+  x.n++; return x.n > 5;
+}
+async function comprobarCodigoCliente(conn, cliente, b) {
+  if (b.recuperacion) {
+    const quedan = gastarRecuperacion(cliente.totp_recuperacion, b.recuperacion);
+    if (quedan === null) return 'Ese código de recuperación no es válido o ya se usó';
+    await conn.execute('UPDATE clientes SET totp_recuperacion = ? WHERE id = ?', [quedan, cliente.id]);
+    return null;
+  }
+  return totpValido(cliente.totp_secreto, b.codigo) ? null : 'El código no es correcto';
+}
+// Verificar la sesión recién abierta (entró con enlace o contraseña)
+app.post('/api/clientes/2fa/verificar', (req, res, next) => { req.permitirSinDosPasos = true; next(); }, requiereSesionCliente, async (req, res) => {
+  if (demasiadosIntentos('s:' + req.cliente.id)) return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos.' });
+  const conn = await pool.getConnection();
+  try {
+    const [c] = await conn.execute('SELECT * FROM clientes WHERE id = ?', [req.cliente.id]);
+    const err = await comprobarCodigoCliente(conn, c[0], req.body || {});
+    if (err) return res.status(401).json({ error: err });
+    await conn.execute('UPDATE sesiones_cliente SET dos_pasos = 1 WHERE token = ?', [req.cliente.sesionToken]);
+    const r = { ok: true };
+    if (req.body && req.body.recordar) r.dispositivo = await recordarDispositivo(conn, 'cliente', req.cliente.id);
+    res.json(r);
+  } finally { conn.release(); }
+});
+// Entró con el enlace de su propuesta (sin sesión): el código abre una sesión verificada
+app.post('/api/clientes/2fa/token', async (req, res) => {
+  const b = req.body || {};
+  if (demasiadosIntentos('t:' + String(b.propuesta_token || '').slice(0, 12))) return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos.' });
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT c.* FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.token = ?', [String(b.propuesta_token || '')]);
+    if (!f.length || !f[0].totp_activo) return res.status(404).json({ error: 'No encontrado' });
+    if (f[0].estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
+    const err = await comprobarCodigoCliente(conn, f[0], b);
+    if (err) return res.status(401).json({ error: err });
+    const r = { ok: true, sesion: await crearSesionCliente(conn, f[0].id, 1) };
+    if (b.recordar) r.dispositivo = await recordarDispositivo(conn, 'cliente', f[0].id);
+    res.json(r);
+  } finally { conn.release(); }
+});
+// Activar / desactivar desde el área (va por el token de la propuesta)
+app.post('/api/propuestas/:token/2fa/iniciar', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [c] = await conn.execute('SELECT correo, totp_activo FROM clientes WHERE id = ?', [p.cliente_id]);
+    if (c[0].totp_activo) return res.status(409).json({ error: 'Ya la tienes activada' });
+    const secreto = nuevoSecretoTOTP();
+    await conn.execute('UPDATE clientes SET totp_secreto = ? WHERE id = ?', [secreto, p.cliente_id]);
+    res.json({ ok: true, secreto, otpauth: uriTOTP(secreto, c[0].correo) });
+  } finally { conn.release(); }
+});
+app.post('/api/propuestas/:token/2fa/activar', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [c] = await conn.execute('SELECT * FROM clientes WHERE id = ?', [p.cliente_id]);
+    if (c[0].totp_activo) return res.status(409).json({ error: 'Ya la tienes activada' });
+    if (!totpValido(c[0].totp_secreto, req.body && req.body.codigo)) return res.status(401).json({ error: 'El código no es correcto. Comprueba que la hora del móvil está bien y prueba con el siguiente.' });
+    const r = nuevosCodigosRecuperacion();
+    await conn.execute('UPDATE clientes SET totp_activo = 1, totp_recuperacion = ?, totp_activado_en = NOW() WHERE id = ?', [r.guardar, p.cliente_id]);
+    // Las demás sesiones abiertas dejan de valer; este navegador sigue dentro
+    await conn.execute('UPDATE sesiones_cliente SET dos_pasos = 0 WHERE cliente_id = ?', [p.cliente_id]);
+    const sesion = await crearSesionCliente(conn, p.cliente_id, 1);
+    res.json({ ok: true, codigos_recuperacion: r.codigos, sesion });
+  } finally { conn.release(); }
+});
+app.post('/api/propuestas/:token/2fa/desactivar', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [c] = await conn.execute('SELECT * FROM clientes WHERE id = ?', [p.cliente_id]);
+    if (!c[0].totp_activo) return res.status(409).json({ error: 'No la tienes activada' });
+    const err = await comprobarCodigoCliente(conn, c[0], req.body || {});
+    if (err) return res.status(401).json({ error: err });
+    await conn.execute('UPDATE clientes SET totp_activo = 0, totp_secreto = NULL, totp_recuperacion = NULL WHERE id = ?', [p.cliente_id]);
+    await conn.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'cliente' AND usuario_id = ?", [p.cliente_id]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
+// Panel: un administrador quita la verificación de un cliente (móvil perdido)
+app.post('/api/admin/clientes/:id/2fa/reiniciar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const id = Number(req.params.id);
+  const [r] = await pool.execute('UPDATE clientes SET totp_activo = 0, totp_secreto = NULL, totp_recuperacion = NULL WHERE id = ?', [id]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Cliente no encontrado' });
+  await pool.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'cliente' AND usuario_id = ?", [id]);
+  res.json({ ok: true });
+});
+
+// ================================================================
+// BUZÓN DE SUGERENCIAS (10/10)
+// Público (páginas de la web): texto + tipo + correo opcional, con el
+// mismo antispam que los demás formularios. Desde el Área, con la sesión o
+// el token del cliente: se asocia a él salvo que marque «anónima» (entonces
+// no se guarda quién es). Solo los administradores las ven en el panel.
+// ================================================================
+const TIPOS_SUGERENCIA = ['idea', 'fallo', 'otro'];
+async function guardarSugerencia(req, res, clienteId) {
+  const b = req.body || {};
+  const texto = String(b.texto || '').trim().slice(0, 4000);
+  if (texto.length < 3) return res.status(400).json({ error: 'Escribe tu sugerencia' });
+  if (esSpam(b)) return res.status(201).json({ ok: true });
+  const tipo = TIPOS_SUGERENCIA.includes(b.tipo) ? b.tipo : 'idea';
+  const anonima = !!b.anonima;
+  const correo = !clienteId && b.correo && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(b.correo).trim()) ? String(b.correo).trim().slice(0, 160) : null;
+  await pool.execute('INSERT INTO sugerencias (tipo, texto, correo, cliente_id, anonima, origen, pagina, idioma) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [tipo, texto, correo, clienteId && !anonima ? clienteId : null, anonima ? 1 : 0, clienteId ? 'area' : 'web', String(b.pagina || '').slice(0, 120) || null, String(b.idioma || '').slice(0, 5) || null]);
+  avisar('💡 Nueva sugerencia', ({ idea: 'Una idea o mejora', fallo: 'Algo que no funciona', otro: 'Un comentario' })[tipo] + (clienteId ? ' desde el área de un cliente' : ' desde la web') + '. La tienes en «Sugerencias» del panel.', { etiqueta: 'bulb' });
+  res.status(201).json({ ok: true });
+}
+app.post('/api/sugerencias', (req, res) => guardarSugerencia(req, res, null));
+app.post('/api/propuestas/:token/sugerencias', async (req, res) => {
+  const conn = await pool.getConnection();
+  let p; try { p = await propuestaVigente(conn, req.params.token); } finally { conn.release(); }
+  if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+  return guardarSugerencia(req, res, p.cliente_id);
+});
+app.get('/api/admin/sugerencias', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const [filas] = await pool.query(
+    'SELECT s.*, c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.correo AS cliente_correo, a.nombre AS vista_por_nombre ' +
+    'FROM sugerencias s LEFT JOIN clientes c ON c.id = s.cliente_id LEFT JOIN asesores a ON a.id = s.vista_por ORDER BY s.vista_en IS NULL DESC, s.creado_en DESC LIMIT 300');
+  res.json(filas);
+});
+app.post('/api/admin/sugerencias/:id/vista', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const [r] = await pool.execute('UPDATE sugerencias SET vista_en = NOW(), vista_por = ? WHERE id = ? AND vista_en IS NULL', [req.asesor.id, Number(req.params.id)]);
+  res.json({ ok: true, cambiada: r.affectedRows });
 });
 
 app.get('/salud', (req, res) => res.json({ estado: 'ok' }));
@@ -1126,6 +1325,63 @@ app.post('/api/admin/asesores/:id/rol', requiereClaveMaestra, async (req, res) =
   }
 });
 
+// ================================================================
+// VERIFICACIÓN EN DOS PASOS (10/10)
+// Códigos de 6 cifras de una app (Google Authenticator, Microsoft
+// Authenticator, 1Password…): TOTP estándar (RFC 6238, SHA-1, 30 s), con
+// un margen de ±30 s por si el reloj del móvil va algo desfasado. Diez
+// códigos de recuperación de un solo uso (se guardan solo resumidos).
+// «Recordar este ordenador 30 días»: un token aleatorio en el navegador,
+// del que aquí se guarda solo el resumen.
+// ================================================================
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32(buf) { let bits = 0, val = 0, out = ''; for (const b of buf) { val = (val << 8) | b; bits += 8; while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; } } if (bits > 0) out += B32[(val << (5 - bits)) & 31]; return out; }
+function desdeBase32(t) { const s = String(t || '').toUpperCase().replace(/[^A-Z2-7]/g, ''); let bits = 0, val = 0; const out = []; for (const ch of s) { val = (val << 5) | B32.indexOf(ch); bits += 5; if (bits >= 8) { out.push((val >>> (bits - 8)) & 255); bits -= 8; } } return Buffer.from(out); }
+function codigoTOTP(secreto, paso) {
+  const msg = Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(paso));
+  const h = crypto.createHmac('sha1', desdeBase32(secreto)).update(msg).digest();
+  const o = h[h.length - 1] & 15;
+  return String(((h.readUInt32BE(o) & 0x7fffffff) % 1000000)).padStart(6, '0');
+}
+function totpValido(secreto, codigo) {
+  const c = String(codigo || '').replace(/\s/g, '');
+  if (!/^\d{6}$/.test(c) || !secreto) return false;
+  const ahoraPaso = Math.floor(Date.now() / 30000);
+  return [-1, 0, 1].some(d => crypto.timingSafeEqual(Buffer.from(codigoTOTP(secreto, ahoraPaso + d)), Buffer.from(c)));
+}
+const nuevoSecretoTOTP = () => base32(crypto.randomBytes(20));
+const uriTOTP = (secreto, cuenta) => 'otpauth://totp/' + encodeURIComponent('Acros:' + cuenta) + '?secret=' + secreto + '&issuer=Acros&algorithm=SHA1&digits=6&period=30';
+const resumen = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+function nuevosCodigosRecuperacion() {
+  const codigos = Array.from({ length: 10 }, () => crypto.randomBytes(5).toString('hex').toUpperCase().replace(/(.{5})/, '$1-'));
+  return { codigos, guardar: JSON.stringify(codigos.map(c => resumen(c.replace(/-/g, '')))) };
+}
+// Gasta un código de recuperación si coincide (devuelve la lista nueva o null)
+function gastarRecuperacion(guardados, codigo) {
+  let lista = []; try { lista = JSON.parse(guardados || '[]'); } catch (e) {}
+  const h = resumen(String(codigo || '').toUpperCase().replace(/[^0-9A-F]/g, ''));
+  const i = lista.indexOf(h);
+  if (i < 0) return null;
+  lista.splice(i, 1);
+  return JSON.stringify(lista);
+}
+async function dispositivoDeConfianza(conn, tipo, usuarioId, token) {
+  if (!token) return false;
+  const [f] = await conn.execute('SELECT id FROM dispositivos_confianza WHERE tipo = ? AND usuario_id = ? AND hash = ? AND expira_en > NOW()', [tipo, usuarioId, resumen(token)]);
+  return f.length > 0;
+}
+async function recordarDispositivo(conn, tipo, usuarioId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await conn.execute('INSERT INTO dispositivos_confianza (tipo, usuario_id, hash, expira_en) VALUES (?, ?, ?, NOW() + INTERVAL 30 DAY)', [tipo, usuarioId, resumen(token)]);
+  return token;
+}
+async function crearSesionAsesor(conn, asesor) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_ASESOR * 24 * 60 * 60 * 1000);
+  await conn.execute('INSERT INTO sesiones_asesor (asesor_id, token, expira_en) VALUES (?,?,?)', [asesor.id, token, aSQLDatetime(expira)]);
+  return { ok: true, token, nombre: asesor.nombre, correo: asesor.correo, es_admin: !!asesor.es_admin, expira_en: expira.toISOString() };
+}
+
 app.post('/api/admin/login', async (req, res) => {
   const correo = (req.body.correo || '').trim().toLowerCase();
   const contrasena = req.body.contrasena || '';
@@ -1141,13 +1397,67 @@ app.post('/api/admin/login', async (req, res) => {
     if (!asesor.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada' });
     const ok = await bcrypt.compare(contrasena, asesor.contrasena_hash);
     if (!ok) return error();
-    const token = crypto.randomBytes(24).toString('hex');
-    const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_ASESOR * 24 * 60 * 60 * 1000);
-    await conn.execute('INSERT INTO sesiones_asesor (asesor_id, token, expira_en) VALUES (?,?,?)', [asesor.id, token, aSQLDatetime(expira)]);
-    res.json({ ok: true, token, nombre: asesor.nombre, correo: asesor.correo, es_admin: !!asesor.es_admin, expira_en: expira.toISOString() });
+    // 10/10: segundo paso obligatorio. En un ordenador de confianza, directo.
+    if (asesor.totp_activo && await dispositivoDeConfianza(conn, 'asesor', asesor.id, req.body.dispositivo)) {
+      return res.json(await crearSesionAsesor(conn, asesor));
+    }
+    const paso = crypto.randomBytes(24).toString('hex');
+    if (asesor.totp_activo) {
+      await conn.execute('INSERT INTO pasos_login (token, asesor_id, expira_en) VALUES (?, ?, NOW() + INTERVAL 10 MINUTE)', [paso, asesor.id]);
+      return res.json({ ok: true, requiere_2fa: true, paso });
+    }
+    const secreto = nuevoSecretoTOTP();
+    await conn.execute('INSERT INTO pasos_login (token, asesor_id, secreto_pendiente, expira_en) VALUES (?, ?, ?, NOW() + INTERVAL 15 MINUTE)', [paso, asesor.id, secreto]);
+    res.json({ ok: true, configurar_2fa: true, paso, secreto, otpauth: uriTOTP(secreto, asesor.correo) });
   } finally {
     conn.release();
   }
+});
+
+// Segundo paso del login de asesor: el código de la app (o uno de
+// recuperación). Si estaba configurándolo, lo deja activado y devuelve los
+// códigos de recuperación (solo esta vez).
+app.post('/api/admin/login/2fa', async (req, res) => {
+  const b = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const [ps] = await conn.execute('SELECT * FROM pasos_login WHERE token = ? AND expira_en > NOW()', [String(b.paso || '')]);
+    if (!ps.length) return res.status(401).json({ error: 'Ha caducado: vuelve a escribir tu correo y contraseña' });
+    const p = ps[0];
+    if (p.intentos >= 5) { await conn.execute('DELETE FROM pasos_login WHERE token = ?', [p.token]); return res.status(429).json({ error: 'Demasiados intentos: vuelve a empezar' }); }
+    await conn.execute('UPDATE pasos_login SET intentos = intentos + 1 WHERE token = ?', [p.token]);
+    const [as] = await conn.execute('SELECT * FROM asesores WHERE id = ? AND activo = 1', [p.asesor_id]);
+    if (!as.length) return res.status(403).json({ error: 'Esta cuenta está desactivada' });
+    const asesor = as[0];
+    let recuperacion = null;
+    if (p.secreto_pendiente) {
+      if (!totpValido(p.secreto_pendiente, b.codigo)) return res.status(401).json({ error: 'El código no es correcto. Comprueba que la hora del móvil está bien y prueba con el siguiente.' });
+      const r = nuevosCodigosRecuperacion(); recuperacion = r.codigos;
+      await conn.execute('UPDATE asesores SET totp_secreto = ?, totp_activo = 1, totp_recuperacion = ?, totp_activado_en = NOW() WHERE id = ?', [p.secreto_pendiente, r.guardar, asesor.id]);
+    } else if (b.recuperacion) {
+      const quedan = gastarRecuperacion(asesor.totp_recuperacion, b.recuperacion);
+      if (quedan === null) return res.status(401).json({ error: 'Ese código de recuperación no es válido o ya se usó' });
+      await conn.execute('UPDATE asesores SET totp_recuperacion = ? WHERE id = ?', [quedan, asesor.id]);
+      avisar('🔐 ' + asesor.nombre + ' ha entrado con un código de recuperación', 'Le quedan ' + JSON.parse(quedan).length + '. Si no ha sido él, desactiva su cuenta.', { prioridad: 4, etiqueta: 'closed_lock_with_key' });
+    } else if (!totpValido(asesor.totp_secreto, b.codigo)) {
+      return res.status(401).json({ error: 'El código no es correcto' });
+    }
+    await conn.execute('DELETE FROM pasos_login WHERE token = ? OR expira_en < NOW()', [p.token]);
+    const sesion = await crearSesionAsesor(conn, asesor);
+    if (b.recordar) sesion.dispositivo = await recordarDispositivo(conn, 'asesor', asesor.id);
+    if (recuperacion) sesion.codigos_recuperacion = recuperacion;
+    res.json(sesion);
+  } finally { conn.release(); }
+});
+// Un administrador reinicia la verificación de otro asesor (móvil perdido):
+// al volver a entrar, la configura de nuevo. Se cierran sus sesiones.
+app.post('/api/admin/asesores/:id/2fa/reiniciar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const id = Number(req.params.id);
+  const [r] = await pool.execute('UPDATE asesores SET totp_activo = 0, totp_secreto = NULL, totp_recuperacion = NULL WHERE id = ?', [id]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Asesor no encontrado' });
+  await pool.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'asesor' AND usuario_id = ?", [id]);
+  await pool.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [id]);
+  res.json({ ok: true });
 });
 
 app.post('/api/admin/logout', requiereSesionAsesor, async (req, res) => {
@@ -1200,7 +1510,7 @@ app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res) => {
 app.get('/api/admin/asesores', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [filas] = await conn.execute('SELECT id, nombre, correo, activo, es_admin, creado_en FROM asesores ORDER BY nombre');
+    const [filas] = await conn.execute('SELECT id, nombre, correo, activo, es_admin, creado_en, totp_activo FROM asesores ORDER BY nombre');
     res.json(filas);
   } finally {
     conn.release();
@@ -1535,6 +1845,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       asesores_disponibles: dispo.map(personaPublica),
       cambio_asesor_pendiente: camb[0] || null,
       valoracion: valor[0] ? valor[0].estado : null,
+      dos_pasos_activo: !!(await conn.execute('SELECT totp_activo FROM clientes WHERE id = ?', [p.cliente_id]))[0][0].totp_activo,
       colaboradores: (await conn.execute("SELECT q.nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id WHERE co.propuesta_id = ? AND co.estado = 'confirmada' ORDER BY co.id", [p.id]))[0].map(x => x.nombre),
       entregas: entregasCli.filter(e => e.propuesta_id === p.id),
       entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
@@ -2209,7 +2520,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [cli] = await conn.execute(
-      'SELECT id, correo, telefono, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id` FROM clientes WHERE id = ?', [id]);
+      'SELECT id, correo, telefono, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id`, `totp_activo` FROM clientes WHERE id = ?', [id]);
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
@@ -2456,11 +2767,19 @@ app.get('/api/configuracion-publica', (req, res) => {
   res.json({ modo_acceso_cliente: MODO_ACCESO_CLIENTE });
 });
 
-async function crearSesionCliente(conn, clienteId) {
+async function crearSesionCliente(conn, clienteId, dosPasos = 0) {
   const token = generarToken();
   const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_CLIENTE * 24 * 60 * 60 * 1000);
-  await conn.execute('INSERT INTO sesiones_cliente (cliente_id, token, expira_en) VALUES (?,?,?)', [clienteId, token, aSQLDatetime(expira)]);
+  await conn.execute('INSERT INTO sesiones_cliente (cliente_id, token, expira_en, dos_pasos) VALUES (?,?,?,?)', [clienteId, token, aSQLDatetime(expira), dosPasos ? 1 : 0]);
   return { token, expira_en: expira.toISOString() };
+}
+// 10/10: si el cliente tiene la verificación en dos pasos, la sesión nace
+// sin verificar (salvo en un dispositivo de confianza) y hay que dar el
+// código antes de ver nada.
+async function sesionClienteTrasEntrar(conn, cliente, tokenDispositivo) {
+  if (!cliente.totp_activo) return { sesion: await crearSesionCliente(conn, cliente.id, 1) };
+  if (await dispositivoDeConfianza(conn, 'cliente', cliente.id, tokenDispositivo)) return { sesion: await crearSesionCliente(conn, cliente.id, 1) };
+  return { sesion: await crearSesionCliente(conn, cliente.id, 0), requiere_2fa: true };
 }
 
 async function requiereSesionCliente(req, res, next) {
@@ -2469,14 +2788,15 @@ async function requiereSesionCliente(req, res, next) {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT s.expira_en, c.id, c.correo, c.nombre, c.apellidos, c.estado, c.contrasena_hash IS NOT NULL AS tiene_contrasena
+      `SELECT s.expira_en, s.dos_pasos, c.totp_activo, c.id, c.correo, c.nombre, c.apellidos, c.estado, c.contrasena_hash IS NOT NULL AS tiene_contrasena
        FROM sesiones_cliente s JOIN clientes c ON c.id = s.cliente_id WHERE s.token = ?`, [token]
     );
     if (!filas.length) return res.status(401).json({ error: 'Sesión no válida. Vuelve a entrar.' });
     const s = filas[0];
     if (new Date(s.expira_en) < ahora()) return res.status(401).json({ error: 'Tu sesión ha caducado. Vuelve a entrar.' });
     if (s.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
-    req.cliente = { id: s.id, correo: s.correo, nombre: s.nombre, apellidos: s.apellidos, tieneContrasena: !!s.tiene_contrasena };
+    if (s.totp_activo && !s.dos_pasos && !req.permitirSinDosPasos) return res.status(401).json({ error: 'Falta la verificación en dos pasos', requiere_2fa: true });
+    req.cliente = { id: s.id, correo: s.correo, nombre: s.nombre, apellidos: s.apellidos, tieneContrasena: !!s.tiene_contrasena, sesionToken: token };
     next();
   } finally {
     conn.release();
@@ -2569,9 +2889,9 @@ app.get('/api/acceso/:token', async (req, res) => {
     if (t.usado) return res.status(410).json({ error: 'Este enlace ya se ha usado' });
     if (new Date(t.expira_en) < ahora()) return res.status(410).json({ error: 'Este enlace ha caducado' });
     await conn.execute('UPDATE tokens_acceso SET usado = 1 WHERE id = ?', [t.id]);
-    const sesion = await crearSesionCliente(conn, t.cliente_id);
-    const [cliente] = await conn.execute('SELECT id, correo, nombre, apellidos FROM clientes WHERE id = ?', [t.cliente_id]);
-    res.json({ ok: true, cliente: cliente[0], sesion });
+    const [cliente] = await conn.execute('SELECT id, correo, nombre, apellidos, totp_activo FROM clientes WHERE id = ?', [t.cliente_id]);
+    const r = await sesionClienteTrasEntrar(conn, cliente[0], req.get('x-dispositivo-2fa'));
+    res.json({ ok: true, cliente: { id: cliente[0].id, correo: cliente[0].correo, nombre: cliente[0].nombre, apellidos: cliente[0].apellidos }, sesion: r.sesion, requiere_2fa: !!r.requiere_2fa });
   } finally {
     conn.release();
   }
@@ -2595,8 +2915,8 @@ app.post('/api/clientes/login', async (req, res) => {
     if (cliente.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa' });
     const ok = await bcrypt.compare(contrasena, cliente.contrasena_hash);
     if (!ok) return error();
-    const sesion = await crearSesionCliente(conn, cliente.id);
-    res.json({ ok: true, cliente: { correo: cliente.correo, nombre: cliente.nombre, apellidos: cliente.apellidos }, sesion });
+    const r = await sesionClienteTrasEntrar(conn, cliente, req.get('x-dispositivo-2fa'));
+    res.json({ ok: true, cliente: { correo: cliente.correo, nombre: cliente.nombre, apellidos: cliente.apellidos }, sesion: r.sesion, requiere_2fa: !!r.requiere_2fa });
   } finally {
     conn.release();
   }
@@ -3003,7 +3323,7 @@ app.get('/api/propuestas/:token/mensajes', async (req, res) => {
     const [filas] = await conn.execute(
       `SELECT m.id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor
        FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
-       WHERE m.propuesta_id = ? ORDER BY m.creado_en, m.id`, [p.id]);
+       WHERE m.propuesta_id = ? AND m.oculto_cliente_en IS NULL AND m.retirado_en IS NULL ORDER BY m.creado_en, m.id`, [p.id]);
     // Al abrir el chat, lo que escribió el asesor queda leído
     await conn.execute("UPDATE mensajes SET leido_en = NOW() WHERE propuesta_id = ? AND autor = 'asesor' AND leido_en IS NULL", [p.id]);
     res.json({ servicios: serviciosDePropuesta(p), mensajes: filas });
@@ -3038,8 +3358,8 @@ app.delete('/api/propuestas/:token/mensajes/:id', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [r] = await conn.execute("DELETE FROM mensajes WHERE id = ? AND propuesta_id = ? AND autor = 'cliente'", [Number(req.params.id), p.id]);
-    if (!r.affectedRows) return res.status(404).json({ error: 'Solo puedes borrar tus propios mensajes' });
+    const [r] = await conn.execute("UPDATE mensajes SET oculto_cliente_en = NOW() WHERE id = ? AND propuesta_id = ? AND autor = 'cliente' AND oculto_cliente_en IS NULL", [Number(req.params.id), p.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solo puedes ocultar tus propios mensajes' });
     res.json({ ok: true });
   } finally {
     conn.release();
@@ -3068,8 +3388,9 @@ app.get('/api/admin/clientes/:id/mensajes', requiereSesionAsesor, async (req, re
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, m.asesor_id, a.nombre AS asesor
-       FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
+      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, m.asesor_id, a.nombre AS asesor,
+              m.oculto_cliente_en, m.retirado_en, ar.nombre AS retirado_por_nombre
+       FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id LEFT JOIN asesores ar ON ar.id = m.retirado_por
        WHERE m.cliente_id = ? ORDER BY m.creado_en, m.id`, [Number(req.params.id)]);
     res.json(filas);
   } finally {
@@ -3114,8 +3435,8 @@ app.post('/api/admin/propuestas/:id/mensajes', requiereSesionAsesor, async (req,
 app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [r] = await conn.execute("DELETE FROM mensajes WHERE id = ? AND autor = 'asesor'", [Number(req.params.id)]);
-    if (!r.affectedRows) return res.status(404).json({ error: 'Solo se pueden borrar mensajes del asesor' });
+    const [r] = await conn.execute("UPDATE mensajes SET retirado_en = NOW(), retirado_por = ? WHERE id = ? AND autor = 'asesor' AND retirado_en IS NULL", [req.asesor.id, Number(req.params.id)]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'Solo se pueden retirar mensajes del asesor' });
     res.json({ ok: true });
   } finally {
     conn.release();
@@ -3675,7 +3996,7 @@ async function enviarAvisosChatPendientes() {
        FROM mensajes m
        JOIN clientes c ON c.id = m.cliente_id
        LEFT JOIN avisos_chat a ON a.propuesta_id = m.propuesta_id
-       WHERE m.autor = 'asesor' AND m.leido_en IS NULL
+       WHERE m.autor = 'asesor' AND m.leido_en IS NULL AND m.retirado_en IS NULL
        GROUP BY m.propuesta_id, c.id, c.correo, a.ultimo_aviso_en
        HAVING MAX(m.creado_en) <= NOW() - INTERVAL ? SECOND
           AND (a.ultimo_aviso_en IS NULL OR MAX(m.creado_en) > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
@@ -3782,7 +4103,8 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
     const [emps] = await conn.execute('SELECT razon_social, contacto_nombre AS contacto FROM empresas WHERE creado_en >= ? AND creado_en < ? ORDER BY creado_en', rango).catch(() => [[]]);
     const [cuests] = await conn.execute('SELECT telefono, correo FROM solicitudes_presupuesto WHERE `cuestionario_en` >= ? AND `cuestionario_en` < ?', rango);
     const [cambs] = await conn.execute('SELECT c.nombre, c.apellidos, c.correo, qd.nombre AS desde_nombre, qa.nombre AS a_nombre, ca.estado FROM cambios_asesor ca JOIN clientes c ON c.id = ca.cliente_id LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.creado_en >= ? AND ca.creado_en < ?', rango);
-    const total = sols.length + llams.length + emps.length + cuests.length + cambs.length;
+    const [sugs] = await conn.execute('SELECT tipo, texto, origen FROM sugerencias WHERE creado_en >= ? AND creado_en < ?', rango);
+    const total = sols.length + llams.length + emps.length + cuests.length + cambs.length + sugs.length;
     await conn.execute('INSERT INTO resumenes_diarios (fecha, enviado_en, elementos) VALUES (?, NOW(), ?) ON DUPLICATE KEY UPDATE enviado_en = NOW(), elementos = ?', [hoy, total, total]);
     if (!total || !brevoActivo()) return { total, enviado: false };
     const servs = x => { try { const l = JSON.parse(x); return Array.isArray(l) ? l.join(', ') : String(x); } catch (e) { return String(x || ''); } };
@@ -3792,6 +4114,7 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
       bloque('Peticiones de llamada', llams.map(x => ESC_HTML(x.nombre || '') + ' · ' + ESC_HTML(x.telefono || ''))) +
       bloque('Empresas registradas', emps.map(x => ESC_HTML(x.razon_social || '') + (x.contacto ? ' · ' + ESC_HTML(x.contacto) : ''))) +
       bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : ''))) +
+      bloque('Sugerencias', sugs.map(x => '<em>' + ({ idea: 'Idea', fallo: 'Algo no funciona', otro: 'Otro' })[x.tipo] + (x.origen === 'area' ? ' · desde el área' : ' · desde la web') + ':</em> ' + ESC_HTML(String(x.texto).slice(0, 220)) + (String(x.texto).length > 220 ? '…' : ''))) +
       bloque('Cambios de asesor pedidos', cambs.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · de ' + ESC_HTML(x.desde_nombre || 'sin asesor') + ' a ' + ESC_HTML(x.a_nombre || '?') + (x.estado === 'pendiente' ? ' · <em>pendiente</em>' : ' · ' + x.estado)));
     const c = plantillaCorreo({ titulo: 'Resumen de ayer', parrafos: ['Esto es lo que entró el ' + fechaBonita + ':', html, 'Lo tenéis todo en el panel.'] });
     const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
