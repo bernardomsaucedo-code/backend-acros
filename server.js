@@ -681,6 +681,13 @@ async function asegurarEsquema() {
       // se borra de verdad. El cliente oculta los suyos de su vista (nosotros
       // conservamos la copia); el asesor retira los suyos (dejan de verse en
       // el área del cliente, pero quedan en el panel).
+      await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
+      // Registro de actividad del equipo (13/10): qué hizo cada asesor en el
+      // panel (confirmar, aprobar, validar, enviar, entregar…), con fecha.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS actividad (' +
+        ' `id` INT AUTO_INCREMENT PRIMARY KEY, `asesor_id` INT NOT NULL, `metodo` VARCHAR(8) NOT NULL, `ruta` VARCHAR(160) NOT NULL,' +
+        ' `objeto_id` INT NULL, `cliente_id` INT NULL, `resumen` VARCHAR(600) NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
       // Verificación en dos pasos (10/10): obligatoria para los asesores,
       // opcional para los clientes. Al estrenarla se cierran todas las
       // sesiones de asesor: cada uno la configura al volver a entrar.
@@ -1022,6 +1029,89 @@ app.post('/api/admin/clientes/:id/2fa/reiniciar', requiereSesionAsesor, requiere
 });
 
 // ================================================================
+// ACTIVIDAD, HISTORIAL, ENCARGOS Y FUSIÓN (13/10)
+// ================================================================
+// Panel (admin): registro de actividad del equipo
+app.get('/api/admin/actividad', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const params = []; let where = '';
+  if (req.query.asesor_id) { where = 'WHERE a.asesor_id = ?'; params.push(Number(req.query.asesor_id)); }
+  if (req.query.cliente_id) { where = (where ? where + ' AND' : 'WHERE') + ' a.cliente_id = ?'; params.push(Number(req.query.cliente_id)); }
+  const [filas] = await pool.query(
+    `SELECT a.*, s.nombre AS asesor_nombre, c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.correo AS cliente_correo
+     FROM actividad a JOIN asesores s ON s.id = a.asesor_id LEFT JOIN clientes c ON c.id = a.cliente_id ${where} ORDER BY a.id DESC LIMIT 300`, params);
+  res.json(filas);
+});
+// Área: los encargos del cliente (para las pestañas) y el historial de uno
+app.get('/api/propuestas/:token/encargos', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [filas] = await conn.execute("SELECT id, token, servicios, estado, creado_en FROM propuestas WHERE cliente_id = ? AND estado IN ('aceptada','enviada') ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
+    res.json(filas.map(x => ({ token: x.token, servicios: serviciosDePropuesta(x), estado: x.estado, creado_en: x.creado_en, actual: x.id === p.id })));
+  } finally { conn.release(); }
+});
+app.get('/api/propuestas/:token/historial', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const ev = [];
+    const add = (cuando, tipo, datos) => { if (cuando) ev.push(Object.assign({ cuando, tipo }, datos || {})); };
+    add(p.creado_en, 'propuesta', { servicios: serviciosDePropuesta(p) });
+    if (p.inicio_inmediato_en) add(p.inicio_inmediato_en, 'aceptada');
+    else if (p.estado === 'aceptada') add(p.actualizado_en || p.creado_en, 'aceptada');
+    if (p.estado === 'rechazada') add(p.actualizado_en || p.creado_en, 'rechazada', { motivo: p.motivo_rechazo });
+    const [pagos] = await conn.execute('SELECT metodo, estado, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ?', [p.id]);
+    pagos.forEach(x => { add(x.creado_en, 'pago_declarado', { metodo: x.metodo }); if (x.estado === 'confirmado') add(x.confirmado_en, 'pago_confirmado'); });
+    const [dils] = await conn.execute('SELECT estado, creado_en, resuelto_en FROM diligencias WHERE propuesta_id = ?', [p.id]);
+    dils.forEach(x => { add(x.creado_en, 'alta_enviada'); if (x.resuelto_en) add(x.resuelto_en, x.estado === 'aprobado' ? 'alta_aprobada' : 'alta_rechazada'); });
+    const [docs] = await conn.execute('SELECT nombre, servicio, estado, razon_rechazo, creado_en, subido_en, revisado_en FROM documentos_fiscales WHERE propuesta_id = ?', [p.id]);
+    docs.forEach(x => { add(x.creado_en, 'doc_pedido', { nombre: x.nombre, servicio: x.servicio }); if (x.subido_en) add(x.subido_en, 'doc_subido', { nombre: x.nombre }); if (x.revisado_en) add(x.revisado_en, x.estado === 'rechazado' ? 'doc_rechazado' : 'doc_validado', { nombre: x.nombre, motivo: x.razon_rechazo }); });
+    const [msgs] = await conn.execute('SELECT m.autor, m.servicio, m.creado_en, a.nombre AS asesor FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id WHERE m.propuesta_id = ?', [p.id]);
+    msgs.forEach(x => add(x.creado_en, x.autor === 'cliente' ? 'msg_cliente' : 'msg_asesor', { servicio: x.servicio, asesor: x.asesor }));
+    const [ents] = await conn.execute('SELECT servicio, version, nombre_archivo, subido_en, estado, respondido_en, comentario FROM entregas WHERE propuesta_id = ?', [p.id]);
+    ents.forEach(x => { add(x.subido_en, 'informe', { servicio: x.servicio, version: x.version, nombre: x.nombre_archivo }); if (x.respondido_en) add(x.respondido_en, x.estado === 'conforme' ? 'conforme' : 'cambios', { servicio: x.servicio, motivo: x.comentario }); });
+    const [cambs] = await conn.execute('SELECT ca.estado, ca.creado_en, ca.resuelto_en, qa.nombre AS a_nombre FROM cambios_asesor ca LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.cliente_id = ? AND ca.creado_en >= ?', [p.cliente_id, p.creado_en]);
+    cambs.forEach(x => { add(x.creado_en, 'cambio_pedido', { a: x.a_nombre }); if (x.resuelto_en) add(x.resuelto_en, x.estado === 'aceptado' ? 'cambio_aceptado' : 'cambio_rechazado', { a: x.a_nombre }); });
+    const [vals] = await conn.execute("SELECT creado_en, estado FROM valoraciones WHERE propuesta_id = ? AND estado <> 'omitida'", [p.id]);
+    vals.forEach(x => add(x.creado_en, 'valoracion'));
+    ev.sort((a, b) => new Date(b.cuando) - new Date(a.cuando));
+    res.json(ev);
+  } finally { conn.release(); }
+});
+// Panel: ¿hay ya un cliente parecido? (antes de enviar una propuesta)
+app.get('/api/admin/clientes/duplicados', requiereSesionAsesor, async (req, res) => {
+  const correo = String(req.query.correo || '').trim().toLowerCase(), tel = String(req.query.telefono || '').replace(/\D/g, ''), nombre = String(req.query.nombre || '').trim();
+  const [filas] = await pool.execute('SELECT id, correo, telefono, nombre, apellidos FROM clientes');
+  const parecidos = filas.filter(c => c.correo !== correo && (
+    (tel.length >= 9 && String(c.telefono || '').replace(/\D/g, '').endsWith(tel.slice(-9))) ||
+    (nombre.length >= 5 && [c.nombre, c.apellidos].filter(Boolean).join(' ').toLowerCase() === nombre.toLowerCase())));
+  res.json(parecidos.map(c => ({ id: c.id, correo: c.correo, telefono: c.telefono, nombre: [c.nombre, c.apellidos].filter(Boolean).join(' ') })));
+});
+// Panel (admin): fusionar dos fichas del mismo cliente. Todo lo del
+// duplicado pasa a la ficha principal; el duplicado se desactiva.
+app.post('/api/admin/clientes/:id/fusionar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const principal = Number(req.params.id), duplicado = Number(req.body && req.body.duplicado_id);
+  if (!duplicado || duplicado === principal) return res.status(400).json({ error: 'Indica la ficha duplicada' });
+  const conn = await pool.getConnection();
+  try {
+    const [a] = await conn.execute('SELECT * FROM clientes WHERE id IN (?, ?)', [principal, duplicado]);
+    if (a.length !== 2) return res.status(404).json({ error: 'Cliente no encontrado' });
+    await conn.beginTransaction();
+    for (const t of ['propuestas', 'diligencias', 'documentos_fiscales', 'mensajes', 'entregas', 'valoraciones', 'cambios_asesor', 'sesiones_cliente', 'tokens_acceso', 'sugerencias', 'actividad']) {
+      await conn.execute(`UPDATE ${t} SET cliente_id = ? WHERE cliente_id = ?`, [principal, duplicado]).catch(() => {});
+    }
+    await conn.execute("UPDATE dispositivos_confianza SET usuario_id = ? WHERE tipo = 'cliente' AND usuario_id = ?", [principal, duplicado]);
+    const dup = a.find(x => x.id === duplicado), pri = a.find(x => x.id === principal);
+    await conn.execute('UPDATE clientes SET telefono = COALESCE(telefono, ?), nombre = COALESCE(nombre, ?), apellidos = COALESCE(apellidos, ?), asesor_persona_id = COALESCE(asesor_persona_id, ?) WHERE id = ?', [dup.telefono, dup.nombre, dup.apellidos, dup.asesor_persona_id, principal]);
+    await conn.execute("UPDATE clientes SET estado = 'inerte', correo = CONCAT('fusionado-', id, '-', correo) WHERE id = ?", [duplicado]);
+    await conn.commit();
+    res.json({ ok: true, principal: pri.correo, fusionado: dup.correo });
+  } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+});
+
+// ================================================================
 // BUZÓN DE SUGERENCIAS (10/10)
 // Público (páginas de la web): texto + tipo + correo opcional, con el
 // mismo antispam que los demás formularios. Desde el Área, con la sesión o
@@ -1264,6 +1354,76 @@ function requiereClaveMaestra(req, res, next) {
 const bcrypt = require('bcryptjs');
 const DIAS_VIGENCIA_SESION_ASESOR = 30;
 
+// ================================================================
+// QUÉ VE CADA ASESOR (modelo B, 13/10, decisión de Vikn)
+// Un asesor que no es administrador solo ve y toca a SUS clientes (los que
+// tienen como asesor a su persona) y los encargos donde figura como
+// colaborador. Los administradores lo ven todo. Se aplica en todas las
+// rutas /api/admin: las listas se filtran por cliente y las rutas con un
+// cliente o encargo concreto se comprueban antes de responder.
+// ================================================================
+async function clientesPermitidos(req) {
+  if (req.asesor.esAdmin) return null;              // null = todos
+  const [f] = await pool.execute(
+    'SELECT c.id FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id WHERE q.asesor_id = ? ' +
+    'UNION SELECT p.cliente_id FROM colaboraciones co JOIN personas q ON q.id = co.persona_id JOIN propuestas p ON p.id = co.propuesta_id WHERE q.asesor_id = ?',
+    [req.asesor.id, req.asesor.id]);
+  return new Set(f.map(x => x.id));
+}
+async function clienteDePropuestaId(id) { const [f] = await pool.execute('SELECT cliente_id FROM propuestas WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
+async function clienteDeObjeto(tabla, id) { const [f] = await pool.execute('SELECT cliente_id FROM ' + tabla + ' WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
+const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados)/];
+async function permisoCliente(req, res, next) {
+  try {
+    if (req.asesor.esAdmin) return next();
+    const permitidos = await clientesPermitidos(req);
+    req.clientesPermitidos = permitidos;
+    // Rutas con un cliente o encargo concreto
+    let clienteId = null; const ruta = req.path;
+    let m;
+    if ((m = ruta.match(/^\/api\/admin\/clientes\/(\d+)/))) clienteId = Number(m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/propuestas\/(\d+)/))) clienteId = await clienteDePropuestaId(m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/documentos\/(\d+)/))) clienteId = await clienteDeObjeto('documentos_fiscales', m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/entregas\/(\d+)/))) clienteId = await clienteDeObjeto('entregas', m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/mensajes\/(\d+)/))) clienteId = await clienteDeObjeto('mensajes', m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/diligencias\/(\d+)/))) clienteId = await clienteDeObjeto('diligencias', m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/pagos\/(\d+)/))) { const [f] = await pool.execute('SELECT p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(m[1])]); clienteId = f.length ? f[0].cliente_id : null; }
+    else if (ruta === '/api/admin/documentos' && req.method === 'POST' && req.body) clienteId = await clienteDePropuestaId(req.body.propuesta_id);
+    if (clienteId !== null && !permitidos.has(clienteId)) return res.status(403).json({ error: 'Este cliente no es tuyo. Pide al titular que te añada como colaborador, o a un administrador.' });
+    // Listas: se filtran por cliente_id (o por propuesta_id si no lo traen)
+    const jsonOriginal = res.json.bind(res);
+    res.json = (datos) => {
+      if (Array.isArray(datos) && datos.length && typeof datos[0] === 'object' && datos[0] && ('cliente_id' in datos[0])) datos = datos.filter(x => x.cliente_id == null || permitidos.has(Number(x.cliente_id)));
+      return jsonOriginal(datos);
+    };
+    next();
+  } catch (err) { next(err); }
+}
+// Registro de actividad: todo lo que un asesor cambia desde el panel
+const RESUMEN_CLAVES = ['decision', 'razon', 'nombre', 'servicio', 'estado', 'accion', 'importe_centimos', 'activo', 'persona_id', 'correo', 'motivo', 'canal', 'tipo', 'urgente', 'respuesta'];
+function registrarActividad(req, status) {
+  if (!req.asesor || !['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method) || status >= 300) return;
+  if (/^\/api\/admin\/(login|logout|mensajes\/sin-leer)/.test(req.path)) return;
+  (async () => {
+    const ruta = req.path.replace(/\/\d+/g, '/:id').slice(0, 160);
+    const ids = (req.path.match(/\/(\d+)/g) || []).map(x => Number(x.slice(1)));
+    let clienteId = null;
+    try {
+      let m;
+      if ((m = req.path.match(/^\/api\/admin\/clientes\/(\d+)/))) clienteId = Number(m[1]);
+      else if ((m = req.path.match(/^\/api\/admin\/propuestas\/(\d+)/))) clienteId = await clienteDePropuestaId(m[1]);
+      else if ((m = req.path.match(/^\/api\/admin\/documentos\/(\d+)/))) clienteId = await clienteDeObjeto('documentos_fiscales', m[1]);
+      else if ((m = req.path.match(/^\/api\/admin\/entregas\/(\d+)/))) clienteId = await clienteDeObjeto('entregas', m[1]);
+      else if ((m = req.path.match(/^\/api\/admin\/diligencias\/(\d+)/))) clienteId = await clienteDeObjeto('diligencias', m[1]);
+      else if ((m = req.path.match(/^\/api\/admin\/pagos\/(\d+)/))) { const [f] = await pool.execute('SELECT p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(m[1])]); clienteId = f.length ? f[0].cliente_id : null; }
+      else if (req.path === '/api/admin/documentos' && req.body) clienteId = await clienteDePropuestaId(req.body.propuesta_id);
+      else if ((req.path === '/api/admin/propuestas' || req.path === '/api/propuestas') && req.body && req.body.correo) { const [f] = await pool.execute('SELECT id FROM clientes WHERE correo = ?', [String(req.body.correo).trim().toLowerCase()]); clienteId = f.length ? f[0].id : null; }
+    } catch (e) {}
+    const resumen = {}; RESUMEN_CLAVES.forEach(k => { if (req.body && req.body[k] !== undefined && req.body[k] !== null && req.body[k] !== '') resumen[k] = String(req.body[k]).slice(0, 120); });
+    await pool.execute('INSERT INTO actividad (asesor_id, metodo, ruta, objeto_id, cliente_id, resumen) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.asesor.id, req.method, ruta, ids.length ? ids[0] : null, clienteId, Object.keys(resumen).length ? JSON.stringify(resumen).slice(0, 600) : null]).catch(err => console.error('Actividad no registrada:', err.message));
+  })();
+}
 async function requiereSesionAsesor(req, res, next) {
   const token = (req.get('x-sesion-token') || '').trim();
   if (!token) return res.status(401).json({ error: 'Falta iniciar sesión' });
@@ -1278,6 +1438,9 @@ async function requiereSesionAsesor(req, res, next) {
     if (new Date(s.expira_en) < ahora()) return res.status(401).json({ error: 'Tu sesión ha caducado. Vuelve a iniciar sesión.' });
     if (!s.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada.' });
     req.asesor = { id: s.id, nombre: s.nombre, correo: s.correo, esAdmin: !!s.es_admin };
+    // 13/10: registro de actividad (al terminar la respuesta) y permisos del modelo B
+    res.on('finish', () => registrarActividad(req, res.statusCode));
+    if (!req.asesor.esAdmin && !RUTAS_LIBRES_ASESOR.some(r => r.test(req.path))) return permisoCliente(req, res, next);
     next();
   } finally {
     conn.release();
@@ -1981,12 +2144,12 @@ app.get('/api/admin/pagos', requiereSesionAsesor, async (req, res) => {
   try {
     const [filas] = estado
       ? await conn.execute(
-          `SELECT pg.*, p.token, c.correo FROM pagos pg
+          `SELECT pg.*, p.token, c.correo, c.id AS cliente_id FROM pagos pg
            JOIN propuestas p ON p.id = pg.propuesta_id
            JOIN clientes c ON c.id = p.cliente_id
            WHERE pg.estado = ? ORDER BY pg.creado_en`, [estado])
       : await conn.execute(
-          `SELECT pg.*, p.token, c.correo FROM pagos pg
+          `SELECT pg.*, p.token, c.correo, c.id AS cliente_id FROM pagos pg
            JOIN propuestas p ON p.id = pg.propuesta_id
            JOIN clientes c ON c.id = p.cliente_id
            ORDER BY pg.creado_en`);
@@ -2735,7 +2898,7 @@ app.post('/api/admin/documentos/:id/revisar', requiereSesionAsesor, async (req, 
       return res.status(409).json({ error: `Solo se puede revisar un documento en estado "enviado" (actual: "${filas[0].estado}")` });
     }
     await conn.execute(
-      'UPDATE documentos_fiscales SET estado = ?, razon_rechazo = ?, resuelto_por_asesor_id = ? WHERE id = ?',
+      'UPDATE documentos_fiscales SET estado = ?, razon_rechazo = ?, resuelto_por_asesor_id = ?, revisado_en = NOW() WHERE id = ?',
       [estadoResultante, accion === 'rechazar' ? razon.trim() : null, req.asesor.id, req.params.id]
     );
     res.json({ ok: true, estado: estadoResultante });
