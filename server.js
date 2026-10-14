@@ -695,6 +695,11 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
       await agregaColumnaSiFalta('clientes', '`preferencias_avisos`', 'TEXT NULL');   // 13/10: «Notificaciones» del Área
       await agregaColumnaSiFalta('clientes', '`telefono2`', 'VARCHAR(40) NULL');   // 14/10: segundo teléfono
+      // 14/10: enlaces para crear o restablecer la contraseña de un asesor
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS enlaces_contrasena (' +
+        " `id` INT AUTO_INCREMENT PRIMARY KEY, `asesor_id` INT NOT NULL, `hash` CHAR(64) NOT NULL UNIQUE, `tipo` ENUM('invitacion','restablecer') NOT NULL," +
+        ' `expira_en` DATETIME NOT NULL, `usado_en` DATETIME NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
       // 14/10: código de usuario (único) y asignación a los clientes que ya tienen identidad
       if (await agregaColumnaSiFalta('clientes', '`codigo`', 'VARCHAR(16) NULL')) {
         await pool.execute('CREATE UNIQUE INDEX idx_clientes_codigo ON clientes (`codigo`)').catch(() => {});
@@ -1523,7 +1528,7 @@ async function clientesPermitidos(req) {
 }
 async function clienteDePropuestaId(id) { const [f] = await pool.execute('SELECT cliente_id FROM propuestas WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
 async function clienteDeObjeto(tabla, id) { const [f] = await pool.execute('SELECT cliente_id FROM ' + tabla + ' WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
-const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados)/];
+const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados|contrasena|mi-correo)/];
 async function permisoCliente(req, res, next) {
   try {
     if (req.asesor.esAdmin) return next();
@@ -1608,10 +1613,12 @@ app.post('/api/admin/asesores', requiereClaveMaestra, async (req, res) => {
   const contrasena = req.body.contrasena || '';
   const esAdmin = req.body.es_admin ? 1 : 0;
   if (!correo || !nombre) return res.status(400).json({ error: 'Faltan correo o nombre' });
-  if (contrasena.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  // 14/10: la contraseña es opcional. Sin ella (lo recomendado), el asesor
+  // recibe por correo un enlace para crearla: nadie más la conoce.
+  if (contrasena && contrasena.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
   const conn = await pool.getConnection();
   try {
-    const hash = await bcrypt.hash(contrasena, 10);
+    const hash = await bcrypt.hash(contrasena || crypto.randomBytes(32).toString('hex'), 10);
     const [r] = await conn.execute('INSERT INTO asesores (correo, nombre, contrasena_hash, es_admin) VALUES (?,?,?,?)', [correo, nombre, hash, esAdmin]);
     // 14/10: alta sencilla. Si ya hay en «Equipo» una persona con ese nombre
     // sin cuenta, se enlaza; si no, se crea. Con «atiende clientes» y su canal
@@ -1629,7 +1636,9 @@ app.post('/api/admin/asesores', requiereClaveMaestra, async (req, res) => {
         persona = { id: pr.insertId, creada: true };
       }
     } catch (err) { console.error('Alta de asesor: no se pudo crear/enlazar su persona:', err.message); }
-    res.status(201).json({ ok: true, id: r.insertId, persona });
+    let invitacion = null;
+    if (!contrasena) invitacion = await enviarEnlaceContrasena(conn, r.insertId, 'invitacion');
+    res.status(201).json({ ok: true, id: r.insertId, persona, invitacion });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Ya existe un asesor con ese correo' });
     throw err;
@@ -1807,6 +1816,83 @@ app.post('/api/admin/logout', requiereSesionAsesor, async (req, res) => {
 // "cambiar contraseña" normal. De momento no invalida las demás sesiones
 // abiertas en otros navegadores (aparcado: no parece grave para un
 // equipo de un puñado de personas, pero queda anotado como pendiente).
+// ================================================================
+// CREAR / RESTABLECER LA CONTRASEÑA DE UN ASESOR (14/10)
+// Enlace de un solo uso al panel (?clave=…): invitación al darle de alta
+// (48 h) o restablecer (1 h si lo pide él, 48 h si lo manda un admin).
+// Solo se guarda el resumen del enlace. Al usarlo se cierran sus sesiones.
+// La verificación en dos pasos se sigue pidiendo al entrar.
+// ================================================================
+const PANEL_URL = (process.env.PANEL_URL || 'https://panel.acrosfi.es').replace(/\/+$/, '');
+async function enviarEnlaceContrasena(conn, asesorId, tipo, horas) {
+  const [f] = await conn.execute('SELECT id, nombre, correo FROM asesores WHERE id = ?', [asesorId]);
+  if (!f.length) return null;
+  const token = crypto.randomBytes(32).toString('hex');
+  const h = horas || (tipo === 'invitacion' ? 48 : 48);
+  await conn.execute("UPDATE enlaces_contrasena SET usado_en = NOW() WHERE asesor_id = ? AND usado_en IS NULL", [asesorId]);   // solo vale el último
+  await conn.execute('INSERT INTO enlaces_contrasena (asesor_id, hash, tipo, expira_en) VALUES (?, ?, ?, NOW() + INTERVAL ? HOUR)', [asesorId, resumen(token), tipo, h]);
+  const enlace = PANEL_URL + '/?clave=' + token;
+  const titulo = tipo === 'invitacion' ? 'Crea tu contraseña para entrar en el panel de Acros' : 'Restablece tu contraseña del panel de Acros';
+  if (brevoActivo()) {
+    const c = plantillaCorreo({ titulo, parrafos: ['Hola, ' + ESC_HTML(f[0].nombre) + ':',
+      tipo === 'invitacion' ? 'Ya tienes cuenta en el panel de Acros. Pulsa el botón para crear tu contraseña; después, al entrar, configurarás la verificación en dos pasos con tu móvil.' : 'Alguien ha pedido restablecer la contraseña de tu cuenta del panel. Si has sido tú, pulsa el botón para poner una nueva. Si no, ignora este correo: tu contraseña no cambia.',
+      'El enlace sirve una sola vez y caduca en ' + h + (h === 1 ? ' hora.' : ' horas.')],
+      boton: { texto: tipo === 'invitacion' ? 'Crear mi contraseña' : 'Poner una contraseña nueva', url: enlace } });
+    enviarCorreo(f[0].correo, titulo, c.html, c.texto).catch(err => console.error('Enlace de contraseña no enviado:', err.message));
+    return { enviado_a: f[0].correo };
+  }
+  return { enviado_a: null, enlace };   // sin correo configurado, el admin lo pasa a mano
+}
+const PETICIONES_OLVIDO = new Map();
+app.post('/api/admin/contrasena/olvidada', async (req, res) => {
+  const correo = String((req.body && req.body.correo) || '').trim().toLowerCase();
+  const generico = { ok: true, mensaje: 'Si ese correo es de una cuenta del panel, te hemos enviado un enlace para poner una contraseña nueva.' };
+  const clave = correo + '|' + (req.ip || ''), x = PETICIONES_OLVIDO.get(clave);
+  if (x && x.hasta > Date.now() && x.n >= 3) return res.json(generico);
+  PETICIONES_OLVIDO.set(clave, x && x.hasta > Date.now() ? { n: x.n + 1, hasta: x.hasta } : { n: 1, hasta: Date.now() + 3600000 });
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT id, nombre FROM asesores WHERE correo = ? AND activo = 1', [correo]);
+    if (f.length) { await enviarEnlaceContrasena(conn, f[0].id, 'restablecer', 1); avisar('🔑 ' + f[0].nombre + ' ha pedido restablecer su contraseña', 'Le hemos enviado un enlace a su correo.', { etiqueta: 'key' }); }
+    res.json(generico);
+  } finally { conn.release(); }
+});
+app.post('/api/admin/asesores/:id/restablecer', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const r = await enviarEnlaceContrasena(conn, Number(req.params.id), 'restablecer', 48);
+    if (!r) return res.status(404).json({ error: 'Asesor no encontrado' });
+    res.json(Object.assign({ ok: true }, r));
+  } finally { conn.release(); }
+});
+async function enlaceVigente(conn, token) {
+  const [f] = await conn.execute('SELECT e.id, e.tipo, e.asesor_id, a.nombre, a.correo, a.activo FROM enlaces_contrasena e JOIN asesores a ON a.id = e.asesor_id WHERE e.hash = ? AND e.usado_en IS NULL AND e.expira_en > NOW()', [resumen(String(token || ''))]);
+  return f.length && f[0].activo ? f[0] : null;
+}
+app.get('/api/admin/contrasena/enlace/:token', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const e = await enlaceVigente(conn, req.params.token);
+    if (!e) return res.status(404).json({ error: 'Este enlace ya no es válido: ha caducado o ya se usó. Pide uno nuevo.' });
+    res.json({ ok: true, tipo: e.tipo, nombre: e.nombre, correo: e.correo });
+  } finally { conn.release(); }
+});
+app.post('/api/admin/contrasena/enlace/:token', async (req, res) => {
+  const nueva = String((req.body && req.body.contrasena) || '');
+  if (nueva.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  const conn = await pool.getConnection();
+  try {
+    const e = await enlaceVigente(conn, req.params.token);
+    if (!e) return res.status(404).json({ error: 'Este enlace ya no es válido: ha caducado o ya se usó. Pide uno nuevo.' });
+    await conn.execute('UPDATE asesores SET contrasena_hash = ? WHERE id = ?', [await bcrypt.hash(nueva, 10), e.asesor_id]);
+    await conn.execute('UPDATE enlaces_contrasena SET usado_en = NOW() WHERE asesor_id = ? AND usado_en IS NULL', [e.asesor_id]);
+    await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [e.asesor_id]);
+    for (const [k] of FALLOS_LOGIN) if (k.startsWith('asesor|' + e.correo + '|')) FALLOS_LOGIN.delete(k);
+    avisar('🔑 ' + e.nombre + (e.tipo === 'invitacion' ? ' ha creado su contraseña' : ' ha restablecido su contraseña'), 'Ya puede entrar en el panel.', { etiqueta: 'key' });
+    res.json({ ok: true, correo: e.correo });
+  } finally { conn.release(); }
+});
+
 // 14/10: cambiar el correo de un asesor. El propio asesor, con su contraseña
 // y el código de su app; un administrador, para otro asesor, con el código
 // de su propia app. Aviso a la dirección antigua y a la nueva; se cierran
