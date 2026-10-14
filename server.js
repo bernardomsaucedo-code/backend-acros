@@ -695,11 +695,20 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
       await agregaColumnaSiFalta('clientes', '`preferencias_avisos`', 'TEXT NULL');   // 13/10: «Notificaciones» del Área
       await agregaColumnaSiFalta('clientes', '`telefono2`', 'VARCHAR(40) NULL');   // 14/10: segundo teléfono
+      // 14/10: llaves de documentos por asesor (ver «LLAVES POR ASESOR»)
+      for (const [col, def] of [['auth_v2', 'TINYINT(1) NOT NULL DEFAULT 0'], ['auth_sal', 'VARCHAR(64) NULL'], ['llave_sal', 'VARCHAR(64) NULL'], ['llave_publica', 'TEXT NULL'], ['llave_privada_cifrada', 'MEDIUMTEXT NULL'], ['llave_iv', 'VARCHAR(40) NULL'], ['maestra_cifrada', 'MEDIUMTEXT NULL'], ['maestra_iv', 'VARCHAR(40) NULL']])
+        await agregaColumnaSiFalta('asesores', '`' + col + '`', def);
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS llaves_documento (' +
+        " `id` INT AUTO_INCREMENT PRIMARY KEY, `tipo` ENUM('fiscal','identidad') NOT NULL, `objeto_id` INT NOT NULL, `asesor_id` INT NOT NULL," +
+        ' `clave_envuelta` VARCHAR(1200) NOT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY u_llave (`tipo`, `objeto_id`, `asesor_id`))');
       // 14/10: enlaces para crear o restablecer la contraseña de un asesor
       await pool.execute(
         'CREATE TABLE IF NOT EXISTS enlaces_contrasena (' +
         " `id` INT AUTO_INCREMENT PRIMARY KEY, `asesor_id` INT NOT NULL, `hash` CHAR(64) NOT NULL UNIQUE, `tipo` ENUM('invitacion','restablecer') NOT NULL," +
         ' `expira_en` DATETIME NOT NULL, `usado_en` DATETIME NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+      await agregaColumnaSiFalta('enlaces_contrasena', '`auth_sal`', 'VARCHAR(64) NULL');
+      await agregaColumnaSiFalta('enlaces_contrasena', '`llave_sal`', 'VARCHAR(64) NULL');
       // 14/10: código de usuario (único) y asignación a los clientes que ya tienen identidad
       if (await agregaColumnaSiFalta('clientes', '`codigo`', 'VARCHAR(16) NULL')) {
         await pool.execute('CREATE UNIQUE INDEX idx_clientes_codigo ON clientes (`codigo`)').catch(() => {});
@@ -1558,7 +1567,10 @@ async function permisoCliente(req, res, next) {
 // Registro de actividad: todo lo que un asesor cambia desde el panel
 const RESUMEN_CLAVES = ['decision', 'razon', 'nombre', 'servicio', 'estado', 'accion', 'importe_centimos', 'activo', 'persona_id', 'correo', 'motivo', 'canal', 'tipo', 'urgente', 'respuesta'];
 function registrarActividad(req, status) {
-  if (!req.asesor || !['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method) || status >= 300) return;
+  // 14/10: además de los cambios, cada descarga de un documento, del DNI, de un
+  // informe o de una copia de la base de datos queda registrada
+  const esDescarga = req.method === 'GET' && /^\/api\/admin\/(documentos|entregas|diligencias|copias-bd)\/\d+\/(descargar|documento)$/.test(req.path);
+  if (!req.asesor || (!['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method) && !esDescarga) || status >= 300) return;
   if (/^\/api\/admin\/(login|logout|mensajes\/sin-leer)/.test(req.path)) return;
   (async () => {
     const ruta = req.path.replace(/\/\d+/g, '/:id').slice(0, 160);
@@ -1573,6 +1585,11 @@ function registrarActividad(req, status) {
       else if ((m = req.path.match(/^\/api\/admin\/diligencias\/(\d+)/))) clienteId = await clienteDeObjeto('diligencias', m[1]);
       else if ((m = req.path.match(/^\/api\/admin\/pagos\/(\d+)/))) { const [f] = await pool.execute('SELECT p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(m[1])]); clienteId = f.length ? f[0].cliente_id : null; }
       else if (req.path === '/api/admin/documentos' && req.body) clienteId = await clienteDePropuestaId(req.body.propuesta_id);
+      if (esDescarga) {   // nombre del documento en el resumen
+        let m2;
+        if ((m2 = req.path.match(/documentos\/(\d+)/))) { const [f] = await pool.execute('SELECT nombre FROM documentos_fiscales WHERE id = ?', [Number(m2[1])]); if (f.length) req.body = Object.assign({}, req.body, { nombre: f[0].nombre }); }
+        if ((m2 = req.path.match(/entregas\/(\d+)/))) { const [f] = await pool.execute('SELECT nombre_archivo FROM entregas WHERE id = ?', [Number(m2[1])]); if (f.length) req.body = Object.assign({}, req.body, { nombre: f[0].nombre_archivo }); }
+      }
       else if ((req.path === '/api/admin/propuestas' || req.path === '/api/propuestas') && req.body && req.body.correo) { const [f] = await pool.execute('SELECT id FROM clientes WHERE correo = ?', [String(req.body.correo).trim().toLowerCase()]); clienteId = f.length ? f[0].id : null; }
     } catch (e) {}
     const resumen = {}; RESUMEN_CLAVES.forEach(k => { if (req.body && req.body[k] !== undefined && req.body[k] !== null && req.body[k] !== '') resumen[k] = String(req.body[k]).slice(0, 120); });
@@ -1718,7 +1735,8 @@ async function crearSesionAsesor(conn, asesor) {
   const token = crypto.randomBytes(24).toString('hex');
   const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_ASESOR * 24 * 60 * 60 * 1000);
   await conn.execute('INSERT INTO sesiones_asesor (asesor_id, token, expira_en) VALUES (?,?,?)', [asesor.id, token, aSQLDatetime(expira)]);
-  return { ok: true, token, nombre: asesor.nombre, correo: asesor.correo, es_admin: !!asesor.es_admin, expira_en: expira.toISOString() };
+  const [k] = await conn.execute('SELECT llave_sal, llave_publica, llave_privada_cifrada, llave_iv, maestra_cifrada, maestra_iv FROM asesores WHERE id = ?', [asesor.id]);
+  return { ok: true, token, nombre: asesor.nombre, correo: asesor.correo, es_admin: !!asesor.es_admin, expira_en: expira.toISOString(), llave: k[0] || null };
 }
 
 app.post('/api/admin/login', async (req, res) => {
@@ -1736,7 +1754,18 @@ app.post('/api/admin/login', async (req, res) => {
     if (!filas.length) return error();
     const asesor = filas[0];
     if (!asesor.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada' });
-    const ok = await bcrypt.compare(contrasena, asesor.contrasena_hash);
+    // 14/10: la contraseña no viaja: el navegador manda una clave derivada
+    // (clave_auth) y se queda con otra para abrir su llave de documentos.
+    // Cuentas antiguas: la primera vez se manda una vez la contraseña para
+    // comprobarla y pasan al sistema nuevo.
+    const claveAuth = String(req.body.clave_auth || '');
+    let ok;
+    if (asesor.auth_v2) ok = !!claveAuth && await bcrypt.compare(claveAuth, asesor.contrasena_hash);
+    else if (!contrasena) return res.status(409).json({ migrar: true });
+    else {
+      ok = await bcrypt.compare(contrasena, asesor.contrasena_hash);
+      if (ok && /^[0-9a-f]{64}$/.test(claveAuth)) { await conn.execute('UPDATE asesores SET contrasena_hash = ?, auth_v2 = 1 WHERE id = ?', [await bcrypt.hash(claveAuth, 10), asesor.id]); asesor.auth_v2 = 1; }
+    }
     if (!ok) return error();
     // 10/10: segundo paso obligatorio. En un ordenador de confianza, directo.
     if (asesor.totp_activo && await dispositivoDeConfianza(conn, 'asesor', asesor.id, req.body.dispositivo)) {
@@ -1789,6 +1818,12 @@ app.post('/api/admin/login/2fa', async (req, res) => {
     if (recuperacion) sesion.codigos_recuperacion = recuperacion;
     res.json(sesion);
   } finally { conn.release(); }
+});
+// 14/10: «Cerrar sesión y olvidar este ordenador»: este navegador vuelve a pedir el código
+app.post('/api/admin/olvidar-dispositivo', requiereSesionAsesor, async (req, res) => {
+  const t = String((req.body && req.body.dispositivo) || '');
+  if (t) await pool.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'asesor' AND usuario_id = ? AND hash = ?", [req.asesor.id, resumen(t)]);
+  res.json({ ok: true });
 });
 // Un administrador reinicia la verificación de otro asesor (móvil perdido):
 // al volver a entrar, la configura de nuevo. Se cierran sus sesiones.
@@ -1866,7 +1901,7 @@ app.post('/api/admin/asesores/:id/restablecer', requiereSesionAsesor, requiereAd
   } finally { conn.release(); }
 });
 async function enlaceVigente(conn, token) {
-  const [f] = await conn.execute('SELECT e.id, e.tipo, e.asesor_id, a.nombre, a.correo, a.activo FROM enlaces_contrasena e JOIN asesores a ON a.id = e.asesor_id WHERE e.hash = ? AND e.usado_en IS NULL AND e.expira_en > NOW()', [resumen(String(token || ''))]);
+  const [f] = await conn.execute('SELECT e.id, e.tipo, e.asesor_id, e.auth_sal, e.llave_sal, a.nombre, a.correo, a.activo FROM enlaces_contrasena e JOIN asesores a ON a.id = e.asesor_id WHERE e.hash = ? AND e.usado_en IS NULL AND e.expira_en > NOW()', [resumen(String(token || ''))]);
   return f.length && f[0].activo ? f[0] : null;
 }
 app.get('/api/admin/contrasena/enlace/:token', async (req, res) => {
@@ -1874,17 +1909,28 @@ app.get('/api/admin/contrasena/enlace/:token', async (req, res) => {
   try {
     const e = await enlaceVigente(conn, req.params.token);
     if (!e) return res.status(404).json({ error: 'Este enlace ya no es válido: ha caducado o ya se usó. Pide uno nuevo.' });
-    res.json({ ok: true, tipo: e.tipo, nombre: e.nombre, correo: e.correo });
+    let auth_sal = e.auth_sal, llave_sal = e.llave_sal;
+    if (!auth_sal || !llave_sal) { auth_sal = salAleatoria(); llave_sal = salAleatoria(); await conn.execute('UPDATE enlaces_contrasena SET auth_sal = ?, llave_sal = ? WHERE id = ?', [auth_sal, llave_sal, e.id]); }
+    res.json({ ok: true, tipo: e.tipo, nombre: e.nombre, correo: e.correo, auth_sal, llave_sal });
   } finally { conn.release(); }
 });
 app.post('/api/admin/contrasena/enlace/:token', async (req, res) => {
-  const nueva = String((req.body && req.body.contrasena) || '');
-  if (nueva.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  const b = req.body || {};
+  const v2 = /^[0-9a-f]{64}$/.test(String(b.clave_auth || ''));
+  const nueva = String(b.contrasena || '');
+  if (!v2 && nueva.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  if (v2 && (!b.llave_publica || !b.llave_privada_cifrada || !b.llave_iv)) return res.status(400).json({ error: 'Falta tu llave de documentos' });
   const conn = await pool.getConnection();
   try {
     const e = await enlaceVigente(conn, req.params.token);
     if (!e) return res.status(404).json({ error: 'Este enlace ya no es válido: ha caducado o ya se usó. Pide uno nuevo.' });
-    await conn.execute('UPDATE asesores SET contrasena_hash = ? WHERE id = ?', [await bcrypt.hash(nueva, 10), e.asesor_id]);
+    if (v2) {
+      // Contraseña nueva = llave nueva: la antigua ya no se puede abrir. Se le
+      // retiran sus accesos y el panel de un administrador se los vuelve a dar.
+      await conn.execute('UPDATE asesores SET contrasena_hash = ?, auth_v2 = 1, auth_sal = ?, llave_sal = ?, llave_publica = ?, llave_privada_cifrada = ?, llave_iv = ?, maestra_cifrada = NULL, maestra_iv = NULL WHERE id = ?',
+        [await bcrypt.hash(String(b.clave_auth), 10), e.auth_sal, e.llave_sal, b.llave_publica, b.llave_privada_cifrada, b.llave_iv, e.asesor_id]);
+      await conn.execute('DELETE FROM llaves_documento WHERE asesor_id = ?', [e.asesor_id]);
+    } else await conn.execute('UPDATE asesores SET contrasena_hash = ?, auth_v2 = 0 WHERE id = ?', [await bcrypt.hash(nueva, 10), e.asesor_id]);
     await conn.execute('UPDATE enlaces_contrasena SET usado_en = NOW() WHERE asesor_id = ? AND usado_en IS NULL', [e.asesor_id]);
     await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [e.asesor_id]);
     for (const [k] of FALLOS_LOGIN) if (k.startsWith('asesor|' + e.correo + '|')) FALLOS_LOGIN.delete(k);
@@ -1892,6 +1938,85 @@ app.post('/api/admin/contrasena/enlace/:token', async (req, res) => {
     res.json({ ok: true, correo: e.correo });
   } finally { conn.release(); }
 });
+
+// ================================================================
+// LLAVES POR ASESOR (14/10, opción B decidida con Vikn)
+// - Cada asesor tiene su par de llaves RSA, creado en su navegador. La
+//   privada se guarda aquí solo CERRADA con una llave que su navegador saca
+//   de su contraseña (PBKDF2, «llave_sal»); este servidor nunca la puede
+//   abrir: la contraseña no viaja (llega «clave_auth», derivada con otra sal).
+// - La clave AES de cada documento va cerrada con la llave maestra (como
+//   siempre) y, además, con la llave de cada asesor que lleve a ese cliente
+//   o colabore con él («llaves_documento»). Las concede el panel de un
+//   administrador (el único que tiene la maestra) y se retiran solas si deja
+//   de llevarlo. Los administradores guardan la maestra cerrada igual.
+// ================================================================
+const salAleatoria = () => crypto.randomBytes(16).toString('hex');
+// Antes de entrar: las sales de esa cuenta (si no existe, unas falsas pero
+// estables, para no revelar qué correos tienen cuenta)
+app.get('/api/admin/login/sales', async (req, res) => {
+  const correo = String(req.query.correo || '').trim().toLowerCase();
+  const [f] = await pool.execute('SELECT id, auth_sal, llave_sal FROM asesores WHERE correo = ?', [correo]);
+  if (!f.length) {
+    const h = crypto.createHmac('sha256', String(process.env.ADMIN_KEY || 'acros')).update(correo).digest('hex');
+    return res.json({ auth_sal: h.slice(0, 32), llave_sal: h.slice(32, 64) });
+  }
+  let { auth_sal, llave_sal } = f[0];
+  if (!auth_sal || !llave_sal) { auth_sal = auth_sal || salAleatoria(); llave_sal = llave_sal || salAleatoria(); await pool.execute('UPDATE asesores SET auth_sal = ?, llave_sal = ? WHERE id = ?', [auth_sal, llave_sal, f[0].id]); }
+  res.json({ auth_sal, llave_sal });
+});
+// Su llave (cerrada), para desbloquearla en otra pestaña o navegador
+app.get('/api/admin/mi-llave', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT auth_v2, llave_sal, llave_publica, llave_privada_cifrada, llave_iv, maestra_cifrada, maestra_iv FROM asesores WHERE id = ?', [req.asesor.id]);
+  res.json(f[0]);
+});
+// Primera vez: guarda su llave nueva (solo si no tenía)
+app.post('/api/admin/mi-llave', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {};
+  if (!b.llave_publica || !b.llave_privada_cifrada || !b.llave_iv) return res.status(400).json({ error: 'Falta la llave' });
+  const [r] = await pool.execute('UPDATE asesores SET llave_publica = ?, llave_privada_cifrada = ?, llave_iv = ? WHERE id = ? AND llave_publica IS NULL', [b.llave_publica, b.llave_privada_cifrada, b.llave_iv, req.asesor.id]);
+  if (!r.affectedRows) return res.status(409).json({ error: 'Ya tienes una llave' });
+  res.json({ ok: true });
+});
+// Administradores: guardar la llave maestra cerrada con su contraseña
+app.post('/api/admin/mi-maestra', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const b = req.body || {};
+  if (!b.maestra_cifrada || !b.maestra_iv) return res.status(400).json({ error: 'Falta la llave maestra' });
+  await pool.execute('UPDATE asesores SET maestra_cifrada = ?, maestra_iv = ? WHERE id = ?', [b.maestra_cifrada, b.maestra_iv, req.asesor.id]);
+  res.json({ ok: true });
+});
+// Quién tiene derecho a cada documento (sus asesores, sin contar admins)
+const SQL_DOCS = "SELECT 'fiscal' AS tipo, d.id AS objeto_id, d.cliente_id, d.documento_clave_cifrada AS clave_cifrada FROM documentos_fiscales d WHERE d.documento_clave_cifrada IS NOT NULL " +
+  "UNION ALL SELECT 'identidad', g.id, g.cliente_id, g.documento_clave_cifrada FROM diligencias g WHERE g.documento_clave_cifrada IS NOT NULL";
+const SQL_DERECHO = 'SELECT c.id AS cliente_id, q.asesor_id FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id WHERE q.asesor_id IS NOT NULL ' +
+  'UNION SELECT p.cliente_id, q.asesor_id FROM colaboraciones co JOIN personas q ON q.id = co.persona_id JOIN propuestas p ON p.id = co.propuesta_id WHERE q.asesor_id IS NOT NULL';
+app.get('/api/admin/llaves/pendientes', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  // Se retiran las que ya no tocan (cliente reasignado, colaboración quitada…)
+  await pool.query(`DELETE l FROM llaves_documento l JOIN (${SQL_DOCS}) x ON x.tipo = l.tipo AND x.objeto_id = l.objeto_id
+    LEFT JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id AND t.asesor_id = l.asesor_id WHERE t.asesor_id IS NULL`);
+  const [f] = await pool.query(`SELECT x.tipo, x.objeto_id, x.clave_cifrada, a.id AS asesor_id, a.llave_publica FROM (${SQL_DOCS}) x
+    JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id
+    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.es_admin = 0 AND a.llave_publica IS NOT NULL
+    LEFT JOIN llaves_documento l ON l.tipo = x.tipo AND l.objeto_id = x.objeto_id AND l.asesor_id = a.id
+    WHERE l.id IS NULL LIMIT 300`);
+  res.json(f);
+});
+app.post('/api/admin/llaves/conceder', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const lista = Array.isArray(req.body && req.body.llaves) ? req.body.llaves.slice(0, 300) : [];
+  const [der] = await pool.query(`SELECT x.tipo, x.objeto_id, t.asesor_id FROM (${SQL_DOCS}) x JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id`);
+  const vale = new Set(der.map(d => d.tipo + '|' + d.objeto_id + '|' + d.asesor_id));
+  let n = 0;
+  for (const l of lista) {
+    if (!vale.has(l.tipo + '|' + l.objeto_id + '|' + l.asesor_id) || !l.clave_envuelta) continue;
+    const [r] = await pool.execute('INSERT IGNORE INTO llaves_documento (tipo, objeto_id, asesor_id, clave_envuelta) VALUES (?, ?, ?, ?)', [l.tipo, Number(l.objeto_id), Number(l.asesor_id), String(l.clave_envuelta).slice(0, 1200)]);
+    n += r.affectedRows;
+  }
+  res.json({ ok: true, concedidas: n });
+});
+async function claveDeAsesor(tipo, objetoId, asesorId) {
+  const [f] = await pool.execute('SELECT clave_envuelta FROM llaves_documento WHERE tipo = ? AND objeto_id = ? AND asesor_id = ?', [tipo, objetoId, asesorId]);
+  return f.length ? f[0].clave_envuelta : null;
+}
 
 // 14/10: cambiar el correo de un asesor. El propio asesor, con su contraseña
 // y el código de su app; un administrador, para otro asesor, con el código
@@ -1923,8 +2048,9 @@ app.post('/api/admin/mi-correo', requiereSesionAsesor, async (req, res) => {
   if (!correoValido(nuevo)) return res.status(400).json({ error: 'Escribe un correo válido' });
   const conn = await pool.getConnection();
   try {
-    const [f] = await conn.execute('SELECT contrasena_hash, totp_secreto, totp_activo FROM asesores WHERE id = ?', [req.asesor.id]);
-    if (!(await bcrypt.compare(String(req.body.contrasena || ''), f[0].contrasena_hash))) return res.status(401).json({ error: 'Tu contraseña no es correcta' });
+    const [f] = await conn.execute('SELECT contrasena_hash, totp_secreto, totp_activo, auth_v2 FROM asesores WHERE id = ?', [req.asesor.id]);
+    const prueba = f[0].auth_v2 ? String(req.body.clave_auth || '') : String(req.body.contrasena || '');
+    if (!prueba || !(await bcrypt.compare(prueba, f[0].contrasena_hash))) return res.status(401).json({ error: 'Tu contraseña no es correcta' });
     if (f[0].totp_activo && !totpValido(f[0].totp_secreto, req.body.codigo)) return res.status(401).json({ error: 'El código de tu app no es correcto' });
     const r = await cambiarCorreoAsesor(conn, req.asesor.id, nuevo, req);
     if (r.error) return res.status(r.status).json({ error: r.error });
@@ -1944,6 +2070,21 @@ app.post('/api/admin/asesores/:id/correo', requiereSesionAsesor, requiereAdminWe
   } finally { conn.release(); }
 });
 
+app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res, next) => {
+  const b = req.body || {};
+  if (!b.clave_auth_actual) return next();   // cuentas antiguas: la ruta de siempre (abajo)
+  if (!/^[0-9a-f]{64}$/.test(String(b.clave_auth_nueva || '')) || !b.auth_sal_nueva || !b.llave_sal_nueva) return res.status(400).json({ error: 'Faltan datos de la contraseña nueva' });
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT contrasena_hash, auth_v2, llave_publica FROM asesores WHERE id = ?', [req.asesor.id]);
+    if (!f[0].auth_v2 || !(await bcrypt.compare(String(b.clave_auth_actual), f[0].contrasena_hash))) return res.status(401).json({ error: 'Tu contraseña actual no es correcta' });
+    if (f[0].llave_publica && (!b.llave_privada_cifrada || !b.llave_iv)) return res.status(400).json({ error: 'Falta tu llave de documentos recerrada' });
+    await conn.execute('UPDATE asesores SET contrasena_hash = ?, auth_sal = ?, llave_sal = ?, llave_privada_cifrada = COALESCE(?, llave_privada_cifrada), llave_iv = COALESCE(?, llave_iv), maestra_cifrada = ?, maestra_iv = ? WHERE id = ?',
+      [await bcrypt.hash(String(b.clave_auth_nueva), 10), b.auth_sal_nueva, b.llave_sal_nueva, b.llave_privada_cifrada || null, b.llave_iv || null, b.maestra_cifrada || null, b.maestra_iv || null, req.asesor.id]);
+    await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ? AND token != ?', [req.asesor.id, req.get('x-sesion-token')]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
 app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res) => {
   const actual = req.body.contrasena_actual || '';
   const nueva = req.body.contrasena_nueva || '';
@@ -2722,6 +2863,7 @@ app.get('/api/admin/diligencias/:id/documento', requiereSesionAsesor, async (req
     res.json({
       archivo_cifrado: buffer.toString('base64'),
       iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada, tipo_mime: d.documento_tipo_mime,
+      clave_asesor: await claveDeAsesor('identidad', Number(req.params.id), req.asesor.id),
     });
   } catch (err) {
     console.error('Error al recuperar el documento:', err);
@@ -3179,6 +3321,7 @@ app.get('/api/admin/documentos/:id/descargar', requiereSesionAsesor, async (req,
     res.json({
       archivo_cifrado: buffer.toString('base64'),
       iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada, tipo_mime: d.documento_tipo_mime,
+      clave_asesor: await claveDeAsesor('fiscal', Number(req.params.id), req.asesor.id),
     });
   } catch (err) {
     console.error('Error al recuperar un documento fiscal:', err);
