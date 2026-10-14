@@ -2654,7 +2654,7 @@ app.get('/api/admin/diligencias/:id/documento', requiereSesionAsesor, async (req
 // vez en cuando y guardarlo aparte (protección contra perder Railway/R2
 // Y contra perder el propio ordenador, no solo uno de los dos).
 const archiver = require('archiver');
-app.get('/api/admin/documentos/backup', requiereSesionAsesor, async (req, res) => {
+app.get('/api/admin/documentos/backup', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {   // 14/10: solo admin (con el modelo B un asesor no puede bajarse lo de todos)
   const conn = await pool.getConnection();
   try {
     const [dniFilas] = await conn.execute(
