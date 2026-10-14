@@ -93,6 +93,17 @@ const ORIGENES_PERMITIDOS = ORIGENES_PERMITIDOS_RAW.trim() === '*'
   ? '*'
   : ORIGENES_PERMITIDOS_RAW.split(',').map(o => o.trim());
 app.use(cors({ origin: ORIGENES_PERMITIDOS }));
+// 14/10: Railway pone un proxy delante; así req.ip es la IP real del visitante
+app.set('trust proxy', 1);
+// 14/10 (panel público): máximo 5 contraseñas fallidas por correo y por IP en
+// 15 minutos; después, a esperar. Se aplica al login del panel y del Área.
+const FALLOS_LOGIN = new Map();
+const VENTANA_LOGIN_MS = 15 * 60 * 1000, MAX_FALLOS_LOGIN = 5;
+function claveLogin(req, tipo, correo) { return tipo + '|' + String(correo || '').toLowerCase() + '|' + (req.ip || ''); }
+function loginBloqueado(clave) { const x = FALLOS_LOGIN.get(clave); if (!x) return false; if (x.hasta < Date.now()) { FALLOS_LOGIN.delete(clave); return false; } return x.n >= MAX_FALLOS_LOGIN; }
+function apuntarFalloLogin(clave) { const x = FALLOS_LOGIN.get(clave); if (!x || x.hasta < Date.now()) FALLOS_LOGIN.set(clave, { n: 1, hasta: Date.now() + VENTANA_LOGIN_MS }); else x.n++; }
+setInterval(() => { const ahoraMs = Date.now(); for (const [k, x] of FALLOS_LOGIN) if (x.hasta < ahoraMs) FALLOS_LOGIN.delete(k); }, 10 * 60 * 1000).unref();
+const MSG_BLOQUEO = 'Demasiados intentos fallidos. Espera 15 minutos y vuelve a probar.';
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
@@ -683,6 +694,12 @@ async function asegurarEsquema() {
       // el área del cliente, pero quedan en el panel).
       await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
       await agregaColumnaSiFalta('clientes', '`preferencias_avisos`', 'TEXT NULL');   // 13/10: «Notificaciones» del Área
+      await agregaColumnaSiFalta('clientes', '`telefono2`', 'VARCHAR(40) NULL');   // 14/10: segundo teléfono
+      // 14/10: código de usuario (único) y asignación a los clientes que ya tienen identidad
+      if (await agregaColumnaSiFalta('clientes', '`codigo`', 'VARCHAR(16) NULL')) {
+        await pool.execute('CREATE UNIQUE INDEX idx_clientes_codigo ON clientes (`codigo`)').catch(() => {});
+      }
+      setTimeout(() => asignarCodigosPendientes().catch(err => console.error('Códigos de usuario:', err.message)), 2000);
       // Registro de actividad del equipo (13/10): qué hizo cada asesor en el
       // panel (confirmar, aprobar, validar, enviar, entregar…), con fecha.
       await pool.execute(
@@ -1030,6 +1047,51 @@ app.post('/api/admin/clientes/:id/2fa/reiniciar', requiereSesionAsesor, requiere
 });
 
 // ================================================================
+// CÓDIGO DE USUARIO (14/10, esquema de Vikn)
+//   1.ª letra del nombre + 1.ª del primer apellido
+// + día de alta (2 cifras) + letra del mes (enero = A … diciembre = L)
+// + último dígito del año de alta
+// + letra del documento + último dígito de su parte numérica
+// + 1 carácter aleatorio (sin los que se confunden: ni O/0 ni I/1…)
+// + 1 letra de control: cada carácter vale 0-9 / A=10…Z=35, se multiplica
+//   por su posición (1, 2, 3…), se suma, resto entre 23 → tabla del DNI.
+// Ej.: Jordi Ejemplo, 12/03/2026, DNI 12345678Z → JE12C6Z8 + aleatorio + control.
+// Único en la base de datos (índice); si coincidiera, se cambia el aleatorio.
+// ================================================================
+const LETRAS_MES = 'ABCDEFGHIJKL', TABLA_CONTROL = 'TRWAGMYFPDXBNJZSQVHLCKE', ALEATORIOS = 'ACDEFHJKMNPRTUVWXY3479';
+const valorCaracter = ch => /[0-9]/.test(ch) ? Number(ch) : ch.charCodeAt(0) - 55;
+const sinTildes = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+function letraControl(base) { let suma = 0; [...base].forEach((ch, i) => { suma += valorCaracter(ch) * (i + 1); }); return TABLA_CONTROL[suma % 23]; }
+function codigoValido(codigo) { const c = String(codigo || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); return c.length >= 3 && letraControl(c.slice(0, -1)) === c.slice(-1); }
+function baseCodigo(c) {
+  const nombre = sinTildes(c.nombre), apellido = sinTildes(String(c.apellidos || '').trim().split(/\s+/)[0]), doc = sinTildes(c.numero_documento);
+  if (!nombre || !apellido || !doc) return null;
+  const f = new Date(new Date(c.creado_en).toLocaleString('en-US', { timeZone: 'Europe/Madrid' }));
+  const letrasDoc = doc.replace(/[0-9]/g, ''), cifrasDoc = doc.replace(/[^0-9]/g, '');
+  return nombre[0] + apellido[0] + String(f.getDate()).padStart(2, '0') + LETRAS_MES[f.getMonth()] + String(f.getFullYear()).slice(-1) +
+    (letrasDoc ? letrasDoc.slice(-1) : 'X') + (cifrasDoc ? cifrasDoc.slice(-1) : '0');
+}
+async function asignarCodigoCliente(conn, clienteId, rehacer) {
+  const [f] = await conn.execute('SELECT id, nombre, apellidos, numero_documento, creado_en, codigo FROM clientes WHERE id = ?', [clienteId]);
+  if (!f.length) return null;
+  const c = f[0], base = baseCodigo(c);
+  if (!base) return c.codigo || null;
+  if (c.codigo && !rehacer && c.codigo.startsWith(base)) return c.codigo;   // ya lo tiene y sigue cuadrando
+  for (let i = 0; i < 12; i++) {
+    const sin = base + ALEATORIOS[crypto.randomInt(ALEATORIOS.length)];
+    const codigo = sin + letraControl(sin);
+    try { await conn.execute('UPDATE clientes SET codigo = ? WHERE id = ?', [codigo, clienteId]); return codigo; }
+    catch (err) { if (err.code !== 'ER_DUP_ENTRY') throw err; }
+  }
+  return null;
+}
+async function asignarCodigosPendientes() {
+  const [f] = await pool.execute("SELECT id FROM clientes WHERE codigo IS NULL AND nombre IS NOT NULL AND apellidos IS NOT NULL AND numero_documento IS NOT NULL AND estado <> 'inerte'");
+  for (const x of f) await asignarCodigoCliente(pool, x.id);
+  if (f.length) console.log('Códigos de usuario asignados:', f.length);
+}
+
+// ================================================================
 // NOTIFICACIONES DEL CLIENTE (13/10)
 // El cliente elige, por tipo de aviso, si le llega por correo y/o por
 // WhatsApp (este solo si Twilio está activo y tiene teléfono). Lo
@@ -1135,11 +1197,11 @@ app.get('/api/propuestas/:token/historial', async (req, res) => {
 // Panel: ¿hay ya un cliente parecido? (antes de enviar una propuesta)
 app.get('/api/admin/clientes/duplicados', requiereSesionAsesor, async (req, res) => {
   const correo = String(req.query.correo || '').trim().toLowerCase(), tel = String(req.query.telefono || '').replace(/\D/g, ''), nombre = String(req.query.nombre || '').trim();
-  const [filas] = await pool.execute('SELECT id, correo, telefono, nombre, apellidos FROM clientes');
+  const [filas] = await pool.execute("SELECT id, correo, telefono, telefono2, nombre, apellidos, codigo, creado_en FROM clientes WHERE estado <> 'inerte'");
   const parecidos = filas.filter(c => c.correo !== correo && (
-    (tel.length >= 9 && String(c.telefono || '').replace(/\D/g, '').endsWith(tel.slice(-9))) ||
+    (tel.length >= 9 && [c.telefono, c.telefono2].some(t => String(t || '').replace(/\D/g, '').endsWith(tel.slice(-9)))) ||
     (nombre.length >= 5 && [c.nombre, c.apellidos].filter(Boolean).join(' ').toLowerCase() === nombre.toLowerCase())));
-  res.json(parecidos.map(c => ({ id: c.id, correo: c.correo, telefono: c.telefono, nombre: [c.nombre, c.apellidos].filter(Boolean).join(' ') })));
+  res.json(parecidos.map(c => ({ id: c.id, correo: c.correo, telefono: c.telefono, codigo: c.codigo, creado_en: c.creado_en, nombre: [c.nombre, c.apellidos].filter(Boolean).join(' ') })));
 });
 // Panel (admin): fusionar dos fichas del mismo cliente. Todo lo del
 // duplicado pasa a la ficha principal; el duplicado se desactiva.
@@ -1162,12 +1224,41 @@ app.post('/api/admin/clientes/:id/fusionar', requiereSesionAsesor, requiereAdmin
     for (const t of ['propuestas', 'diligencias', 'documentos_fiscales', 'mensajes', 'entregas', 'valoraciones', 'cambios_asesor', 'sesiones_cliente', 'tokens_acceso', 'sugerencias', 'actividad']) {
       await conn.execute(`UPDATE ${t} SET cliente_id = ? WHERE cliente_id = ?`, [principal, duplicado]).catch(() => {});
     }
-    await conn.execute("UPDATE dispositivos_confianza SET usuario_id = ? WHERE tipo = 'cliente' AND usuario_id = ?", [principal, duplicado]);
     const dup = a.find(x => x.id === duplicado), pri = a.find(x => x.id === principal);
-    await conn.execute('UPDATE clientes SET telefono = COALESCE(telefono, ?), nombre = COALESCE(nombre, ?), apellidos = COALESCE(apellidos, ?), asesor_persona_id = COALESCE(asesor_persona_id, ?) WHERE id = ?', [dup.telefono, dup.nombre, dup.apellidos, dup.asesor_persona_id, principal]);
-    await conn.execute("UPDATE clientes SET estado = 'inerte', correo = CONCAT('fusionado-', id, '-', correo) WHERE id = ?", [duplicado]);
+    // 14/10: qué dato se queda de cada ficha. Por campo: 'principal',
+    // 'duplicado' o 'ninguno' (vacío). Sin indicar: el de la principal y, si
+    // la principal no lo tiene, el de la duplicada. El correo es obligatorio.
+    const elegido = (req.body && req.body.campos) || {};
+    const de = (campo, cols) => {
+      let o = elegido[campo];
+      if (!['principal', 'duplicado', 'ninguno'].includes(o)) o = cols.some(c => pri[c] != null && pri[c] !== '') ? 'principal' : 'duplicado';
+      if (campo === 'correo' && o === 'ninguno') o = 'principal';
+      const fuente = o === 'principal' ? pri : o === 'duplicado' ? dup : null;
+      return Object.fromEntries(cols.map(c => [c, fuente ? fuente[c] : null]));
+    };
+    const fin = Object.assign({},
+      de('correo', ['correo']), de('nombre', ['nombre']), de('apellidos', ['apellidos']), de('telefono', ['telefono']), de('telefono2', ['telefono2']),
+      de('documento', ['tipo_documento', 'numero_documento']), de('asesor', ['asesor_persona_id']), de('codigo', ['codigo']),
+      de('contrasena', ['contrasena_hash']), de('dos_pasos', ['totp_activo', 'totp_secreto', 'totp_recuperacion', 'totp_activado_en']),
+      de('avisos', ['preferencias_avisos']));
+    if (!fin.totp_activo) Object.assign(fin, { totp_activo: 0, totp_secreto: null, totp_recuperacion: null, totp_activado_en: null });
+    // «Guardar el teléfono de la otra ficha como segundo teléfono»
+    if (elegido.telefono2 === 'telefono_principal') fin.telefono2 = pri.telefono;
+    if (elegido.telefono2 === 'telefono_duplicado') fin.telefono2 = dup.telefono;
+    // Los dispositivos de confianza solo siguen si se queda la verificación de esa ficha
+    const dosPasosDe = (elegido.dos_pasos === 'duplicado') ? duplicado : (elegido.dos_pasos === 'ninguno' ? 0 : principal);
+    await conn.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'cliente' AND usuario_id IN (?, ?) AND usuario_id <> ?", [principal, duplicado, dosPasosDe]);
+    await conn.execute("UPDATE dispositivos_confianza SET usuario_id = ? WHERE tipo = 'cliente' AND usuario_id = ?", [principal, duplicado]);
+    // La duplicada libera su correo y su código antes (son únicos)
+    await conn.execute("UPDATE clientes SET estado = 'inerte', correo = CONCAT('fusionado-', id, '-', correo), codigo = NULL WHERE id = ?", [duplicado]);
+    await conn.execute('UPDATE clientes SET codigo = NULL WHERE id = ?', [principal]);
+    await conn.execute(
+      'UPDATE clientes SET correo = ?, nombre = ?, apellidos = ?, telefono = ?, telefono2 = ?, tipo_documento = ?, numero_documento = ?, asesor_persona_id = ?, codigo = ?, contrasena_hash = ?, totp_activo = ?, totp_secreto = ?, totp_recuperacion = ?, totp_activado_en = ?, preferencias_avisos = ? WHERE id = ?',
+      [fin.correo, fin.nombre, fin.apellidos, fin.telefono, fin.telefono2, fin.tipo_documento, fin.numero_documento, fin.asesor_persona_id, fin.codigo, fin.contrasena_hash,
+       fin.totp_activo ? 1 : 0, fin.totp_secreto, fin.totp_recuperacion, fin.totp_activado_en, fin.preferencias_avisos, principal]);
     await conn.commit();
-    res.json({ ok: true, principal: pri.correo, fusionado: dup.correo, copia: copia ? (copia.clave_r2 || copia.clave || true) : null });
+    if (!fin.codigo) asignarCodigoCliente(pool, principal).catch(() => {});
+    res.json({ ok: true, principal: fin.correo, fusionado: dup.correo, copia: copia ? (copia.clave_r2 || copia.clave || true) : null });
   } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
 });
 
@@ -1522,7 +1613,23 @@ app.post('/api/admin/asesores', requiereClaveMaestra, async (req, res) => {
   try {
     const hash = await bcrypt.hash(contrasena, 10);
     const [r] = await conn.execute('INSERT INTO asesores (correo, nombre, contrasena_hash, es_admin) VALUES (?,?,?,?)', [correo, nombre, hash, esAdmin]);
-    res.status(201).json({ ok: true, id: r.insertId });
+    // 14/10: alta sencilla. Si ya hay en «Equipo» una persona con ese nombre
+    // sin cuenta, se enlaza; si no, se crea. Con «atiende clientes» y su canal
+    // de ntfy propio ya generado. Faltará completar foto, puesto y bio.
+    let persona = null;
+    try {
+      const [ya] = await conn.execute('SELECT id FROM personas WHERE asesor_id IS NULL AND LOWER(nombre) = LOWER(?) LIMIT 1', [nombre]);
+      const canal = 'acros-' + crypto.randomBytes(6).toString('hex');
+      if (ya.length) {
+        await conn.execute('UPDATE personas SET asesor_id = ?, atiende_clientes = 1, ntfy_topic = COALESCE(ntfy_topic, ?) WHERE id = ?', [r.insertId, canal, ya[0].id]);
+        persona = { id: ya[0].id, creada: false };
+      } else {
+        const [ord] = await conn.execute('SELECT COALESCE(MAX(orden), 0) + 1 AS o FROM personas');
+        const [pr] = await conn.execute('INSERT INTO personas (nombre, atiende_clientes, asesor_id, ntfy_topic, activa, orden) VALUES (?, 1, ?, ?, 1, ?)', [nombre, r.insertId, canal, ord[0].o]);
+        persona = { id: pr.insertId, creada: true };
+      }
+    } catch (err) { console.error('Alta de asesor: no se pudo crear/enlazar su persona:', err.message); }
+    res.status(201).json({ ok: true, id: r.insertId, persona });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Ya existe un asesor con ese correo' });
     throw err;
@@ -1614,7 +1721,9 @@ app.post('/api/admin/login', async (req, res) => {
     // Mismo mensaje tanto si el correo no existe como si la contraseña es
     // incorrecta — no hay que confirmar a quien intenta entrar cuáles de
     // los dos falló.
-    const error = () => res.status(401).json({ error: 'Correo o contraseña incorrectos' });
+    const clave = claveLogin(req, 'asesor', correo);
+    if (loginBloqueado(clave)) return res.status(429).json({ error: MSG_BLOQUEO });
+    const error = () => { apuntarFalloLogin(clave); return res.status(401).json({ error: 'Correo o contraseña incorrectos' }); };
     if (!filas.length) return error();
     const asesor = filas[0];
     if (!asesor.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada' });
@@ -1698,6 +1807,57 @@ app.post('/api/admin/logout', requiereSesionAsesor, async (req, res) => {
 // "cambiar contraseña" normal. De momento no invalida las demás sesiones
 // abiertas en otros navegadores (aparcado: no parece grave para un
 // equipo de un puñado de personas, pero queda anotado como pendiente).
+// 14/10: cambiar el correo de un asesor. El propio asesor, con su contraseña
+// y el código de su app; un administrador, para otro asesor, con el código
+// de su propia app. Aviso a la dirección antigua y a la nueva; se cierran
+// las demás sesiones. La cuenta es la misma: no se pierde nada.
+async function cambiarCorreoAsesor(conn, asesorId, nuevo, req) {
+  const [f] = await conn.execute('SELECT id, nombre, correo FROM asesores WHERE id = ?', [asesorId]);
+  if (!f.length) return { status: 404, error: 'Asesor no encontrado' };
+  const antiguo = f[0].correo;
+  if (antiguo === nuevo) return { status: 400, error: 'Es el mismo correo' };
+  try { await conn.execute('UPDATE asesores SET correo = ? WHERE id = ?', [nuevo, asesorId]); }
+  catch (err) { if (err.code === 'ER_DUP_ENTRY') return { status: 409, error: 'Ya hay una cuenta con ese correo' }; throw err; }
+  const tokenActual = req.get('x-sesion-token');
+  if (asesorId === req.asesor.id) await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ? AND token != ?', [asesorId, tokenActual]);
+  else await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [asesorId]);
+  await conn.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'asesor' AND usuario_id = ?", [asesorId]);
+  if (brevoActivo()) {
+    const quien = asesorId === req.asesor.id ? 'tú mismo' : req.asesor.nombre;
+    const c = plantillaCorreo({ titulo: 'Ha cambiado el correo de tu cuenta de Acros',
+      parrafos: ['Hola, ' + ESC_HTML(f[0].nombre) + ':', 'El correo con el que entras en el panel de Acros ha pasado de <b>' + ESC_HTML(antiguo) + '</b> a <b>' + ESC_HTML(nuevo) + '</b>. Lo ha cambiado ' + ESC_HTML(quien) + '.', 'Si no sabías nada de este cambio, avisa enseguida a un administrador.'] });
+    for (const dest of [antiguo, nuevo]) enviarCorreo(dest, 'Ha cambiado el correo de tu cuenta de Acros', c.html, c.texto).catch(err => console.error('Aviso de cambio de correo no enviado:', err.message));
+  }
+  avisar('✉️ Cambio de correo de un asesor', f[0].nombre + ': ' + antiguo + ' → ' + nuevo + ' (lo ha hecho ' + req.asesor.nombre + ').', { etiqueta: 'envelope' });
+  return { ok: true, antiguo, nuevo };
+}
+const correoValido = c => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c);
+app.post('/api/admin/mi-correo', requiereSesionAsesor, async (req, res) => {
+  const nuevo = String((req.body && req.body.correo_nuevo) || '').trim().toLowerCase();
+  if (!correoValido(nuevo)) return res.status(400).json({ error: 'Escribe un correo válido' });
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT contrasena_hash, totp_secreto, totp_activo FROM asesores WHERE id = ?', [req.asesor.id]);
+    if (!(await bcrypt.compare(String(req.body.contrasena || ''), f[0].contrasena_hash))) return res.status(401).json({ error: 'Tu contraseña no es correcta' });
+    if (f[0].totp_activo && !totpValido(f[0].totp_secreto, req.body.codigo)) return res.status(401).json({ error: 'El código de tu app no es correcto' });
+    const r = await cambiarCorreoAsesor(conn, req.asesor.id, nuevo, req);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    res.json(r);
+  } finally { conn.release(); }
+});
+app.post('/api/admin/asesores/:id/correo', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const nuevo = String((req.body && req.body.correo_nuevo) || '').trim().toLowerCase();
+  if (!correoValido(nuevo)) return res.status(400).json({ error: 'Escribe un correo válido' });
+  const conn = await pool.getConnection();
+  try {
+    const [yo] = await conn.execute('SELECT totp_secreto, totp_activo FROM asesores WHERE id = ?', [req.asesor.id]);
+    if (yo[0].totp_activo && !totpValido(yo[0].totp_secreto, req.body.codigo)) return res.status(401).json({ error: 'El código de tu app no es correcto' });
+    const r = await cambiarCorreoAsesor(conn, Number(req.params.id), nuevo, req);
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    res.json(r);
+  } finally { conn.release(); }
+});
+
 app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res) => {
   const actual = req.body.contrasena_actual || '';
   const nueva = req.body.contrasena_nueva || '';
@@ -2037,7 +2197,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento, creado_en FROM clientes WHERE id = ?', [p.cliente_id]);
+    const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento, creado_en, codigo FROM clientes WHERE id = ?', [p.cliente_id]);
     const [pagos] = await conn.execute('SELECT metodo, estado, hash_transaccion, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
     const [diligencias] = await conn.execute('SELECT estado, coherencia, resuelto_en FROM diligencias WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
     // Solo interesa mandar la lista de documentos una vez la diligencia está
@@ -2112,6 +2272,7 @@ app.post('/api/propuestas/:token/identidad', async (req, res) => {
       'UPDATE clientes SET nombre = ?, apellidos = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?',
       [req.body.nombre.trim(), req.body.apellidos.trim(), req.body.tipo_documento, req.body.numero_documento.trim(), p.cliente_id]
     );
+    await asignarCodigoCliente(conn, p.cliente_id).catch(err => console.error('Código de usuario:', err.message));
     if (contrasena && MODO_ACCESO_CLIENTE !== 'enlace') {
       const hash = await bcrypt.hash(contrasena, 10);
       await conn.execute('UPDATE clientes SET contrasena_hash = ? WHERE id = ?', [hash, p.cliente_id]);
@@ -2598,6 +2759,7 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
     // (el Área no lo manda aquí) y se perdía el que dio al darse de alta.
     await conn.execute('UPDATE clientes SET tipo_documento = COALESCE(NULLIF(?, \'\'), tipo_documento), numero_documento = COALESCE(NULLIF(?, \'\'), numero_documento) WHERE id = ?',
       [b.tipo_documento || '', (b.numero_documento || '').trim(), p.cliente_id]);
+    await asignarCodigoCliente(conn, p.cliente_id).catch(() => {});
     avisarCliente(p.cliente_id, '🪪', 'un cliente ha enviado su cuestionario de alta', 'Revísalo en «Diligencias pendientes».', { etiqueta: 'identification_card' });
     res.status(201).json({ ok: true, estado: 'revision' });
   } finally {
@@ -2695,7 +2857,7 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
     const [filas] = await conn.query(
       `SELECT p.id AS propuesta_id, p.servicios, p.importe_centimos, p.estado AS estado_propuesta,
               p.creado_en, p.actualizado_en,
-              c.id AS cliente_id, c.nombre, c.apellidos, c.correo, c.telefono,
+              c.id AS cliente_id, c.nombre, c.apellidos, c.correo, c.telefono, c.codigo,
               (SELECT q.nombre FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_nombre,
               (SELECT q.asesor_id FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_cuenta_id,
               (SELECT pg.estado FROM pagos pg WHERE pg.propuesta_id = p.id ORDER BY pg.id DESC LIMIT 1) AS estado_pago,
@@ -2743,7 +2905,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [cli] = await conn.execute(
-      'SELECT id, correo, telefono, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id`, `totp_activo` FROM clientes WHERE id = ?', [id]);
+      'SELECT id, correo, telefono, telefono2, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id`, `totp_activo`, `codigo`, (`contrasena_hash` IS NOT NULL) AS tiene_contrasena, (`preferencias_avisos` IS NOT NULL) AS avisos_personalizados FROM clientes WHERE id = ?', [id]);
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
@@ -3132,7 +3294,9 @@ app.post('/api/clientes/login', async (req, res) => {
     const [filas] = await conn.execute('SELECT * FROM clientes WHERE correo = ?', [correo]);
     // Mismo mensaje siempre — ni si existe el correo, ni si tiene o no
     // contraseña puesta: no hay que dar pistas a quien prueba a ciegas.
-    const error = () => res.status(401).json({ error: 'Correo o contraseña incorrectos' });
+    const claveC = claveLogin(req, 'cliente', correo);
+    if (loginBloqueado(claveC)) return res.status(429).json({ error: MSG_BLOQUEO });
+    const error = () => { apuntarFalloLogin(claveC); return res.status(401).json({ error: 'Correo o contraseña incorrectos' }); };
     if (!filas.length || !filas[0].contrasena_hash) return error();
     const cliente = filas[0];
     if (cliente.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa' });
@@ -3679,11 +3843,12 @@ app.put('/api/admin/clientes/:id/datos', requiereSesionAsesor, async (req, res) 
   if (!limpio(b.nombre, 120) || !limpio(b.apellidos, 160)) return res.status(400).json({ error: 'Nombre y apellidos no pueden quedar vacíos' });
   if (b.tipo_documento && !tipos.includes(String(b.tipo_documento).toLowerCase())) return res.status(400).json({ error: 'Tipo de documento no válido' });
   const [r] = await pool.execute(
-    'UPDATE clientes SET nombre = ?, apellidos = ?, telefono = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?',
-    [limpio(b.nombre, 120), limpio(b.apellidos, 160), limpio(b.telefono, 40) || null,
+    'UPDATE clientes SET nombre = ?, apellidos = ?, telefono = ?, telefono2 = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?',
+    [limpio(b.nombre, 120), limpio(b.apellidos, 160), limpio(b.telefono, 40) || null, limpio(b.telefono2, 40) || null,
      b.tipo_documento ? String(b.tipo_documento).toLowerCase() : null, limpio(b.numero_documento, 20).toUpperCase() || null, Number(req.params.id)]);
   if (!r.affectedRows) return res.status(404).json({ error: 'Cliente no encontrado' });
-  res.json({ ok: true });
+  const codigo = await asignarCodigoCliente(pool, Number(req.params.id)).catch(() => null);
+  res.json({ ok: true, codigo });
 });
 
 // ================================================================
