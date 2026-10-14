@@ -682,6 +682,7 @@ async function asegurarEsquema() {
       // conservamos la copia); el asesor retira los suyos (dejan de verse en
       // el área del cliente, pero quedan en el panel).
       await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
+      await agregaColumnaSiFalta('clientes', '`preferencias_avisos`', 'TEXT NULL');   // 13/10: «Notificaciones» del Área
       // Registro de actividad del equipo (13/10): qué hizo cada asesor en el
       // panel (confirmar, aprobar, validar, enviar, entregar…), con fecha.
       await pool.execute(
@@ -1026,6 +1027,57 @@ app.post('/api/admin/clientes/:id/2fa/reiniciar', requiereSesionAsesor, requiere
   if (!r.affectedRows) return res.status(404).json({ error: 'Cliente no encontrado' });
   await pool.execute("DELETE FROM dispositivos_confianza WHERE tipo = 'cliente' AND usuario_id = ?", [id]);
   res.json({ ok: true });
+});
+
+// ================================================================
+// NOTIFICACIONES DEL CLIENTE (13/10)
+// El cliente elige, por tipo de aviso, si le llega por correo y/o por
+// WhatsApp (este solo si Twilio está activo y tiene teléfono). Lo
+// imprescindible (propuesta, enlace de acceso, cambio de asesor…) va
+// siempre por correo y no se puede apagar. Por defecto: todo por correo.
+// ================================================================
+const TIPOS_AVISO = ['mensajes', 'documentos', 'informes', 'recordatorios'];
+const AVISOS_POR_DEFECTO = () => Object.fromEntries(TIPOS_AVISO.map(t => [t, { correo: true, whatsapp: false }]));
+function leerPreferenciasAvisos(texto) {
+  const base = AVISOS_POR_DEFECTO();
+  try { const g = JSON.parse(texto || '{}'); TIPOS_AVISO.forEach(t => { if (g[t]) base[t] = { correo: g[t].correo !== false, whatsapp: !!g[t].whatsapp }; }); } catch (e) {}
+  return base;
+}
+// Envía un aviso al cliente según sus preferencias. correoFn() hace el envío
+// por correo (ya preparado por quien llama); textoWA es el mensaje corto.
+async function avisarCliente(conn, clienteId, tipo, correoFn, textoWA) {
+  const [c] = await conn.execute('SELECT telefono, preferencias_avisos FROM clientes WHERE id = ?', [clienteId]);
+  const pref = leerPreferenciasAvisos(c.length ? c[0].preferencias_avisos : null)[tipo] || { correo: true, whatsapp: false };
+  let porCorreo = false;
+  // Si eligió WhatsApp pero aún no está activo (o no tiene teléfono), se le
+  // manda por correo para que no se quede sin aviso.
+  const waPosible = twilioActivo() && c.length && c[0].telefono;
+  if (pref.correo || (pref.whatsapp && !waPosible)) { await correoFn(); porCorreo = true; }
+  if (pref.whatsapp && twilioActivo() && c.length && c[0].telefono && textoWA) {
+    enviarWhatsApp(c[0].telefono, textoWA).catch(err => console.error('WhatsApp de aviso no enviado:', err.message));
+  }
+  return porCorreo;
+}
+app.get('/api/propuestas/:token/avisos', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [c] = await conn.execute('SELECT telefono, preferencias_avisos FROM clientes WHERE id = ?', [p.cliente_id]);
+    res.json({ preferencias: leerPreferenciasAvisos(c[0].preferencias_avisos), whatsapp_disponible: twilioActivo(), tiene_telefono: !!c[0].telefono });
+  } finally { conn.release(); }
+});
+app.put('/api/propuestas/:token/avisos', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const entrada = (req.body && req.body.preferencias) || {};
+    const limpio = {};
+    TIPOS_AVISO.forEach(t => { const x = entrada[t] || {}; limpio[t] = { correo: x.correo !== false, whatsapp: !!x.whatsapp }; });
+    await conn.execute('UPDATE clientes SET preferencias_avisos = ? WHERE id = ?', [JSON.stringify(limpio), p.cliente_id]);
+    res.json({ ok: true, preferencias: limpio });
+  } finally { conn.release(); }
 });
 
 // ================================================================
@@ -4017,7 +4069,9 @@ async function enviarRecordatoriosValoracion() {
         boton: enlace ? { texto: 'Valorar en un minuto', url: enlace } : null,
         nota: 'Es el único recordatorio que te enviaremos.',
       });
-      enviarCorreo(f.correo, `¿Qué tal con ${quien}? · Acros`, c.html, c.texto).catch(err => console.error('Recordatorio de valoración no enviado:', err.message));
+      avisarCliente(conn, f.cliente_id, 'recordatorios', () => enviarCorreo(f.correo, `¿Qué tal con ${quien}? · Acros`, c.html, c.texto),
+        `Acros: hace unos días terminamos tu encargo. ¿Nos cuentas qué tal te ha atendido ${quien}? Son tres preguntas.` + (enlace ? ' ' + enlace : ''))
+        .catch(err => console.error('Recordatorio de valoración no enviado:', err.message));
     }
   } catch (err) { console.error('Recordatorios de valoración:', err.message); }
   finally { if (conn) conn.release(); }
@@ -4080,7 +4134,11 @@ app.post('/api/admin/propuestas/:id/entregas', requiereSesionAsesor, async (req,
         boton: enlace ? { texto: 'Ver mi informe', url: enlace } : null,
         nota: 'Por tu privacidad, el informe no viaja por correo: está guardado en tu área y podrás descargarlo siempre que lo necesites.',
       });
-      try { await enviarCorreo(p.correo, version > 1 ? 'Tu informe corregido de Acros está listo' : 'Tu informe de Acros está listo', c.html, c.texto); correo = 'enviado'; }
+      try {
+        const porCorreo = await avisarCliente(conn, p.cliente_id, 'informes', () => enviarCorreo(p.correo, version > 1 ? 'Tu informe corregido de Acros está listo' : 'Tu informe de Acros está listo', c.html, c.texto),
+          'Acros: ' + (version > 1 ? 'tu informe corregido está listo' : 'tu informe está listo') + ' en tu área de cliente.' + (enlace ? ' ' + enlace : ''));
+        correo = porCorreo ? 'enviado' : 'desactivado_por_cliente';
+      }
       catch (err) { console.error('Correo de entrega no enviado:', err.message); correo = 'fallo'; }
     }
     res.status(201).json({ ok: true, id: r.insertId, version, servicio: serv, correo });
@@ -4185,7 +4243,8 @@ async function enviarAvisosChatPendientes() {
           boton: enlace ? { texto: 'Leer el mensaje', url: enlace } : null,
           nota: enlace ? null : 'Entra en tu área de cliente desde acrosfi.es para leerlo.',
         });
-        await enviarCorreo(f.correo, asesorC ? `${asesorC.nombre}, tu asesor de Acros, te ha escrito` : 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto);
+        await avisarCliente(conn, f.cliente_id, 'mensajes', () => enviarCorreo(f.correo, asesorC ? `${asesorC.nombre}, tu asesor de Acros, te ha escrito` : 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto),
+          'Acros: ' + (asesorC ? asesorC.nombre : 'tu asesor') + ' te ha escrito en tu área de cliente.' + (enlace ? ' ' + enlace : ''));
       } catch (err) {
         console.error('Correo de aviso de chat no enviado (encargo ' + f.propuesta_id + '):', err.message);
       }
@@ -4234,7 +4293,8 @@ async function enviarAvisosDocumentosPendientes() {
         boton: enlace ? { texto: 'Subir documentación', url: enlace } : null,
         nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
       });
-      try { await enviarCorreo(f.correo, asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación', c.html, c.texto); }
+      try { await avisarCliente(conn, f.cliente_id, 'documentos', () => enviarCorreo(f.correo, asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación', c.html, c.texto),
+        'Acros: ' + (asesorD ? asesorD.nombre : 'tu asesor') + ' necesita ' + (docs.length === 1 ? 'un documento' : docs.length + ' documentos') + ' para seguir con tu encargo. Súbelos desde tu área.' + (enlace ? ' ' + enlace : '')); }
       catch (err) { console.error('Correo de documentación pedida no enviado:', err.message); }
     }
   } catch (err) {
