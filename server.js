@@ -1121,7 +1121,7 @@ function leerPreferenciasAvisos(texto) {
 }
 // Envía un aviso al cliente según sus preferencias. correoFn() hace el envío
 // por correo (ya preparado por quien llama); textoWA es el mensaje corto.
-async function avisarCliente(conn, clienteId, tipo, correoFn, textoWA) {
+async function notificarCliente(conn, clienteId, tipo, correoFn, textoWA) {   // 14/10: renombrada (chocaba con avisarCliente, el aviso ntfy al equipo)
   const [c] = await conn.execute('SELECT telefono, preferencias_avisos FROM clientes WHERE id = ?', [clienteId]);
   const pref = leerPreferenciasAvisos(c.length ? c[0].preferencias_avisos : null)[tipo] || { correo: true, whatsapp: false };
   let porCorreo = false;
@@ -4463,7 +4463,7 @@ async function enviarRecordatoriosValoracion() {
         boton: enlace ? { texto: 'Valorar en un minuto', url: enlace } : null,
         nota: 'Es el único recordatorio que te enviaremos.',
       });
-      avisarCliente(conn, f.cliente_id, 'recordatorios', () => enviarCorreo(f.correo, `¿Qué tal con ${quien}? · Acros`, c.html, c.texto),
+      notificarCliente(conn, f.cliente_id, 'recordatorios', () => enviarCorreo(f.correo, `¿Qué tal con ${quien}? · Acros`, c.html, c.texto),
         `Acros: hace unos días terminamos tu encargo. ¿Nos cuentas qué tal te ha atendido ${quien}? Son tres preguntas.` + (enlace ? ' ' + enlace : ''))
         .catch(err => console.error('Recordatorio de valoración no enviado:', err.message));
     }
@@ -4529,7 +4529,7 @@ app.post('/api/admin/propuestas/:id/entregas', requiereSesionAsesor, async (req,
         nota: 'Por tu privacidad, el informe no viaja por correo: está guardado en tu área y podrás descargarlo siempre que lo necesites.',
       });
       try {
-        const porCorreo = await avisarCliente(conn, p.cliente_id, 'informes', () => enviarCorreo(p.correo, version > 1 ? 'Tu informe corregido de Acros está listo' : 'Tu informe de Acros está listo', c.html, c.texto),
+        const porCorreo = await notificarCliente(conn, p.cliente_id, 'informes', () => enviarCorreo(p.correo, version > 1 ? 'Tu informe corregido de Acros está listo' : 'Tu informe de Acros está listo', c.html, c.texto),
           'Acros: ' + (version > 1 ? 'tu informe corregido está listo' : 'tu informe está listo') + ' en tu área de cliente.' + (enlace ? ' ' + enlace : ''));
         correo = porCorreo ? 'enviado' : 'desactivado_por_cliente';
       }
@@ -4637,7 +4637,7 @@ async function enviarAvisosChatPendientes() {
           boton: enlace ? { texto: 'Leer el mensaje', url: enlace } : null,
           nota: enlace ? null : 'Entra en tu área de cliente desde acrosfi.es para leerlo.',
         });
-        await avisarCliente(conn, f.cliente_id, 'mensajes', () => enviarCorreo(f.correo, asesorC ? `${asesorC.nombre}, tu asesor de Acros, te ha escrito` : 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto),
+        await notificarCliente(conn, f.cliente_id, 'mensajes', () => enviarCorreo(f.correo, asesorC ? `${asesorC.nombre}, tu asesor de Acros, te ha escrito` : 'Tu asesor de Acros te ha escrito', correoC.html, correoC.texto),
           'Acros: ' + (asesorC ? asesorC.nombre : 'tu asesor') + ' te ha escrito en tu área de cliente.' + (enlace ? ' ' + enlace : ''));
       } catch (err) {
         console.error('Correo de aviso de chat no enviado (encargo ' + f.propuesta_id + '):', err.message);
@@ -4687,7 +4687,7 @@ async function enviarAvisosDocumentosPendientes() {
         boton: enlace ? { texto: 'Subir documentación', url: enlace } : null,
         nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
       });
-      try { await avisarCliente(conn, f.cliente_id, 'documentos', () => enviarCorreo(f.correo, asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación', c.html, c.texto),
+      try { await notificarCliente(conn, f.cliente_id, 'documentos', () => enviarCorreo(f.correo, asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación', c.html, c.texto),
         'Acros: ' + (asesorD ? asesorD.nombre : 'tu asesor') + ' necesita ' + (docs.length === 1 ? 'un documento' : docs.length + ' documentos') + ' para seguir con tu encargo. Súbelos desde tu área.' + (enlace ? ' ' + enlace : '')); }
       catch (err) { console.error('Correo de documentación pedida no enviado:', err.message); }
     }
@@ -4729,7 +4729,13 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
     const [cuests] = await conn.execute('SELECT telefono, correo FROM solicitudes_presupuesto WHERE `cuestionario_en` >= ? AND `cuestionario_en` < ?', rango);
     const [cambs] = await conn.execute('SELECT c.nombre, c.apellidos, c.correo, qd.nombre AS desde_nombre, qa.nombre AS a_nombre, ca.estado FROM cambios_asesor ca JOIN clientes c ON c.id = ca.cliente_id LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.creado_en >= ? AND ca.creado_en < ?', rango);
     const [sugs] = await conn.execute('SELECT tipo, texto, origen FROM sugerencias WHERE creado_en >= ? AND creado_en < ?', rango);
-    const total = sols.length + llams.length + emps.length + cuests.length + cambs.length + sugs.length;
+    // 14/10: además de lo nuevo de ayer, lo que sigue pendiente ahora mismo
+    const [chats] = await conn.execute("SELECT c.nombre, c.apellidos, c.correo, COUNT(*) AS n, MIN(m.creado_en) AS desde FROM mensajes m JOIN clientes c ON c.id = m.cliente_id WHERE m.autor = 'cliente' AND m.leido_en IS NULL AND m.oculto_cliente_en IS NULL GROUP BY c.id, c.nombre, c.apellidos, c.correo ORDER BY desde");
+    const [docsP] = await conn.execute("SELECT c.nombre, c.apellidos, c.correo, d.nombre AS doc FROM documentos_fiscales d JOIN clientes c ON c.id = d.cliente_id WHERE d.estado = 'enviado' ORDER BY d.subido_en").catch(() => [[]]);
+    const [pagosP] = await conn.execute("SELECT c.correo, pg.metodo FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id JOIN clientes c ON c.id = p.cliente_id WHERE pg.estado = 'autodeclarado'").catch(() => [[]]);
+    const [altasP] = await conn.execute("SELECT c.nombre, c.apellidos, c.correo FROM diligencias g JOIN clientes c ON c.id = g.cliente_id WHERE g.estado IN ('pendiente','examen_especial')").catch(() => [[]]);
+    const pendientes = chats.length + docsP.length + pagosP.length + altasP.length;
+    const total = sols.length + llams.length + emps.length + cuests.length + cambs.length + sugs.length + pendientes;
     await conn.execute('INSERT INTO resumenes_diarios (fecha, enviado_en, elementos) VALUES (?, NOW(), ?) ON DUPLICATE KEY UPDATE enviado_en = NOW(), elementos = ?', [hoy, total, total]);
     if (!total || !brevoActivo()) return { total, enviado: false };
     const servs = x => { try { const l = JSON.parse(x); return Array.isArray(l) ? l.join(', ') : String(x); } catch (e) { return String(x || ''); } };
@@ -4740,8 +4746,14 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
       bloque('Empresas registradas', emps.map(x => ESC_HTML(x.razon_social || '') + (x.contacto ? ' · ' + ESC_HTML(x.contacto) : ''))) +
       bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : ''))) +
       bloque('Sugerencias', sugs.map(x => '<em>' + ({ idea: 'Idea', fallo: 'Algo no funciona', otro: 'Otro' })[x.tipo] + (x.origen === 'area' ? ' · desde el área' : ' · desde la web') + ':</em> ' + ESC_HTML(String(x.texto).slice(0, 220)) + (String(x.texto).length > 220 ? '…' : ''))) +
-      bloque('Cambios de asesor pedidos', cambs.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · de ' + ESC_HTML(x.desde_nombre || 'sin asesor') + ' a ' + ESC_HTML(x.a_nombre || '?') + (x.estado === 'pendiente' ? ' · <em>pendiente</em>' : ' · ' + x.estado)));
-    const c = plantillaCorreo({ titulo: 'Resumen de ayer', parrafos: ['Esto es lo que entró el ' + fechaBonita + ':', html, 'Lo tenéis todo en el panel.'] });
+      bloque('Cambios de asesor pedidos', cambs.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · de ' + ESC_HTML(x.desde_nombre || 'sin asesor') + ' a ' + ESC_HTML(x.a_nombre || '?') + (x.estado === 'pendiente' ? ' · <em>pendiente</em>' : ' · ' + x.estado))) +
+      (pendientes ? '<p style="margin:22px 0 0;"><strong>Pendiente ahora mismo</strong></p>' : '') +
+      bloque('💬 Chats de clientes sin contestar', chats.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · ' + x.n + ' mensaje' + (x.n == 1 ? '' : 's'))) +
+      bloque('📄 Documentos por revisar', docsP.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · ' + ESC_HTML(x.doc || ''))) +
+      bloque('💶 Pagos por confirmar', pagosP.map(x => ESC_HTML(x.correo) + ' · ' + ESC_HTML(x.metodo || ''))) +
+      bloque('🪪 Altas por revisar', altasP.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo)));
+    const nuevos = total - pendientes;
+    const c = plantillaCorreo({ titulo: 'Resumen de Acros', parrafos: [nuevos ? 'Esto es lo que entró el ' + fechaBonita + ':' : 'Ayer (' + fechaBonita + ') no entró nada nuevo.', html, 'Lo tenéis todo en el panel: panel.acrosfi.es'] });
     const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
     for (const a of admins) {
       try { await enviarCorreo(a.correo, 'Resumen de Acros · ' + fechaBonita + ' (' + total + ')', c.html, c.texto); }
