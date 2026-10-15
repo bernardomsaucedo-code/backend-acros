@@ -266,7 +266,31 @@ function avisarEn(topic, titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } =
     .then(() => true)
     .catch(err => { console.error('Aviso ntfy no enviado:', err.message); return false; });
 }
-function avisar(titulo, mensaje, opciones) { return avisarEn(NTFY_TOPIC, titulo, mensaje, opciones); }
+function avisar(titulo, mensaje, opciones) { return avisarEn(canalDe('actividad'), titulo, mensaje, opciones); }   // «Clientes · actividad»
+// 15/10: CANALES DE AVISOS (decididos con Vikn). Se configuran en el panel
+// («Canales de avisos», tabla `ajustes`). Si uno está vacío, sus avisos van
+// al de «Clientes · actividad», que si tampoco está usa NTFY_TOPIC.
+//   captacion      → solicitudes, cuestionarios, llamadas, empresas
+//   actividad      → todo lo de cada cliente (y siempre lo de los canales de asesor)
+//   equipo         → cuentas de asesores: contraseñas, enlaces, códigos, correos
+//   admin_clientes → sugerencias, cambios de asesor, valoraciones
+//   alertas        → lo técnico (correos que no salen, copias que fallan…)
+const NTFY_TOPIC_ADMIN = (process.env.NTFY_TOPIC_ADMIN || '').trim();
+const CANALES = { captacion: '', actividad: '', equipo: '', admin_clientes: '', alertas: '' };
+function canalDe(clave) {
+  const base = CANALES.actividad || NTFY_TOPIC;
+  if (clave === 'actividad') return base;
+  return CANALES[clave] || (['equipo', 'admin_clientes', 'alertas'].includes(clave) && NTFY_TOPIC_ADMIN) || base;
+}
+async function cargarCanales() {
+  try { const [f] = await pool.execute("SELECT clave, valor FROM ajustes WHERE clave LIKE 'ntfy_%'"); f.forEach(x => { const k = x.clave.slice(5); if (k in CANALES) CANALES[k] = (x.valor || '').trim(); }); }
+  catch (e) { /* aún sin tabla */ }
+}
+const avisarCaptacion = (t, m, o) => avisarEn(canalDe('captacion'), t, m, o);
+const avisarEquipo = (t, m, o) => avisarEn(canalDe('equipo'), t, m, o);
+const avisarAdminClientes = (t, m, o) => avisarEn(canalDe('admin_clientes'), t, m, o);
+const avisarAlerta = (t, m, o) => avisarEn(canalDe('alertas'), t, m, o);
+function avisarAdmin(titulo, mensaje, opciones) { return avisarEquipo(titulo, mensaje, opciones); }
 // Fase B (10/10): lo de un cliente concreto va con el nombre de su asesor
 // («💬 Bernardo, un cliente te ha escrito») al canal general (el admin lo
 // ve todo) y, además, al canal propio de ese asesor. Sin asesor asignado:
@@ -695,6 +719,9 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
       await agregaColumnaSiFalta('clientes', '`preferencias_avisos`', 'TEXT NULL');   // 13/10: «Notificaciones» del Área
       await agregaColumnaSiFalta('clientes', '`telefono2`', 'VARCHAR(40) NULL');   // 14/10: segundo teléfono
+      await agregaColumnaSiFalta('documentos_fiscales', '`nombre_original`', 'VARCHAR(255) NULL');   // 15/10: nombre del archivo tal cual lo subió el cliente
+      await pool.execute('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');   // 15/10
+      setTimeout(cargarCanales, 500);
       // 14/10: llaves de documentos por asesor (ver «LLAVES POR ASESOR»)
       for (const [col, def] of [['auth_v2', 'TINYINT(1) NOT NULL DEFAULT 0'], ['auth_sal', 'VARCHAR(64) NULL'], ['llave_sal', 'VARCHAR(64) NULL'], ['llave_publica', 'TEXT NULL'], ['llave_privada_cifrada', 'MEDIUMTEXT NULL'], ['llave_iv', 'VARCHAR(40) NULL'], ['maestra_cifrada', 'MEDIUMTEXT NULL'], ['maestra_iv', 'VARCHAR(40) NULL']])
         await agregaColumnaSiFalta('asesores', '`' + col + '`', def);
@@ -938,7 +965,7 @@ app.post('/api/llamada', async (req, res) => {
       'INSERT INTO solicitudes_llamada (nombre, telefono, origen) VALUES (?, ?, ?)',
       [nombre.trim(), telefono.trim(), origen]
     );
-    avisar('📞 Alguien pide que le llaméis', 'Tenéis una petición de llamada nueva en el panel.', { prioridad: 5, etiqueta: 'telephone_receiver' });
+    avisarCaptacion('📞 Alguien pide que le llaméis', 'Tenéis una petición de llamada nueva en el panel.', { prioridad: 5, etiqueta: 'telephone_receiver' });
     res.status(201).json({ ok: true });
   } catch (err) {
     console.error('Error al guardar la solicitud de llamada:', err);
@@ -1294,7 +1321,7 @@ async function guardarSugerencia(req, res, clienteId) {
   const correo = !clienteId && b.correo && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(b.correo).trim()) ? String(b.correo).trim().slice(0, 160) : null;
   await pool.execute('INSERT INTO sugerencias (tipo, texto, correo, cliente_id, anonima, origen, pagina, idioma) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [tipo, texto, correo, clienteId && !anonima ? clienteId : null, anonima ? 1 : 0, clienteId ? 'area' : 'web', String(b.pagina || '').slice(0, 120) || null, String(b.idioma || '').slice(0, 5) || null]);
-  avisar('💡 Nueva sugerencia', ({ idea: 'Una idea o mejora', fallo: 'Algo que no funciona', otro: 'Un comentario' })[tipo] + (clienteId ? ' desde el área de un cliente' : ' desde la web') + '. La tienes en «Sugerencias» del panel.', { etiqueta: 'bulb' });
+  avisarAdminClientes('💡 Nueva sugerencia', ({ idea: 'Una idea o mejora', fallo: 'Algo que no funciona', otro: 'Un comentario' })[tipo] + (clienteId ? ' desde el área de un cliente' : ' desde la web') + '. La tienes en «Sugerencias» del panel.', { etiqueta: 'bulb' });
   res.status(201).json({ ok: true });
 }
 app.post('/api/sugerencias', (req, res) => guardarSugerencia(req, res, null));
@@ -1352,7 +1379,7 @@ app.post('/api/presupuesto', async (req, res) => {
         Number.isInteger(Number(req.body.asesor_preferido)) && Number(req.body.asesor_preferido) > 0 ? Number(req.body.asesor_preferido) : null,
       ]
     );
-    avisar('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
+    avisarCaptacion('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
     // 09/10: confirmación al cliente si dejó su correo; si no rellenó el
     // cuestionario, con un botón para completarlo cuando quiera
     if (correo && brevoActivo()) {
@@ -1398,7 +1425,7 @@ app.post('/api/presupuesto/:id/cuestionario', async (req, res) => {
     'UPDATE solicitudes_presupuesto SET cuestionario = ?, `token_cuestionario` = NULL, `cuestionario_en` = NOW() WHERE id = ? AND `token_cuestionario` = ? AND cuestionario IS NULL',
     [texto, Number(req.params.id), String(token)]);
   if (!r.affectedRows) return res.status(404).json({ error: 'Esta solicitud ya tiene su cuestionario o no existe' });
-  avisar('📝 Un cliente ha completado su cuestionario', 'Lo tienes en su solicitud, en «Nuevas solicitudes».', { etiqueta: 'memo' });
+  avisarCaptacion('📝 Un cliente ha completado su cuestionario', 'Lo tienes en su solicitud, en «Nuevas solicitudes».', { etiqueta: 'memo' });
   res.json({ ok: true });
 });
 
@@ -1528,7 +1555,7 @@ const DIAS_VIGENCIA_SESION_ASESOR = 30;
 // cliente o encargo concreto se comprueban antes de responder.
 // ================================================================
 async function clientesPermitidos(req) {
-  if (req.asesor.esAdmin) return null;              // null = todos
+  if (req.asesor.esAdmin && !(req.get('x-ambito') === 'mio' && req.method === 'GET')) return null;   // null = todos (admin con «Ver: lo mío»: solo los suyos)
   const [f] = await pool.execute(
     'SELECT c.id FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id WHERE q.asesor_id = ? ' +
     'UNION SELECT p.cliente_id FROM colaboraciones co JOIN personas q ON q.id = co.persona_id JOIN propuestas p ON p.id = co.propuesta_id WHERE q.asesor_id = ?',
@@ -1540,7 +1567,10 @@ async function clienteDeObjeto(tabla, id) { const [f] = await pool.execute('SELE
 const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados|contrasena|mi-correo)/];
 async function permisoCliente(req, res, next) {
   try {
-    if (req.asesor.esAdmin) return next();
+    // 15/10: un admin con «Ver: lo mío» (cabecera x-ambito: mio) ve las listas
+    // filtradas a sus clientes, pero puede seguir abriendo cualquier ficha
+    const soloLoMio = req.asesor.esAdmin && req.get('x-ambito') === 'mio' && req.method === 'GET';
+    if (req.asesor.esAdmin && !soloLoMio) return next();
     const permitidos = await clientesPermitidos(req);
     req.clientesPermitidos = permitidos;
     // Rutas con un cliente o encargo concreto
@@ -1554,7 +1584,7 @@ async function permisoCliente(req, res, next) {
     else if ((m = ruta.match(/^\/api\/admin\/diligencias\/(\d+)/))) clienteId = await clienteDeObjeto('diligencias', m[1]);
     else if ((m = ruta.match(/^\/api\/admin\/pagos\/(\d+)/))) { const [f] = await pool.execute('SELECT p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(m[1])]); clienteId = f.length ? f[0].cliente_id : null; }
     else if (ruta === '/api/admin/documentos' && req.method === 'POST' && req.body) clienteId = await clienteDePropuestaId(req.body.propuesta_id);
-    if (clienteId !== null && !permitidos.has(clienteId)) return res.status(403).json({ error: 'Este cliente no es tuyo. Pide al titular que te añada como colaborador, o a un administrador.' });
+    if (clienteId !== null && !permitidos.has(clienteId) && !soloLoMio) return res.status(403).json({ error: 'Este cliente no es tuyo. Pide al titular que te añada como colaborador, o a un administrador.' });
     // Listas: se filtran por cliente_id (o por propuesta_id si no lo traen)
     const jsonOriginal = res.json.bind(res);
     res.json = (datos) => {
@@ -1613,7 +1643,7 @@ async function requiereSesionAsesor(req, res, next) {
     req.asesor = { id: s.id, nombre: s.nombre, correo: s.correo, esAdmin: !!s.es_admin };
     // 13/10: registro de actividad (al terminar la respuesta) y permisos del modelo B
     res.on('finish', () => registrarActividad(req, res.statusCode));
-    if (!req.asesor.esAdmin && !RUTAS_LIBRES_ASESOR.some(r => r.test(req.path))) return permisoCliente(req, res, next);
+    if ((!req.asesor.esAdmin || (req.get('x-ambito') === 'mio' && req.method === 'GET')) && !RUTAS_LIBRES_ASESOR.some(r => r.test(req.path))) return permisoCliente(req, res, next);   // 15/10: también admin con «lo mío»
     next();
   } finally {
     conn.release();
@@ -1654,7 +1684,7 @@ app.post('/api/admin/asesores', requiereClaveMaestra, async (req, res) => {
       }
     } catch (err) { console.error('Alta de asesor: no se pudo crear/enlazar su persona:', err.message); }
     let invitacion = null;
-    if (!contrasena) invitacion = await enviarEnlaceContrasena(conn, r.insertId, 'invitacion');
+    if (!contrasena) { const inv = await enviarEnlaceContrasena(conn, r.insertId, 'invitacion'); invitacion = inv ? { enviado_a: inv.enviado_a, enlace: inv.enlace || inv.enlace_interno } : null; }
     res.status(201).json({ ok: true, id: r.insertId, persona, invitacion });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Ya existe un asesor con ese correo' });
@@ -1808,7 +1838,7 @@ app.post('/api/admin/login/2fa', async (req, res) => {
       const quedan = gastarRecuperacion(asesor.totp_recuperacion, b.recuperacion);
       if (quedan === null) return res.status(401).json({ error: 'Ese código de recuperación no es válido o ya se usó' });
       await conn.execute('UPDATE asesores SET totp_recuperacion = ? WHERE id = ?', [quedan, asesor.id]);
-      avisar('🔐 ' + asesor.nombre + ' ha entrado con un código de recuperación', 'Le quedan ' + JSON.parse(quedan).length + '. Si no ha sido él, desactiva su cuenta.', { prioridad: 4, etiqueta: 'closed_lock_with_key' });
+      avisarAdmin('🔐 ' + asesor.nombre + ' ha entrado con un código de recuperación', 'Le quedan ' + JSON.parse(quedan).length + '. Si no ha sido él, desactiva su cuenta.', { prioridad: 4, etiqueta: 'closed_lock_with_key' });
     } else if (!totpValido(asesor.totp_secreto, b.codigo)) {
       return res.status(401).json({ error: 'El código no es correcto' });
     }
@@ -1819,6 +1849,31 @@ app.post('/api/admin/login/2fa', async (req, res) => {
     res.json(sesion);
   } finally { conn.release(); }
 });
+// 15/10: «Canales de avisos» (solo admins)
+app.get('/api/admin/canales', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  await cargarCanales();
+  res.json({ canales: CANALES, efectivos: Object.fromEntries(Object.keys(CANALES).map(k => [k, canalDe(k)])), general_railway: NTFY_TOPIC, servidor: NTFY_SERVER });
+});
+app.put('/api/admin/canales', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const b = (req.body && req.body.canales) || {};
+  for (const k of Object.keys(CANALES)) {
+    if (!(k in b)) continue;
+    const v = String(b[k] || '').trim();
+    if (v && !/^[A-Za-z0-9_-]{6,64}$/.test(v)) return res.status(400).json({ error: 'El nombre del canal «' + k + '» solo puede llevar letras, números, - y _ (de 6 a 64)' });
+    await pool.execute('INSERT INTO ajustes (clave, valor) VALUES (?, ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)', ['ntfy_' + k, v]);
+  }
+  await cargarCanales();
+  res.json({ ok: true, canales: CANALES });
+});
+app.post('/api/admin/canales/prueba', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const k = String((req.body && req.body.canal) || '');
+  if (!(k in CANALES)) return res.status(400).json({ error: 'Canal desconocido' });
+  const nombres = { captacion: 'Clientes · captación', actividad: 'Clientes · actividad', equipo: 'Admin · equipo', admin_clientes: 'Admin · clientes', alertas: 'Admin · alertas' };
+  const ok = await avisarEn(canalDe(k), '🔔 Prueba · ' + nombres[k], 'Si ves esto, este canal funciona. Lo ha enviado ' + req.asesor.nombre + '.', { etiqueta: 'tada' });
+  if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso.' });
+  res.json({ ok: true, canal: canalDe(k) });
+});
+
 // 14/10: «Cerrar sesión y olvidar este ordenador»: este navegador vuelve a pedir el código
 app.post('/api/admin/olvidar-dispositivo', requiereSesionAsesor, async (req, res) => {
   const t = String((req.body && req.body.dispositivo) || '');
@@ -1874,7 +1929,7 @@ async function enviarEnlaceContrasena(conn, asesorId, tipo, horas) {
       'El enlace sirve una sola vez y caduca en ' + h + (h === 1 ? ' hora.' : ' horas.')],
       boton: { texto: tipo === 'invitacion' ? 'Crear mi contraseña' : 'Poner una contraseña nueva', url: enlace } });
     enviarCorreo(f[0].correo, titulo, c.html, c.texto).catch(err => console.error('Enlace de contraseña no enviado:', err.message));
-    return { enviado_a: f[0].correo };
+    return { enviado_a: f[0].correo, enlace_interno: enlace };
   }
   return { enviado_a: null, enlace };   // sin correo configurado, el admin lo pasa a mano
 }
@@ -1888,7 +1943,7 @@ app.post('/api/admin/contrasena/olvidada', async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [f] = await conn.execute('SELECT id, nombre FROM asesores WHERE correo = ? AND activo = 1', [correo]);
-    if (f.length) { await enviarEnlaceContrasena(conn, f[0].id, 'restablecer', 1); avisar('🔑 ' + f[0].nombre + ' ha pedido restablecer su contraseña', 'Le hemos enviado un enlace a su correo.', { etiqueta: 'key' }); }
+    if (f.length) { await enviarEnlaceContrasena(conn, f[0].id, 'restablecer', 1); avisarAdmin('🔑 ' + f[0].nombre + ' ha pedido restablecer su contraseña', 'Le hemos enviado un enlace a su correo.', { etiqueta: 'key' }); }
     res.json(generico);
   } finally { conn.release(); }
 });
@@ -1897,7 +1952,8 @@ app.post('/api/admin/asesores/:id/restablecer', requiereSesionAsesor, requiereAd
   try {
     const r = await enviarEnlaceContrasena(conn, Number(req.params.id), 'restablecer', 48);
     if (!r) return res.status(404).json({ error: 'Asesor no encontrado' });
-    res.json(Object.assign({ ok: true }, r));
+    // 15/10: al admin se le devuelve también el enlace, por si el correo no llega (spam…) y se lo pasa por otro canal
+    res.json({ ok: true, enviado_a: r.enviado_a, enlace: r.enlace || r.enlace_interno });
   } finally { conn.release(); }
 });
 async function enlaceVigente(conn, token) {
@@ -1934,7 +1990,7 @@ app.post('/api/admin/contrasena/enlace/:token', async (req, res) => {
     await conn.execute('UPDATE enlaces_contrasena SET usado_en = NOW() WHERE asesor_id = ? AND usado_en IS NULL', [e.asesor_id]);
     await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ?', [e.asesor_id]);
     for (const [k] of FALLOS_LOGIN) if (k.startsWith('asesor|' + e.correo + '|')) FALLOS_LOGIN.delete(k);
-    avisar('🔑 ' + e.nombre + (e.tipo === 'invitacion' ? ' ha creado su contraseña' : ' ha restablecido su contraseña'), 'Ya puede entrar en el panel.', { etiqueta: 'key' });
+    avisarAdmin('🔑 ' + e.nombre + (e.tipo === 'invitacion' ? ' ha creado su contraseña' : ' ha restablecido su contraseña'), 'Ya puede entrar en el panel.', { etiqueta: 'key' });
     res.json({ ok: true, correo: e.correo });
   } finally { conn.release(); }
 });
@@ -2039,7 +2095,7 @@ async function cambiarCorreoAsesor(conn, asesorId, nuevo, req) {
       parrafos: ['Hola, ' + ESC_HTML(f[0].nombre) + ':', 'El correo con el que entras en el panel de Acros ha pasado de <b>' + ESC_HTML(antiguo) + '</b> a <b>' + ESC_HTML(nuevo) + '</b>. Lo ha cambiado ' + ESC_HTML(quien) + '.', 'Si no sabías nada de este cambio, avisa enseguida a un administrador.'] });
     for (const dest of [antiguo, nuevo]) enviarCorreo(dest, 'Ha cambiado el correo de tu cuenta de Acros', c.html, c.texto).catch(err => console.error('Aviso de cambio de correo no enviado:', err.message));
   }
-  avisar('✉️ Cambio de correo de un asesor', f[0].nombre + ': ' + antiguo + ' → ' + nuevo + ' (lo ha hecho ' + req.asesor.nombre + ').', { etiqueta: 'envelope' });
+  avisarAdmin('✉️ Cambio de correo de un asesor', f[0].nombre + ': ' + antiguo + ' → ' + nuevo + ' (lo ha hecho ' + req.asesor.nombre + ').', { etiqueta: 'envelope' });
   return { ok: true, antiguo, nuevo };
 }
 const correoValido = c => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c);
@@ -2082,6 +2138,7 @@ app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res, next
     await conn.execute('UPDATE asesores SET contrasena_hash = ?, auth_sal = ?, llave_sal = ?, llave_privada_cifrada = COALESCE(?, llave_privada_cifrada), llave_iv = COALESCE(?, llave_iv), maestra_cifrada = ?, maestra_iv = ? WHERE id = ?',
       [await bcrypt.hash(String(b.clave_auth_nueva), 10), b.auth_sal_nueva, b.llave_sal_nueva, b.llave_privada_cifrada || null, b.llave_iv || null, b.maestra_cifrada || null, b.maestra_iv || null, req.asesor.id]);
     await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ? AND token != ?', [req.asesor.id, req.get('x-sesion-token')]);
+    avisarAdmin('🔑 ' + req.asesor.nombre + ' ha cambiado su contraseña', 'Desde «Mi cuenta» del panel. Si no ha sido él, desactiva su cuenta.', { etiqueta: 'key' });   // 15/10
     res.json({ ok: true });
   } finally { conn.release(); }
 });
@@ -2105,6 +2162,7 @@ app.post('/api/admin/mi-contrasena', requiereSesionAsesor, async (req, res) => {
     // de hacer él mismo.
     const tokenActual = req.get('x-sesion-token');
     await conn.execute('DELETE FROM sesiones_asesor WHERE asesor_id = ? AND token != ?', [req.asesor.id, tokenActual]);
+    avisarAdmin('🔑 ' + req.asesor.nombre + ' ha cambiado su contraseña', 'Desde «Mi cuenta» del panel. Si no ha sido él, desactiva su cuenta.', { etiqueta: 'key' });
     res.json({ ok: true });
   } finally {
     conn.release();
@@ -2212,7 +2270,7 @@ app.post('/api/empresas', async (req, res) => {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
       [datos.razon, datos.cif, datos.tipo, datos.tipoOtro, datos.contacto, datos.telefono, datos.correo, datos.canal, datos.comentario, idioma, utm, origen]
     );
-    avisar('🏢 Nueva empresa registrada', 'Está en el bloque «Empresas» del panel.', { etiqueta: 'office' });
+    avisarCaptacion('🏢 Nueva empresa registrada', 'Está en el bloque «Empresas» del panel.', { etiqueta: 'office' });
     res.status(201).json({ ok: true });
   } catch (err) {
     console.error('Error al guardar el alta de empresa:', err);
@@ -2440,6 +2498,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       );
       documentos = filas;
     }
+    const subidasHoy = await subidasDeHoy(conn, p.cliente_id);   // 15/10
     const [entregasCli] = await conn.execute(
       'SELECT e.`id`, e.`propuesta_id`, e.`servicio`, e.`version`, e.`nombre_archivo`, e.`bytes`, e.`subido_en`, e.`estado`, e.`comentario`, e.`respondido_en`, p2.`creado_en` AS propuesta_creada ' +
       'FROM entregas e JOIN propuestas p2 ON p2.`id` = e.`propuesta_id` ' +
@@ -2463,7 +2522,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
       diligencia: diligencias[0] || null,
-      documentos,
+      documentos, subidas_hoy: subidasHoy, limite_subidas: LIMITE_SUBIDAS_DIA,
     });
   } finally {
     conn.release();
@@ -3234,7 +3293,7 @@ app.get('/api/admin/documentos', requiereSesionAsesor, async (req, res) => {
     // (10/09): quién lo pidió — tiene sentido mostrarlo ya en la cola de
     // revisión, a diferencia de "quién lo resolvió" (que por definición
     // todavía es nadie mientras siga en esta cola).
-    const columnas = `d.id, d.cliente_id, d.propuesta_id, d.servicio, d.nombre AS nombre_doc, d.urgente,
+    const columnas = `d.id, d.cliente_id, d.propuesta_id, d.servicio, d.nombre AS nombre_doc, d.nombre_original, d.urgente,
               d.estado, d.razon_rechazo, d.subido_en, d.creado_en,
               c.correo, c.nombre AS nombre_cliente, c.apellidos,
               ap.nombre AS asesor_pide`;
@@ -3275,6 +3334,37 @@ app.delete('/api/admin/documentos/:id', requiereSesionAsesor, async (req, res) =
 
 // El cliente sube el archivo (ya cifrado por su navegador) contra un
 // documento pedido en concreto. Mismo límite de tamaño que el DNI.
+// 15/10: límite de subidas por cliente y día (hora de Madrid)
+const LIMITE_SUBIDAS_DIA = 20;
+async function subidasDeHoy(conn, clienteId) {
+  const [f] = await conn.execute('SELECT COUNT(*) AS n FROM documentos_fiscales WHERE cliente_id = ? AND subido_en >= ?', [clienteId, aSQLDatetime(inicioDiaMadridUTC(fechaMadrid().fecha))]);
+  return Number(f[0].n) || 0;
+}
+const MSG_LIMITE_SUBIDAS = 'Has llegado al límite de hoy (' + LIMITE_SUBIDAS_DIA + ' documentos). Mañana podrás subir más; si te corre prisa, escribe a tu asesor.';
+// 15/10: el cliente sube un documento que no se le ha pedido (botón «Subir
+// documento» → «Otro documento»). Se guarda igual que los pedidos.
+app.post('/api/propuestas/:token/documentos-nuevo', async (req, res) => {
+  const b = req.body || {};
+  const nombre = String(b.nombre || '').trim().slice(0, 200);
+  if (nombre.length < 4) return res.status(400).json({ error: 'Indica qué documento es' });
+  if (!b.archivo_cifrado || !b.iv || !b.clave_cifrada) return res.status(400).json({ error: 'Falta el archivo' });
+  if (!limiteTamanoOk(b.archivo_cifrado, 15 * 1024 * 1024)) return res.status(400).json({ error: 'El archivo no puede superar los 15 MB' });
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const servicios = serviciosDePropuesta(p);
+    const servicio = servicios.includes(b.servicio) ? b.servicio : 'general';
+    if (await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
+    const clave = `docs/${p.cliente_id}/${generarToken()}.enc`;
+    await subirAR2(clave, Buffer.from(b.archivo_cifrado, 'base64'), 'application/octet-stream');
+    const [r] = await conn.execute(
+      "INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, estado, documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, subido_en, nombre_original) VALUES (?, ?, ?, ?, 'enviado', ?, ?, ?, ?, ?, ?)",
+      [p.cliente_id, p.id, servicio, nombre, clave, b.iv, b.clave_cifrada, b.tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), String(b.nombre_original || '').slice(0, 255) || null]);
+    avisarCliente(p.cliente_id, '📄', 'un cliente ha subido un documento', '«' + nombre + '». Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
+    res.status(201).json({ ok: true, id: r.insertId, subidas_hoy: await subidasDeHoy(conn, p.cliente_id), limite: LIMITE_SUBIDAS_DIA });
+  } finally { conn.release(); }
+});
 app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
   const { archivo_cifrado, iv, clave_cifrada, tipo_mime } = req.body;
   if (!archivo_cifrado || !iv || !clave_cifrada) {
@@ -3289,6 +3379,8 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [filas] = await conn.execute('SELECT * FROM documentos_fiscales WHERE id = ? AND propuesta_id = ?', [req.params.id, p.id]);
     if (!filas.length) return res.status(404).json({ error: 'Documento no encontrado' });
+    if (await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
+    if (req.body.nombre_original) await conn.execute('UPDATE documentos_fiscales SET nombre_original = ? WHERE id = ?', [String(req.body.nombre_original).slice(0, 255), req.params.id]);
     const clave = `docs/${p.cliente_id}/${generarToken()}.enc`;
     await subirAR2(clave, Buffer.from(archivo_cifrado, 'base64'), 'application/octet-stream');
     // Re-subir tras un rechazo también vale — vuelve a "enviado" y borra
@@ -3480,7 +3572,7 @@ app.post('/api/acceso/solicitar', async (req, res) => {
       // el registro y os llega un aviso para revisar el correo.
       if (process.env.MODO_DEMO === '1') return res.json({ ok: true, token_demo: token, expira_en: expira.toISOString() });
       console.error('ACCESO: el enlace de un cliente no ha salido por ningún canal (¿Brevo sin configurar o con error?).');
-      avisar('⚠️ Un cliente no ha recibido su enlace de acceso', 'El correo no ha salido: revisa Brevo en Railway (BREVO_API_KEY y BREVO_REMITENTE) y el registro.', { prioridad: 4, etiqueta: 'warning' });
+      avisarAlerta('⚠️ Un cliente no ha recibido su enlace de acceso', 'El correo no ha salido: revisa Brevo en Railway (BREVO_API_KEY y BREVO_REMITENTE) y el registro.', { prioridad: 4, etiqueta: 'warning' });
       return res.json({ ok: true });
     }
     // Mismo "ok" tanto si el correo existe como si no: no hay que confirmar
@@ -4156,7 +4248,7 @@ app.post('/api/propuestas/:token/cambio-asesor', async (req, res) => {
     if (pend.length) return res.status(409).json({ error: 'Ya tienes un cambio pendiente de confirmar' });
     const motivo = textoMensaje(req.body.motivo || '').slice(0, 1000) || null;
     await conn.execute('INSERT INTO cambios_asesor (cliente_id, desde_persona_id, a_persona_id, motivo) VALUES (?, ?, ?, ?)', [p.cliente_id, actual ? actual.id : null, destino.id, motivo]);
-    avisar('🔁 Un cliente pide cambiar de asesor', (actual ? 'De ' + actual.nombre + ' a ' : 'A ') + destino.nombre + '. Confírmalo en «Cambios de asesor pendientes».', { prioridad: 4, etiqueta: 'arrows_counterclockwise' });
+    avisarAdminClientes('🔁 Un cliente pide cambiar de asesor', (actual ? 'De ' + actual.nombre + ' a ' : 'A ') + destino.nombre + '. Confírmalo en «Cambios de asesor pendientes».', { prioridad: 4, etiqueta: 'arrows_counterclockwise' });
     res.status(201).json({ ok: true });
   } finally { conn.release(); }
 });
@@ -4420,7 +4512,7 @@ app.post('/api/propuestas/:token/valoracion', async (req, res) => {
     if (ya.length) await conn.execute('UPDATE valoraciones SET `persona_id`=?, `atencion`=?, `calidad`=?, `rapidez`=?, `comentario`=?, `nombre_publico`=?, `nombre_mostrado`=?, `estado`=?, `creado_en`=NOW() WHERE `propuesta_id`=?', [...valores, p.id]);
     else await conn.execute('INSERT INTO valoraciones (`persona_id`, `atencion`, `calidad`, `rapidez`, `comentario`, `nombre_publico`, `nombre_mostrado`, `estado`, `propuesta_id`, `cliente_id`) VALUES (?,?,?,?,?,?,?,?,?,?)', [...valores, p.id, p.cliente_id]);
     const media = ((at + ca + ra) / 3).toFixed(1).replace('.', ',');
-    avisarCliente(p.cliente_id, '⭐', 'un cliente te ha valorado', 'Media ' + media + '/5' + (comentario ? ' · con comentario por revisar' : '') + '.', { etiqueta: 'star' });
+    (async () => { const q = await personaDeCliente(p.cliente_id).catch(() => null); avisarAdminClientes('⭐ Nueva valoración' + (q ? ' de un cliente de ' + q.nombre : ''), 'Media ' + media + '/5' + (comentario ? ' · con comentario por revisar' : '') + '.', { etiqueta: 'star' }); })();   // 15/10: las valoraciones solo a los admins
     res.status(201).json({ ok: true });
   } finally { conn.release(); }
 });
@@ -4829,7 +4921,7 @@ function cifrarCopia(buffer) {
   }));
 }
 async function avisarFalloCopia(mensaje) {
-  avisar('⚠️ La copia de la base de datos ha fallado', 'Mira el registro de Railway. Se reintenta cada hora.', { prioridad: 4, etiqueta: 'floppy_disk' });
+  avisarAlerta('⚠️ La copia de la base de datos ha fallado', 'Mira el registro de Railway. Se reintenta cada hora.', { prioridad: 4, etiqueta: 'floppy_disk' });
   if (!brevoActivo()) return;
   const conn = await pool.getConnection();
   try {
@@ -4933,9 +5025,13 @@ app.get('/api/admin/copias-bd/:id/descargar', requiereSesionAsesor, requiereAdmi
 
 app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
   if (!NTFY_TOPIC) return res.status(400).json({ error: 'Falta la variable NTFY_TOPIC en Railway: sin ella no se envía ningún aviso.' });
-  const ok = await avisar('🔔 Aviso de prueba de Acros', 'Si ves esto, los avisos funcionan. Lo ha enviado ' + req.asesor.nombre + ' desde el panel.', { etiqueta: 'tada' });
+  const ok = await avisar('🔔 Aviso de prueba · canal de clientes', 'Si ves esto, los avisos de clientes funcionan. Lo ha enviado ' + req.asesor.nombre + ' desde el panel.', { etiqueta: 'tada' });
   if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso. Revisa el nombre del canal en NTFY_TOPIC.' });
-  res.json({ ok: true });
+  // 15/10: también al canal de administración y al propio del asesor, si los hay
+  if (NTFY_TOPIC_ADMIN) await avisarEn(NTFY_TOPIC_ADMIN, '🔔 Aviso de prueba · canal de administración', 'Si ves esto, los avisos de administración funcionan.', { etiqueta: 'tada' });
+  const [q] = await pool.execute('SELECT ntfy_topic FROM personas WHERE asesor_id = ? AND ntfy_topic IS NOT NULL LIMIT 1', [req.asesor.id]);
+  if (q.length && q[0].ntfy_topic !== NTFY_TOPIC) await avisarEn(q[0].ntfy_topic, '🔔 Aviso de prueba · tu canal', 'Si ves esto, te llegan los avisos de tus clientes.', { etiqueta: 'tada' });
+  res.json({ ok: true, canal_admin: !!NTFY_TOPIC_ADMIN, canal_propio: !!q.length });
 });
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
