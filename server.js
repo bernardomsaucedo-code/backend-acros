@@ -1936,6 +1936,15 @@ app.get('/api/admin/equipos', requiereSesionAsesor, async (req, res) => {
   const [e] = await pool.execute('SELECT e.*, j.nombre AS jefe_nombre, n.nombre AS encargado_nombre, (SELECT COUNT(*) FROM personas p WHERE p.equipo_id = e.id) AS miembros FROM equipos e LEFT JOIN personas j ON j.id = e.jefe_persona_id LEFT JOIN personas n ON n.id = e.encargado_persona_id ORDER BY e.activo DESC, e.nombre');
   res.json(e);
 });
+// 15/10 (Vikn): un único jefe por equipo, y solo puede serlo un miembro del equipo
+async function cambiarRolAsesorDePersona(personaId, rol, poner) {
+  if (!personaId) return;
+  const [a] = await pool.execute('SELECT a.id, a.roles, a.es_admin FROM personas p JOIN asesores a ON a.id = p.asesor_id WHERE p.id = ?', [personaId]);
+  if (!a.length) return;
+  const r = rolesDeFila(a[0]);
+  if (poner) r.add(rol); else { r.delete(rol); if (!r.size) r.add('asesor'); }
+  await pool.execute('UPDATE asesores SET roles = ? WHERE id = ?', [[...r].filter(x => x !== 'admin').concat(a[0].es_admin ? ['admin'] : []).join(','), a[0].id]);
+}
 async function guardarEquipo(req, res, id) {
   const b = req.body || {};
   const nombre = String(b.nombre || '').trim().slice(0, 80);
@@ -1943,24 +1952,64 @@ async function guardarEquipo(req, res, id) {
   const topic = String(b.ntfy_topic || '').trim();
   if (topic && !/^[A-Za-z0-9_-]{6,64}$/.test(topic)) return res.status(400).json({ error: 'El canal solo puede llevar letras, números, - y _ (de 6 a 64)' });
   const v = [nombre, b.jefe_persona_id ? Number(b.jefe_persona_id) : null, b.encargado_persona_id ? Number(b.encargado_persona_id) : null, topic || null, b.activo === false ? 0 : 1];
+  let jefeAnterior = null;
+  if (v[1]) {
+    // el jefe tiene que ser miembro de este equipo
+    const [m] = await pool.execute('SELECT equipo_id FROM personas WHERE id = ?', [v[1]]);
+    if (!id || !m.length || m[0].equipo_id !== id) return res.status(400).json({ error: 'El jefe tiene que ser miembro del equipo. Añádelo primero como miembro y después hazlo jefe.' });
+  }
+  if (id) { const [e] = await pool.execute('SELECT jefe_persona_id FROM equipos WHERE id = ?', [id]); jefeAnterior = e.length ? e[0].jefe_persona_id : null; }
+  // quien deja de ser jefe pierde ese rol (solo se puede ser jefe del propio equipo)
+  if (jefeAnterior && jefeAnterior !== v[1]) await cambiarRolAsesorDePersona(jefeAnterior, 'jefe', false);
+  // 15/10: quien se pone de jefe o encargado de un equipo recibe ese rol si no lo tenía
+  for (const [pid, rol] of [[v[1], 'jefe'], [v[2], 'encargado']]) {
+    if (!pid) continue;
+    const [a] = await pool.execute('SELECT a.id, a.roles, a.es_admin FROM personas p JOIN asesores a ON a.id = p.asesor_id WHERE p.id = ?', [pid]);
+    if (a.length) { const r = rolesDeFila(a[0]); if (!r.has(rol)) { r.add(rol); await pool.execute('UPDATE asesores SET roles = ? WHERE id = ?', [[...r].join(','), a[0].id]); } }
+  }
   if (id) { await pool.execute('UPDATE equipos SET nombre = ?, jefe_persona_id = ?, encargado_persona_id = ?, ntfy_topic = ?, activo = ? WHERE id = ?', [...v, id]); return res.json({ ok: true, id }); }
   const [r] = await pool.execute('INSERT INTO equipos (nombre, jefe_persona_id, encargado_persona_id, ntfy_topic, activo) VALUES (?, ?, ?, ?, ?)', v);
-  // el jefe pertenece a su equipo
-  if (v[1]) await pool.execute('UPDATE personas SET equipo_id = ? WHERE id = ? AND equipo_id IS NULL', [r.insertId, v[1]]);
   res.status(201).json({ ok: true, id: r.insertId });
 }
+app.get('/api/admin/equipos/:id', requiereSesionAsesor, async (req, res) => {
+  const [e] = await pool.execute('SELECT e.*, j.nombre AS jefe_nombre, n.nombre AS encargado_nombre FROM equipos e LEFT JOIN personas j ON j.id = e.jefe_persona_id LEFT JOIN personas n ON n.id = e.encargado_persona_id WHERE e.id = ?', [Number(req.params.id)]);
+  if (!e.length) return res.status(404).json({ error: 'Equipo no encontrado' });
+  const [m] = await pool.execute("SELECT p.id, p.nombre, a.id AS asesor_id, a.correo, a.roles, a.es_admin, (SELECT COUNT(*) FROM clientes c WHERE c.asesor_persona_id = p.id AND c.estado <> 'inerte') AS clientes FROM personas p LEFT JOIN asesores a ON a.id = p.asesor_id WHERE p.equipo_id = ? ORDER BY p.nombre", [e[0].id]);
+  res.json(Object.assign(e[0], { miembros: m.map(x => ({ id: x.id, nombre: x.nombre, asesor_id: x.asesor_id, correo: x.correo, clientes: Number(x.clientes) || 0, roles: x.correo ? [...rolesDeFila(x)] : [] })) }));
+});
 app.post('/api/admin/equipos', requiereSesionAsesor, requiereAdminWeb, (req, res) => guardarEquipo(req, res, null));
 app.put('/api/admin/equipos/:id', requiereSesionAsesor, requiereAdminWeb, (req, res) => guardarEquipo(req, res, Number(req.params.id)));
 app.put('/api/admin/personas/:id/equipo', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
-  const eq = req.body && req.body.equipo_id ? Number(req.body.equipo_id) : null;
-  await pool.execute('UPDATE personas SET equipo_id = ? WHERE id = ?', [eq, Number(req.params.id)]);
-  res.json({ ok: true });
+  const eq = req.body && req.body.equipo_id ? Number(req.body.equipo_id) : null, pid = Number(req.params.id);
+  const [antes] = await pool.execute('SELECT equipo_id FROM personas WHERE id = ?', [pid]);
+  const anterior = antes.length ? antes[0].equipo_id : null;
+  await pool.execute('UPDATE personas SET equipo_id = ? WHERE id = ?', [eq, pid]);
+  let dejaDeSerJefe = false;
+  if (anterior && anterior !== eq) {
+    const [r] = await pool.execute('UPDATE equipos SET jefe_persona_id = NULL WHERE id = ? AND jefe_persona_id = ?', [anterior, pid]);
+    if (r.affectedRows) { dejaDeSerJefe = true; await cambiarRolAsesorDePersona(pid, 'jefe', false); }
+  }
+  res.json({ ok: true, deja_de_ser_jefe: dejaDeSerJefe });
 });
 app.put('/api/admin/asesores/:id/roles', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const roles = [...new Set((Array.isArray(req.body && req.body.roles) ? req.body.roles : []).filter(r => ROLES_VALIDOS.includes(r)))];
   if (!roles.length) return res.status(400).json({ error: 'Elige al menos un rol' });
   const id = Number(req.params.id), admin = roles.includes('admin') ? 1 : 0;
   if (!admin) { const [a] = await pool.execute('SELECT COUNT(*) AS n FROM asesores WHERE es_admin = 1 AND activo = 1 AND id <> ?', [id]); if (!a[0].n) return res.status(400).json({ error: 'Tiene que quedar al menos un administrador' }); }
+  // 15/10: «Jefe de equipo» va ligado a ser el jefe de su equipo
+  const [ps] = await pool.execute('SELECT p.id, p.equipo_id, e.nombre AS equipo, e.jefe_persona_id, j.nombre AS jefe_nombre FROM personas p LEFT JOIN equipos e ON e.id = p.equipo_id LEFT JOIN personas j ON j.id = e.jefe_persona_id WHERE p.asesor_id = ?', [id]);
+  const yaEraJefe = ps.some(x => x.jefe_persona_id === x.id);
+  if (roles.includes('jefe') && !yaEraJefe) {
+    const p = ps.find(x => x.equipo_id);
+    if (!p) return res.status(400).json({ error: 'Para ser jefe de equipo tiene que estar en un equipo. Asígnale primero su equipo.' });
+    if (p.jefe_persona_id && p.jefe_persona_id !== p.id) {
+      // 15/10 (Vikn): se puede quitar de jefe al actual para promocionar al nuevo
+      if (!req.body.reemplazar_jefe) return res.status(409).json({ error: 'El equipo ' + p.equipo + ' ya tiene jefe (' + (p.jefe_nombre || 'otra persona') + ').', ya_tiene_jefe: true, equipo: p.equipo, jefe_actual: p.jefe_nombre });
+      await cambiarRolAsesorDePersona(p.jefe_persona_id, 'jefe', false);
+    }
+    await pool.execute('UPDATE equipos SET jefe_persona_id = ? WHERE id = ?', [p.id, p.equipo_id]);
+  }
+  if (!roles.includes('jefe') && yaEraJefe) for (const x of ps) if (x.jefe_persona_id === x.id) await pool.execute('UPDATE equipos SET jefe_persona_id = NULL WHERE id = ?', [x.equipo_id]);
   await pool.execute('UPDATE asesores SET roles = ?, es_admin = ? WHERE id = ?', [roles.join(','), admin, id]);
   res.json({ ok: true, roles });
 });
