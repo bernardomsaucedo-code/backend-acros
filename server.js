@@ -305,7 +305,7 @@ function avisarCliente(clienteId, emoji, accion, mensaje, opciones) {
   (async () => {
     let q = null;
     try { q = clienteId ? await personaDeCliente(clienteId) : null; } catch (e) { q = null; }
-    const titulo = emoji + ' ' + (q ? q.nombre + ', ' + accion : accion.charAt(0).toUpperCase() + accion.slice(1));
+    const titulo = emoji + ' ' + (q ? q.nombre + ', ' + accion : accion.charAt(0).toUpperCase() + accion.slice(1));   // nombre del ASESOR, nunca datos del cliente
     if (!(opciones && opciones.soloAsesor)) await avisar(titulo, mensaje, opciones);
     if (q && q.ntfy_topic && q.ntfy_topic !== NTFY_TOPIC) await avisarEn(q.ntfy_topic, titulo, mensaje, opciones);
     // 15/10: y al canal de su equipo (2b), si lo tiene
@@ -722,6 +722,13 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('documentos_fiscales', '`revisado_en`', 'DATETIME NULL');   // 13/10: para el historial
       await agregaColumnaSiFalta('clientes', '`preferencias_avisos`', 'TEXT NULL');   // 13/10: «Notificaciones» del Área
       await agregaColumnaSiFalta('clientes', '`telefono2`', 'VARCHAR(40) NULL');   // 14/10: segundo teléfono
+      // 16/10: «Mi cartera»
+      await pool.execute('CREATE TABLE IF NOT EXISTS cartera_movimientos (`id` INT AUTO_INCREMENT PRIMARY KEY, `cliente_id` INT NOT NULL, `fecha` DATETIME NOT NULL, `tipo` VARCHAR(60) NOT NULL, `buy_amount` DOUBLE NULL, `buy_cur` VARCHAR(30) NULL, `sell_amount` DOUBLE NULL, `sell_cur` VARCHAR(30) NULL, `fee_amount` DOUBLE NULL, `fee_cur` VARCHAR(30) NULL, `exchange` VARCHAR(200) NULL, `grupo` VARCHAR(200) NULL, `comentario` VARCHAR(500) NULL, `txid` VARCHAR(200) NULL, `buy_valor_eur` DOUBLE NULL, `sell_valor_eur` DOUBLE NULL, ' +
+        "`origen` ENUM('importado','manual') NOT NULL, `nota` VARCHAR(300) NULL, `sustituye_id` INT NULL, `anulado` TINYINT(1) NOT NULL DEFAULT 0, `anulado_motivo` VARCHAR(300) NULL, `anulado_por` INT NULL, `anulado_en` DATETIME NULL, `creado_por` INT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY k_cliente (`cliente_id`, `anulado`, `fecha`))");
+      await pool.execute("CREATE TABLE IF NOT EXISTS cartera_estado (`cliente_id` INT PRIMARY KEY, `fuente_nombre` VARCHAR(200) NULL, `importado_en` DATETIME NULL, `importado_por` INT NULL, `publicado_en` DATETIME NULL, `publicado_por` INT NULL, `ritmo` VARCHAR(20) NOT NULL DEFAULT 'mensual', `simulador` TINYINT(1) NOT NULL DEFAULT 0, `perdidas_pendientes` TEXT NULL)");
+      await pool.execute('CREATE TABLE IF NOT EXISTS cartera_otras (`id` INT AUTO_INCREMENT PRIMARY KEY, `cliente_id` INT NOT NULL, `anio` INT NOT NULL, `plataforma` VARCHAR(80) NOT NULL, `tipo` VARCHAR(80) NULL, `ganancias` DOUBLE NOT NULL DEFAULT 0, `perdidas` DOUBLE NOT NULL DEFAULT 0, `rendimientos` DOUBLE NOT NULL DEFAULT 0, `latente` DOUBLE NULL, `fuente` VARCHAR(120) NULL, `creado_por` INT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+      await pool.execute("CREATE TABLE IF NOT EXISTS activos_catalogo (`simbolo` VARCHAR(30) PRIMARY KEY, `nombre` VARCHAR(80) NULL, `coingecko_id` VARCHAR(120) NULL, `red` VARCHAR(80) NULL, `sector` VARCHAR(80) NULL, `tipo` VARCHAR(20) NULL, `tamano` VARCHAR(20) NULL, `grupo` VARCHAR(80) NULL, `origen` ENUM('sin','coingecko','manual') NOT NULL DEFAULT 'sin', `editado_por` INT NULL, `precio_eur` DOUBLE NULL, `precio_en` DATETIME NULL, `intento_en` DATETIME NULL, `actualizado_en` DATETIME NULL)");
+      setTimeout(() => resolverActivosPendientes().then(actualizarPrecios).catch(() => {}), 5000);
       // 15/10: roles y equipos
       await agregaColumnaSiFalta('asesores', '`roles`', 'VARCHAR(120) NULL');
       await agregaColumnaSiFalta('personas', '`equipo_id`', 'INT NULL');
@@ -1920,7 +1927,7 @@ app.post('/api/admin/login/2fa', async (req, res) => {
       const quedan = gastarRecuperacion(asesor.totp_recuperacion, b.recuperacion);
       if (quedan === null) return res.status(401).json({ error: 'Ese código de recuperación no es válido o ya se usó' });
       await conn.execute('UPDATE asesores SET totp_recuperacion = ? WHERE id = ?', [quedan, asesor.id]);
-      avisarAdmin('🔐 ' + asesor.nombre + ' ha entrado con un código de recuperación', 'Le quedan ' + JSON.parse(quedan).length + '. Si no ha sido él, desactiva su cuenta.', { prioridad: 4, etiqueta: 'closed_lock_with_key' });
+      avisarAdmin('🔐 ' + asesor.nombre + ' ha entrado con un código de recuperación', 'Si no ha sido él, desactiva su cuenta.', { prioridad: 4, etiqueta: 'closed_lock_with_key' });
     } else if (!totpValido(asesor.totp_secreto, b.codigo)) {
       return res.status(401).json({ error: 'El código no es correcto' });
     }
@@ -1931,6 +1938,366 @@ app.post('/api/admin/login/2fa', async (req, res) => {
     res.json(sesion);
   } finally { conn.release(); }
 });
+// ================================================================
+// MI CARTERA (16/10, versión 1) — idea de Vikn
+// Expediente de movimientos por cliente (importado del Excel de
+// movimientos en formato de importación de CoinTracking/DFPro + lo añadido
+// o corregido a mano) → FIFO por activo (criterio español) → posiciones,
+// lotes, ganancias realizadas por año e ingresos. Precios de CoinGecko
+// cacheados. El cliente ve «Mi cartera» en su Área (opción C: resumen y
+// posiciones para todos; simulador para la asesoría continuada).
+// Son cálculos orientativos de escenarios, nunca recomendaciones.
+// ================================================================
+const ESCALA_AHORRO = [[6000, 0.19], [50000, 0.21], [200000, 0.23], [300000, 0.27], [null, 0.30]];   // escala vigente; revisar cada año
+const TIPOS_ADQ_TRADE = new Set(['Trade', 'Margin Trade', 'Derivatives / Futures Trade']);
+const TIPOS_INGRESO = new Set(['Income', 'Gift / Tip', 'Reward / Bonus', 'Mining', 'Airdrop', 'Airdrop (non taxable)', 'Staking', 'Masternode', 'Minting', 'Mining (commercial)', 'Dividends Income', 'Lending Income', 'Interest Income', 'Other Income', 'Income (non taxable)', 'LP Rewards']);
+const TIPOS_RENDIMIENTO_AHORRO = new Set(['Staking', 'Lending Income', 'Interest Income', 'Dividends Income', 'LP Rewards']);
+const TIPOS_SIN_EFECTO = new Set(['Deposit', 'Withdrawal']);
+const TIPOS_CANJE_SIN_IMPUESTO = new Set(['Swap (non taxable)', 'Provide Liquidity', 'Return LP Token', 'Receive LP Token', 'Remove Liquidity']);
+const TIPOS_SALIDA_SIN_GANANCIA = new Set(['Gift', 'Donation', 'Lost', 'Stolen', 'Send Collateral', 'Repay Loan', 'Expense (non taxable)']);
+const TIPOS_SALIDA_A_VALOR = new Set(['Spend', 'Other Expense', 'Other Fee', 'Borrowing Fee', 'Settlement Fee', 'Margin Fee']);
+const TIPOS_GANANCIA_DIRECTA = new Set(['Derivatives / Futures Profit', 'Margin Profit']);
+const TIPOS_PERDIDA_DIRECTA = new Set(['Derivatives / Futures Loss', 'Margin Loss', 'Liquidation']);
+const TIPOS_ENTRADA_A_VALOR = new Set(['Receive Loan', 'Receive Collateral']);
+const TIPOS_REVISAR = new Set(['Provide Liquidity', 'Return LP Token', 'Receive LP Token', 'Remove Liquidity', 'Receive Loan', 'Repay Loan', 'Receive Collateral', 'Send Collateral', 'Lost', 'Stolen', 'Liquidation']);
+const esEUR = c => String(c || '').toUpperCase() === 'EUR';
+const num = v => { if (v === null || v === undefined || v === '') return null; const n = Number(String(v).replace(',', '.')); return isFinite(n) ? n : null; };
+
+// Motor FIFO. movs ordenados por fecha. Devuelve posiciones, lotes, realizado por año, ingresos y avisos.
+function calcularFifo(movs) {
+  const lotes = {}, realizado = {}, ingresos = {}, avisos = [];
+  const anioDe = f => String(f).slice(0, 4);
+  const reg = (anio) => (realizado[anio] = realizado[anio] || { ganancias: 0, perdidas: 0, por_activo: {} });
+  const apuntar = (anio, sym, g) => { const r = reg(anio); if (g >= 0) r.ganancias += g; else r.perdidas += -g; const a = r.por_activo[sym] = r.por_activo[sym] || { ganancia: 0 }; a.ganancia += g; };
+  const entrar = (sym, cant, coste, fecha) => { if (!sym || esEUR(sym) || !(cant > 0)) return; (lotes[sym] = lotes[sym] || []).push({ cantidad: cant, coste_unit: coste / cant, fecha }); };
+  // saca cantidad por FIFO; devuelve el coste de lo sacado (o null si no había bastante)
+  const sacar = (sym, cant, m) => {
+    if (!sym || esEUR(sym) || !(cant > 0)) return 0;
+    const q = lotes[sym] || []; let falta = cant, coste = 0;
+    while (falta > 1e-12 && q.length) { const l = q[0]; const t = Math.min(l.cantidad, falta); coste += t * l.coste_unit; l.cantidad -= t; falta -= t; if (l.cantidad <= 1e-12) q.shift(); }
+    if (falta > 1e-9) avisos.push({ mov_id: m.id, tipo: 'saldo', texto: 'Se venden ' + cant + ' ' + sym + ' pero solo había ' + (cant - falta).toFixed(8) + ': falta alguna compra anterior.' });
+    return coste;
+  };
+  for (const m of movs) {
+    const t = m.tipo, f = m.fecha, anio = anioDe(f);
+    const bA = num(m.buy_amount), sA = num(m.sell_amount), fA = num(m.fee_amount);
+    const bC = (m.buy_cur || '').toUpperCase(), sC = (m.sell_cur || '').toUpperCase(), fC = (m.fee_cur || '').toUpperCase();
+    let valor = esEUR(sC) && sA ? sA : esEUR(bC) && bA ? bA : (num(m.buy_valor_eur) ?? num(m.sell_valor_eur));
+    if (TIPOS_REVISAR.has(t)) avisos.push({ mov_id: m.id, tipo: 'revisar', texto: 'Tipo «' + t + '»: revisa su tratamiento fiscal.' });
+    if (TIPOS_SIN_EFECTO.has(t)) continue;
+    if (TIPOS_ADQ_TRADE.has(t)) {
+      if (valor == null && !(esEUR(bC) || esEUR(sC))) { avisos.push({ mov_id: m.id, tipo: 'sin_valor', texto: 'Permuta sin valor en euros: añádelo en la consola.' }); valor = 0; }
+      let coste = valor, ingreso = valor;
+      if (esEUR(fC) && fA) { if (esEUR(sC)) coste += fA; else if (esEUR(bC)) ingreso -= fA; }
+      if (sC && !esEUR(sC)) { const c = sacar(sC, sA, m); apuntar(anio, sC, ingreso - c); }
+      entrar(bC, bA, coste, f);
+    } else if (TIPOS_INGRESO.has(t)) {
+      if (valor == null) { avisos.push({ mov_id: m.id, tipo: 'sin_valor', texto: 'Ingreso («' + t + '») sin valor en euros: añádelo en la consola.' }); valor = 0; }
+      entrar(bC, bA, valor, f);
+      const i = ingresos[anio] = ingresos[anio] || { ahorro: 0, otros: 0 };
+      if (TIPOS_RENDIMIENTO_AHORRO.has(t)) i.ahorro += valor; else if (!/non taxable/.test(t)) i.otros += valor;
+    } else if (TIPOS_CANJE_SIN_IMPUESTO.has(t)) {
+      const c = sacar(sC, sA, m); entrar(bC, bA, c, f);
+    } else if (TIPOS_SALIDA_SIN_GANANCIA.has(t)) {
+      sacar(sC, sA, m);
+    } else if (TIPOS_SALIDA_A_VALOR.has(t)) {
+      if (valor == null) { avisos.push({ mov_id: m.id, tipo: 'sin_valor', texto: 'Salida («' + t + '») sin valor en euros.' }); valor = 0; }
+      const c = sacar(sC, sA, m); apuntar(anio, sC, valor - c);
+    } else if (TIPOS_GANANCIA_DIRECTA.has(t)) {
+      if (valor == null) { avisos.push({ mov_id: m.id, tipo: 'sin_valor', texto: 'Beneficio de derivados sin valor en euros.' }); valor = 0; }
+      apuntar(anio, bC || 'DERIVADOS', valor); entrar(bC, bA, valor, f);
+    } else if (TIPOS_PERDIDA_DIRECTA.has(t)) {
+      if (valor == null) { avisos.push({ mov_id: m.id, tipo: 'sin_valor', texto: 'Pérdida de derivados sin valor en euros.' }); valor = 0; }
+      sacar(sC, sA, m); apuntar(anio, sC || 'DERIVADOS', -valor);
+    } else if (TIPOS_ENTRADA_A_VALOR.has(t)) {
+      entrar(bC, bA, valor || 0, f);
+    } else avisos.push({ mov_id: m.id, tipo: 'desconocido', texto: 'Tipo desconocido «' + t + '»: no se ha tenido en cuenta.' });
+    // comisión en cripto (no EUR) en cualquier movimiento: sale sin ganancia
+    if (fA && fC && !esEUR(fC) && !TIPOS_SALIDA_A_VALOR.has(t)) sacar(fC, fA, m);
+  }
+  const posiciones = {};
+  for (const [sym, q] of Object.entries(lotes)) {
+    const cant = q.reduce((a, l) => a + l.cantidad, 0);
+    if (cant > 1e-10) posiciones[sym] = { cantidad: cant, coste: q.reduce((a, l) => a + l.cantidad * l.coste_unit, 0), lotes: q.map(l => ({ cantidad: +l.cantidad.toFixed(12), coste_unit: l.coste_unit, fecha: l.fecha })) };
+  }
+  return { posiciones, realizado, ingresos, avisos };
+}
+
+// --- CoinGecko (precios y catálogo). Sin clave funciona con límites; con COINGECKO_API_KEY (demo) va mejor.
+const COINGECKO_URL = (process.env.COINGECKO_API_URL || 'https://api.coingecko.com/api/v3').replace(/\/+$/, '');
+const cgCabeceras = () => process.env.COINGECKO_API_KEY ? { 'x-cg-demo-api-key': process.env.COINGECKO_API_KEY } : {};
+const cg = (ruta) => axios.get(COINGECKO_URL + ruta, { headers: cgCabeceras(), timeout: 15000 }).then(r => r.data);
+const FIAT_A_COINGECKO = { USD: 'usd-coin' };
+const RED_DE_PLATAFORMA = { ethereum: 'Ethereum', solana: 'Solana', 'binance-smart-chain': 'BNB Chain', 'polygon-pos': 'Polygon', 'arbitrum-one': 'Arbitrum', base: 'Base', 'optimistic-ethereum': 'Optimism', avalanche: 'Avalanche', tron: 'Tron', 'the-open-network': 'TON', sui: 'Sui', cardano: 'Cardano' };
+function sectorDe(cats, simbolo) {
+  const c = (cats || []).join(' | ').toLowerCase();
+  if (/stablecoin/.test(c)) return 'Estables';
+  if (/meme/.test(c)) return 'Memes';
+  if (/privacy/.test(c)) return 'Privacidad';
+  if (/artificial intelligence|\bai\b/.test(c)) return 'IA';
+  if (/decentralized finance|defi|decentralized exchange/.test(c)) return 'DeFi';
+  if (['BTC'].includes(simbolo) || /store of value/.test(c)) return 'Reserva de valor';
+  if (/layer 1|smart contract platform|layer 2/.test(c)) return 'Plataformas';
+  if (/gaming|metaverse|nft/.test(c)) return 'Juegos y NFT';
+  return 'Otros';
+}
+let RESOLVIENDO = false;
+async function resolverActivosPendientes() {
+  if (RESOLVIENDO) return; RESOLVIENDO = true;
+  try {
+    const [f] = await pool.execute("SELECT simbolo FROM activos_catalogo WHERE coingecko_id IS NULL AND origen <> 'manual' AND (intento_en IS NULL OR intento_en < NOW() - INTERVAL 1 DAY) LIMIT 20");
+    for (const { simbolo } of f) {
+      await pool.execute('UPDATE activos_catalogo SET intento_en = NOW() WHERE simbolo = ?', [simbolo]);
+      try {
+        if (FIAT_A_COINGECKO[simbolo]) { await pool.execute("UPDATE activos_catalogo SET coingecko_id = ?, nombre = COALESCE(nombre, ?), sector = COALESCE(sector, 'Estables'), tipo = 'estable', origen = 'coingecko' WHERE simbolo = ?", [FIAT_A_COINGECKO[simbolo], simbolo, simbolo]); continue; }
+        const s = await cg('/search?query=' + encodeURIComponent(simbolo));
+        const c = (s.coins || []).find(x => String(x.symbol).toUpperCase() === simbolo);
+        if (!c) continue;
+        await new Promise(r => setTimeout(r, Number(process.env.COINGECKO_PAUSA_MS) || 2500));   // límite de la API gratuita
+        const d = await cg('/coins/' + encodeURIComponent(c.id) + '?localization=false&tickers=false&market_data=false&community_data=false&developer_data=false');
+        const plat = d.asset_platform_id, cats = d.categories || [];
+        const red = plat ? (RED_DE_PLATAFORMA[plat] || plat) : (d.name || simbolo);
+        const rank = d.market_cap_rank || c.market_cap_rank || null;
+        const sector = sectorDe(cats, simbolo);
+        await pool.execute("UPDATE activos_catalogo SET coingecko_id = ?, nombre = ?, red = COALESCE(red, ?), sector = COALESCE(sector, ?), tipo = COALESCE(tipo, ?), tamano = COALESCE(tamano, ?), origen = IF(origen = 'manual', 'manual', 'coingecko'), actualizado_en = NOW() WHERE simbolo = ?",
+          [c.id, d.name || c.name, red, sector, sector === 'Estables' ? 'estable' : plat ? 'token' : 'nativa', rank && rank <= 20 ? 'grande' : rank && rank <= 200 ? 'mediana' : 'pequena', simbolo]);
+        await new Promise(r => setTimeout(r, Number(process.env.COINGECKO_PAUSA_MS) || 2500));   // límite de la API gratuita
+      } catch (e) { console.error('CoinGecko (' + simbolo + '):', e.message); }
+    }
+  } finally { RESOLVIENDO = false; }
+}
+async function actualizarPrecios() {
+  try {
+    const [f] = await pool.execute('SELECT DISTINCT a.simbolo, a.coingecko_id FROM activos_catalogo a WHERE a.coingecko_id IS NOT NULL AND EXISTS (SELECT 1 FROM cartera_movimientos m WHERE m.anulado = 0 AND (m.buy_cur = a.simbolo OR m.sell_cur = a.simbolo))');
+    for (let i = 0; i < f.length; i += 200) {
+      const trozo = f.slice(i, i + 200);
+      const d = await cg('/simple/price?vs_currencies=eur&ids=' + encodeURIComponent([...new Set(trozo.map(x => x.coingecko_id))].join(',')));
+      for (const x of trozo) if (d[x.coingecko_id] && d[x.coingecko_id].eur != null) await pool.execute('UPDATE activos_catalogo SET precio_eur = ?, precio_en = NOW() WHERE simbolo = ?', [d[x.coingecko_id].eur, x.simbolo]);
+    }
+  } catch (e) { console.error('Precios de CoinGecko:', e.message); }
+}
+async function asegurarCatalogo(simbolos) {
+  for (const s of new Set(simbolos.filter(x => x && !esEUR(x)).map(x => x.toUpperCase()))) await pool.execute("INSERT IGNORE INTO activos_catalogo (simbolo, origen) VALUES (?, 'sin')", [s]);
+  setTimeout(() => resolverActivosPendientes().then(actualizarPrecios), 200);
+}
+
+// --- Datos de la cartera de un cliente
+async function movimientosVigentes(clienteId) {
+  const [f] = await pool.execute("SELECT id, DATE_FORMAT(fecha, '%Y-%m-%d %H:%i:%s') AS fecha, tipo, buy_amount, buy_cur, sell_amount, sell_cur, fee_amount, fee_cur, exchange, grupo, comentario, txid, buy_valor_eur, sell_valor_eur FROM cartera_movimientos WHERE cliente_id = ? AND anulado = 0 ORDER BY fecha, id", [clienteId]);
+  return f;
+}
+async function datosCartera(clienteId, { conLotes = true } = {}) {
+  const movs = await movimientosVigentes(clienteId);
+  const r = calcularFifo(movs);
+  const anio = String(new Date().getFullYear());
+  const [est] = await pool.execute('SELECT e.*, a.nombre AS publicado_por_nombre FROM cartera_estado e LEFT JOIN asesores a ON a.id = e.publicado_por WHERE e.cliente_id = ?', [clienteId]);
+  const [otras] = await pool.execute('SELECT * FROM cartera_otras WHERE cliente_id = ? AND anio = ? ORDER BY id', [clienteId, Number(anio)]);
+  const syms = Object.keys(r.posiciones);
+  const [cat] = syms.length ? await pool.query('SELECT * FROM activos_catalogo WHERE simbolo IN (?)', [syms]) : [[]];
+  const C = Object.fromEntries(cat.map(x => [x.simbolo, x]));
+  const posiciones = syms.map(s => {
+    const p = r.posiciones[s], c = C[s] || {}, precio = c.precio_eur != null ? Number(c.precio_eur) : null;
+    return { simbolo: s, nombre: c.nombre || s, red: c.red || null, sector: c.sector || null, tipo: c.tipo || null, tamano: c.tamano || null, grupo: c.grupo || null,
+      cantidad: p.cantidad, coste: p.coste, precio, valor: precio != null ? p.cantidad * precio : null, precio_en: c.precio_en || null, lotes: conLotes ? p.lotes : undefined };
+  }).sort((a, b) => (b.valor || 0) - (a.valor || 0));
+  const e = est[0] || {};
+  return {
+    anio, posiciones, avisos: r.avisos, n_movimientos: movs.length,
+    realizado: r.realizado[anio] || { ganancias: 0, perdidas: 0, por_activo: {} },
+    ingresos: r.ingresos[anio] || { ahorro: 0, otros: 0 },
+    otras: otras.map(o => ({ id: o.id, plataforma: o.plataforma, tipo: o.tipo, ganancias: Number(o.ganancias) || 0, perdidas: Number(o.perdidas) || 0, rendimientos: Number(o.rendimientos) || 0, latente: o.latente == null ? null : Number(o.latente), fuente: o.fuente })),
+    perdidas_pendientes: (() => { try { return JSON.parse(e.perdidas_pendientes || '[]'); } catch (x) { return []; } })(),
+    escala: ESCALA_AHORRO, simulador: !!e.simulador, ritmo: e.ritmo || 'mensual',
+    fuente: e.fuente_nombre || null, importado_en: e.importado_en || null, publicado_en: e.publicado_en || null, publicado_por: e.publicado_por_nombre || null, recalculado_en: new Date().toISOString(),
+  };
+}
+const CAMPOS_MOV = ['fecha', 'tipo', 'buy_amount', 'buy_cur', 'sell_amount', 'sell_cur', 'fee_amount', 'fee_cur', 'exchange', 'grupo', 'comentario', 'txid', 'buy_valor_eur', 'sell_valor_eur'];
+function normalizarMov(o) {
+  const fechaTxt = String(o.fecha || '').trim().replace('T', ' ');
+  const fecha = /^\d{4}-\d{2}-\d{2}/.test(fechaTxt) ? fechaTxt.slice(0, 19).padEnd(19, fechaTxt.length <= 10 ? ' 00:00:00'.slice(0, 19 - fechaTxt.length) : '0') : null;
+  const m = { fecha: fecha && fecha.length === 10 ? fecha + ' 00:00:00' : fecha, tipo: String(o.tipo || '').trim() };
+  for (const k of ['buy_amount', 'sell_amount', 'fee_amount', 'buy_valor_eur', 'sell_valor_eur']) m[k] = num(o[k]);
+  for (const k of ['buy_cur', 'sell_cur', 'fee_cur']) m[k] = o[k] ? String(o[k]).trim().toUpperCase().slice(0, 30) : null;
+  for (const k of ['exchange', 'grupo', 'comentario', 'txid']) m[k] = o[k] ? String(o[k]).slice(0, k === 'comentario' ? 500 : 200) : null;
+  return m;
+}
+async function guardarEstadoCartera(clienteId, campos) {
+  await pool.execute('INSERT IGNORE INTO cartera_estado (cliente_id) VALUES (?)', [clienteId]);
+  const ks = Object.keys(campos); if (!ks.length) return;
+  await pool.execute('UPDATE cartera_estado SET ' + ks.map(k => '`' + k + '` = ?').join(', ') + ' WHERE cliente_id = ?', [...ks.map(k => campos[k]), clienteId]);
+}
+async function correoAlAsesorDelCliente(clienteId, asunto, parrafos, boton) {
+  if (!brevoActivo()) return;
+  const [f] = await pool.execute('SELECT a.correo, a.nombre FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id JOIN asesores a ON a.id = q.asesor_id WHERE c.id = ? AND a.activo = 1', [clienteId]);
+  if (!f.length) return;
+  const c = plantillaCorreo({ titulo: asunto, parrafos: ['Hola, ' + ESC_HTML(f[0].nombre) + ':', ...parrafos], boton });
+  enviarCorreo(f[0].correo, asunto, c.html, c.texto).catch(err => console.error('Correo al asesor:', err.message));
+}
+const ruta = (sufijo) => '/api/admin/clientes/:id/cartera' + sufijo;
+app.get(ruta(''), requiereSesionAsesor, async (req, res) => {
+  const d = await datosCartera(Number(req.params.id));
+  res.json(d);
+});
+app.post(ruta('/importar'), requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), b = req.body || {};
+  const filas = Array.isArray(b.filas) ? b.filas : [];
+  if (!filas.length) return res.status(400).json({ error: 'El archivo no tiene movimientos' });
+  if (filas.length > 50000) return res.status(400).json({ error: 'Demasiados movimientos en un solo archivo (máx. 50.000)' });
+  const malos = []; const buenos = [];
+  filas.forEach((o, i) => { const m = normalizarMov(o); if (!m.fecha || !m.tipo || (!m.buy_cur && !m.sell_cur)) malos.push(i + 2); else buenos.push(m); });
+  if (!buenos.length) return res.status(400).json({ error: 'No se ha podido leer ninguna fila. ¿Es el Excel de movimientos (formato de importación de CoinTracking)?' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // lo importado antes se sustituye; lo manual se queda
+    await conn.execute("UPDATE cartera_movimientos SET anulado = 1, anulado_motivo = 'Sustituido por una importación nueva', anulado_por = ?, anulado_en = NOW() WHERE cliente_id = ? AND origen = 'importado' AND anulado = 0", [req.asesor.id, id]);
+    for (let i = 0; i < buenos.length; i += 500) {
+      const t = buenos.slice(i, i + 500);
+      await conn.query('INSERT INTO cartera_movimientos (cliente_id, origen, creado_por, ' + CAMPOS_MOV.join(', ') + ') VALUES ?', [t.map(m => [id, 'importado', req.asesor.id, ...CAMPOS_MOV.map(k => m[k])])]);
+    }
+    await conn.commit();
+  } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
+  await guardarEstadoCartera(id, { fuente_nombre: String(b.nombre_archivo || 'movimientos.xlsx').slice(0, 200), importado_en: aSQLDatetime(ahora()), importado_por: req.asesor.id });
+  await asegurarCatalogo(buenos.flatMap(m => [m.buy_cur, m.sell_cur, m.fee_cur]));
+  req.body = { nombre_archivo: b.nombre_archivo, movimientos: buenos.length };   // para «Actividad»
+  res.json({ ok: true, importados: buenos.length, descartadas: malos.slice(0, 50), n_descartadas: malos.length });
+});
+app.get(ruta('/movimientos'), requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), q = req.query, por = 25, pag = Math.max(0, Number(q.pagina) || 0);
+  const w = ['cliente_id = ?'], v = [id];
+  if (q.anulados !== '1') w.push('anulado = 0');
+  if (q.anio) { w.push('YEAR(fecha) = ?'); v.push(Number(q.anio)); }
+  if (q.activo) { w.push('(buy_cur = ? OR sell_cur = ? OR fee_cur = ?)'); v.push(q.activo, q.activo, q.activo); }
+  if (q.tipo) { w.push('tipo = ?'); v.push(q.tipo); }
+  if (q.origen === 'manual') w.push("(origen = 'manual')");
+  if (q.buscar) { w.push('(comentario LIKE ? OR exchange LIKE ? OR txid LIKE ? OR buy_cur LIKE ? OR sell_cur LIKE ?)'); const t = '%' + q.buscar + '%'; v.push(t, t, t, t, t); }
+  let idsAviso = null;
+  if (q.avisos === '1') { idsAviso = [...new Set(calcularFifo(await movimientosVigentes(id)).avisos.map(a => a.mov_id))]; if (!idsAviso.length) idsAviso = [0]; w.push('id IN (' + idsAviso.map(Number).join(',') + ')'); }
+  const donde = ' WHERE ' + w.join(' AND ');
+  const [[{ n }]] = await pool.query('SELECT COUNT(*) AS n FROM cartera_movimientos' + donde, v);
+  const [filas] = await pool.query("SELECT m.*, DATE_FORMAT(m.fecha, '%Y-%m-%d %H:%i:%s') AS fecha, a.nombre AS creado_por_nombre, x.nombre AS anulado_por_nombre FROM cartera_movimientos m LEFT JOIN asesores a ON a.id = m.creado_por LEFT JOIN asesores x ON x.id = m.anulado_por" + donde.replace(/\b(cliente_id|anulado|fecha|buy_cur|sell_cur|fee_cur|tipo|origen|comentario|exchange|txid|id)\b/g, 'm.$1') + ' ORDER BY m.fecha DESC, m.id DESC LIMIT ? OFFSET ?', [...v, por, pag * por]);
+  const avisos = calcularFifo(await movimientosVigentes(id)).avisos;
+  const porMov = {}; avisos.forEach(a => { (porMov[a.mov_id] = porMov[a.mov_id] || []).push(a.texto); });
+  const [[{ manuales }]] = await pool.query("SELECT COUNT(*) AS manuales FROM cartera_movimientos WHERE cliente_id = ? AND anulado = 0 AND origen = 'manual'", [id]);
+  res.json({ total: Number(n), pagina: pag, por_pagina: por, movimientos: filas.map(m => Object.assign(m, { avisos: porMov[m.id] || [] })), n_avisos: new Set(avisos.map(a => a.mov_id)).size, n_manuales: Number(manuales) });
+});
+app.get(ruta('/excel'), requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  const movs = await movimientosVigentes(id);
+  const [cambios] = await pool.execute("SELECT m.id, DATE_FORMAT(m.creado_en, '%Y-%m-%d %H:%i') AS cuando, a.nombre AS quien, m.origen, m.sustituye_id, m.anulado, m.anulado_motivo, x.nombre AS anulado_por, m.tipo, DATE_FORMAT(m.fecha, '%Y-%m-%d %H:%i:%s') AS fecha, m.buy_amount, m.buy_cur, m.sell_amount, m.sell_cur, m.nota FROM cartera_movimientos m LEFT JOIN asesores a ON a.id = m.creado_por LEFT JOIN asesores x ON x.id = m.anulado_por WHERE m.cliente_id = ? AND (m.origen = 'manual' OR (m.anulado = 1 AND m.anulado_motivo NOT LIKE 'Sustituido por una importación%')) ORDER BY m.creado_en", [id]);
+  const [cli] = await pool.execute('SELECT codigo, nombre, apellidos FROM clientes WHERE id = ?', [id]);
+  res.json({ cliente: cli[0] || {}, movimientos: movs, cambios });
+});
+async function insertarMovManual(req, id, m, extra) {
+  const [r] = await pool.execute('INSERT INTO cartera_movimientos (cliente_id, origen, creado_por, nota, sustituye_id, ' + CAMPOS_MOV.join(', ') + ') VALUES (?, ?, ?, ?, ?, ' + CAMPOS_MOV.map(() => '?').join(', ') + ')',
+    [id, 'manual', req.asesor.id, extra.nota || null, extra.sustituye_id || null, ...CAMPOS_MOV.map(k => m[k] === undefined ? null : m[k])]);
+  await asegurarCatalogo([m.buy_cur, m.sell_cur, m.fee_cur]);
+  return r.insertId;
+}
+app.post(ruta('/movimientos'), requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), m = normalizarMov(req.body || {});
+  if (!m.fecha || !m.tipo || (!m.buy_cur && !m.sell_cur)) return res.status(400).json({ error: 'Faltan la fecha, el tipo o el activo' });
+  const nuevo = await insertarMovManual(req, id, m, { nota: String((req.body || {}).nota || '').slice(0, 300) });
+  res.status(201).json({ ok: true, id: nuevo });
+});
+app.put(ruta('/movimientos/:mid'), requiereSesionAsesor, async (req, res) => {
+  // corregir = anular el original (se conserva) y crear uno nuevo que lo sustituye
+  const id = Number(req.params.id), mid = Number(req.params.mid);
+  const [o] = await pool.execute('SELECT * FROM cartera_movimientos WHERE id = ? AND cliente_id = ? AND anulado = 0', [mid, id]);
+  if (!o.length) return res.status(404).json({ error: 'Movimiento no encontrado' });
+  const base = Object.fromEntries(CAMPOS_MOV.map(k => [k, k === 'fecha' ? aSQLDatetime(new Date(o[0].fecha)) : o[0][k]]));
+  const m = normalizarMov(Object.assign(base, req.body || {}));
+  const nota = String((req.body || {}).nota || '').slice(0, 300);
+  if (!nota) return res.status(400).json({ error: 'Explica en la nota por qué lo corriges' });
+  await pool.execute("UPDATE cartera_movimientos SET anulado = 1, anulado_motivo = 'Corregido', anulado_por = ?, anulado_en = NOW() WHERE id = ?", [req.asesor.id, mid]);
+  const nuevo = await insertarMovManual(req, id, m, { nota, sustituye_id: mid });
+  res.json({ ok: true, id: nuevo });
+});
+app.delete(ruta('/movimientos/:mid'), requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), motivo = String((req.body || {}).motivo || req.query.motivo || '').slice(0, 300);
+  if (!motivo) return res.status(400).json({ error: 'Indica el motivo' });
+  const [r] = await pool.execute('UPDATE cartera_movimientos SET anulado = 1, anulado_motivo = ?, anulado_por = ?, anulado_en = NOW() WHERE id = ? AND cliente_id = ? AND anulado = 0', [motivo, req.asesor.id, Number(req.params.mid), id]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Movimiento no encontrado' });
+  res.json({ ok: true });
+});
+app.put(ruta('/ajustes'), requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, campos = {};
+  if (Array.isArray(b.perdidas_pendientes)) campos.perdidas_pendientes = JSON.stringify(b.perdidas_pendientes.map(x => ({ anio: Number(x.anio) || null, importe: Math.abs(num(x.importe) || 0) })).filter(x => x.anio && x.importe));
+  if (['semanal', 'quincenal', 'mensual', 'trimestral'].includes(b.ritmo)) campos.ritmo = b.ritmo;
+  if (typeof b.simulador === 'boolean') campos.simulador = b.simulador ? 1 : 0;
+  await guardarEstadoCartera(Number(req.params.id), campos);
+  res.json({ ok: true });
+});
+app.post(ruta('/publicar'), requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  await guardarEstadoCartera(id, { publicado_en: aSQLDatetime(ahora()), publicado_por: req.asesor.id });
+  // aviso al cliente (por correo, según sus preferencias de «informes»)
+  const conn = await pool.getConnection();
+  try {
+    await notificarCliente(conn, id, 'informes', async () => {
+      const [c] = await conn.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [id]);
+      const [p] = await conn.execute("SELECT token FROM propuestas WHERE cliente_id = ? AND estado = 'aceptada' ORDER BY id DESC LIMIT 1", [id]);
+      if (!c.length || !brevoActivo()) return;
+      const t = plantillaCorreo({ titulo: 'Tu cartera está al día', parrafos: ['Hola' + (c[0].nombre ? ', ' + ESC_HTML(c[0].nombre) : '') + ':', 'Tu asesor ha revisado tus posiciones. Entra en «Mi cartera» para ver tu situación fiscal de este año con los precios de hoy.'], boton: p.length ? { texto: 'Ver mi cartera', url: enlaceArea('area', p[0].token) + '&vista=cartera' } : undefined });
+      await enviarCorreo(c[0].correo, 'Tu cartera está al día', t.html, t.texto);
+    }, 'Tu asesor ha revisado tu cartera. Entra en tu área de Acros para verla.');
+  } catch (e) { console.error('Aviso de cartera publicada:', e.message); } finally { conn.release(); }
+  res.json({ ok: true });
+});
+// Otras inversiones (acciones, ETF, fondos…), por año
+app.post(ruta('/otras'), requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, id = Number(req.params.id);
+  if (!String(b.plataforma || '').trim()) return res.status(400).json({ error: 'Falta la plataforma' });
+  const v = [String(b.plataforma).trim().slice(0, 80), String(b.tipo || '').slice(0, 80), num(b.ganancias) || 0, Math.abs(num(b.perdidas) || 0), num(b.rendimientos) || 0, num(b.latente), String(b.fuente || '').slice(0, 120)];
+  if (b.id) await pool.execute('UPDATE cartera_otras SET plataforma = ?, tipo = ?, ganancias = ?, perdidas = ?, rendimientos = ?, latente = ?, fuente = ? WHERE id = ? AND cliente_id = ?', [...v, Number(b.id), id]);
+  else await pool.execute('INSERT INTO cartera_otras (cliente_id, anio, plataforma, tipo, ganancias, perdidas, rendimientos, latente, fuente, creado_por) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, new Date().getFullYear(), ...v, req.asesor.id]);
+  res.json({ ok: true });
+});
+app.delete(ruta('/otras/:oid'), requiereSesionAsesor, async (req, res) => {
+  await pool.execute('DELETE FROM cartera_otras WHERE id = ? AND cliente_id = ?', [Number(req.params.oid), Number(req.params.id)]);
+  res.json({ ok: true });
+});
+// Catálogo de activos (Sistema): encargados y admins
+app.get('/api/admin/activos', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const [f] = await pool.execute("SELECT a.*, (SELECT COUNT(DISTINCT m.cliente_id) FROM cartera_movimientos m WHERE m.anulado = 0 AND (m.buy_cur = a.simbolo OR m.sell_cur = a.simbolo)) AS clientes FROM activos_catalogo a ORDER BY (a.origen = 'sin') DESC, clientes DESC, a.simbolo");
+  res.json(f);
+});
+app.put('/api/admin/activos/:simbolo', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const b = req.body || {}, s = String(req.params.simbolo).toUpperCase();
+  const vals = ['nombre', 'coingecko_id', 'red', 'sector', 'tipo', 'tamano', 'grupo'].map(k => b[k] === undefined ? undefined : (String(b[k] || '').trim().slice(0, 80) || null));
+  await pool.execute("UPDATE activos_catalogo SET nombre = COALESCE(?, nombre), coingecko_id = COALESCE(?, coingecko_id), red = ?, sector = ?, tipo = ?, tamano = ?, grupo = ?, origen = 'manual', editado_por = ?, actualizado_en = NOW() WHERE simbolo = ?",
+    [vals[0] ?? null, vals[1] ?? null, vals[2] ?? null, vals[3] ?? null, vals[4] ?? null, vals[5] ?? null, vals[6] ?? null, req.asesor.id, s]);
+  if (vals[1]) setTimeout(actualizarPrecios, 100);
+  res.json({ ok: true });
+});
+// Cliente: su cartera (si su asesor la ha publicado)
+app.get('/api/propuestas/:token/cartera', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [e] = await conn.execute('SELECT publicado_en FROM cartera_estado WHERE cliente_id = ?', [p.cliente_id]);
+    if (!e.length || !e[0].publicado_en) return res.json({ disponible: false });
+    const d = await datosCartera(p.cliente_id);
+    delete d.avisos; delete d.n_movimientos; delete d.fuente; delete d.importado_en;
+    res.json(Object.assign({ disponible: true }, d));
+  } finally { conn.release(); }
+});
+// Revisiones pendientes: correo al asesor (con detalle) y ntfy sin datos de clientes
+async function avisarRevisionesDeCartera() {
+  const dias = { semanal: 7, quincenal: 14, mensual: 30, trimestral: 91 };
+  const [f] = await pool.execute("SELECT e.cliente_id, e.ritmo, e.publicado_en, c.nombre, c.apellidos, c.correo, q.id AS persona_id, q.nombre AS asesor, a.correo AS asesor_correo FROM cartera_estado e JOIN clientes c ON c.id = e.cliente_id JOIN personas q ON q.id = c.asesor_persona_id LEFT JOIN asesores a ON a.id = q.asesor_id WHERE e.publicado_en IS NOT NULL AND c.estado <> 'inerte'");
+  const porAsesor = {};
+  for (const x of f) if ((Date.now() - new Date(x.publicado_en).getTime()) / 86400000 >= (dias[x.ritmo] || 30)) (porAsesor[x.persona_id] = porAsesor[x.persona_id] || { asesor: x.asesor, correo: x.asesor_correo, clientes: [] }).clientes.push([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo);
+  for (const [pid, g] of Object.entries(porAsesor)) {
+    const [q] = await pool.execute('SELECT ntfy_topic FROM personas WHERE id = ?', [pid]);
+    if (q.length && q[0].ntfy_topic) avisarEn(q[0].ntfy_topic, '🗓️ ' + g.asesor + ', tienes ' + g.clientes.length + (g.clientes.length === 1 ? ' cartera' : ' carteras') + ' por revisar', 'Te hemos mandado el detalle por correo. Están en el panel.', { etiqueta: 'calendar' });
+    if (g.correo && brevoActivo()) { const c = plantillaCorreo({ titulo: 'Carteras por revisar', parrafos: ['Hola, ' + ESC_HTML(g.asesor) + ':', 'Según su ritmo de revisión, toca actualizar la cartera de:', '<ul>' + g.clientes.map(n => '<li>' + ESC_HTML(n) + '</li>').join('') + '</ul>'] }); enviarCorreo(g.correo, 'Carteras por revisar', c.html, c.texto).catch(() => {}); }
+  }
+}
+setInterval(() => { resolverActivosPendientes().then(actualizarPrecios).catch(() => {}); }, 10 * 60 * 1000).unref();
+setInterval(() => { const h = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' })); if (h.getHours() === 9 && h.getMinutes() < 10) avisarRevisionesDeCartera().catch(e => console.error('Revisiones de cartera:', e.message)); }, 10 * 60 * 1000).unref();
+
 // 15/10: EQUIPOS, ROLES Y «MIS CANALES»
 app.get('/api/admin/equipos', requiereSesionAsesor, async (req, res) => {
   const [e] = await pool.execute('SELECT e.*, j.nombre AS jefe_nombre, n.nombre AS encargado_nombre, (SELECT COUNT(*) FROM personas p WHERE p.equipo_id = e.id) AS miembros FROM equipos e LEFT JOIN personas j ON j.id = e.jefe_persona_id LEFT JOIN personas n ON n.id = e.encargado_persona_id ORDER BY e.activo DESC, e.nombre');
@@ -2055,7 +2422,7 @@ app.post('/api/admin/canales/prueba', requiereSesionAsesor, requiereAdminWeb, as
   const k = String((req.body && req.body.canal) || '');
   if (!(k in CANALES)) return res.status(400).json({ error: 'Canal desconocido' });
   const nombres = { captacion: 'Clientes · captación', actividad: 'Clientes · actividad', equipo: 'Admin · equipo', admin_clientes: 'Admin · clientes', alertas: 'Admin · alertas', pagos: 'Pagos' };
-  const ok = await avisarEn(canalDe(k), '🔔 Prueba · ' + nombres[k], 'Si ves esto, este canal funciona. Lo ha enviado ' + req.asesor.nombre + '.', { etiqueta: 'tada' });
+  const ok = await avisarEn(canalDe(k), '🔔 Prueba · ' + nombres[k], 'Si ves esto, este canal funciona.', { etiqueta: 'tada' });
   if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso.' });
   res.json({ ok: true, canal: canalDe(k) });
 });
@@ -2281,7 +2648,7 @@ async function cambiarCorreoAsesor(conn, asesorId, nuevo, req) {
       parrafos: ['Hola, ' + ESC_HTML(f[0].nombre) + ':', 'El correo con el que entras en el panel de Acros ha pasado de <b>' + ESC_HTML(antiguo) + '</b> a <b>' + ESC_HTML(nuevo) + '</b>. Lo ha cambiado ' + ESC_HTML(quien) + '.', 'Si no sabías nada de este cambio, avisa enseguida a un administrador.'] });
     for (const dest of [antiguo, nuevo]) enviarCorreo(dest, 'Ha cambiado el correo de tu cuenta de Acros', c.html, c.texto).catch(err => console.error('Aviso de cambio de correo no enviado:', err.message));
   }
-  avisarAdmin('✉️ Cambio de correo de un asesor', f[0].nombre + ': ' + antiguo + ' → ' + nuevo + ' (lo ha hecho ' + req.asesor.nombre + ').', { etiqueta: 'envelope' });
+  avisarAdmin('✉️ Cambio de correo de ' + f[0].nombre, 'Lo ha hecho ' + req.asesor.nombre + '. Se ha avisado al correo antiguo y al nuevo.', { etiqueta: 'envelope' });
   return { ok: true, antiguo, nuevo };
 }
 const correoValido = c => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c);
@@ -3556,7 +3923,7 @@ app.post('/api/propuestas/:token/documentos-nuevo', async (req, res) => {
     const [r] = await conn.execute(
       "INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, estado, documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, subido_en, nombre_original) VALUES (?, ?, ?, ?, 'enviado', ?, ?, ?, ?, ?, ?)",
       [p.cliente_id, p.id, servicio, nombre, clave, b.iv, b.clave_cifrada, b.tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), String(b.nombre_original || '').slice(0, 255) || null]);
-    avisarCliente(p.cliente_id, '📄', 'un cliente ha subido un documento', '«' + nombre + '». Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
+    avisarCliente(p.cliente_id, '📄', 'un cliente ha subido un documento', 'Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
     res.status(201).json({ ok: true, id: r.insertId, subidas_hoy: await subidasDeHoy(conn, p.cliente_id), limite: LIMITE_SUBIDAS_DIA });
   } finally { conn.release(); }
 });
@@ -4707,7 +5074,7 @@ app.post('/api/propuestas/:token/valoracion', async (req, res) => {
     if (ya.length) await conn.execute('UPDATE valoraciones SET `persona_id`=?, `atencion`=?, `calidad`=?, `rapidez`=?, `comentario`=?, `nombre_publico`=?, `nombre_mostrado`=?, `estado`=?, `creado_en`=NOW() WHERE `propuesta_id`=?', [...valores, p.id]);
     else await conn.execute('INSERT INTO valoraciones (`persona_id`, `atencion`, `calidad`, `rapidez`, `comentario`, `nombre_publico`, `nombre_mostrado`, `estado`, `propuesta_id`, `cliente_id`) VALUES (?,?,?,?,?,?,?,?,?,?)', [...valores, p.id, p.cliente_id]);
     const media = ((at + ca + ra) / 3).toFixed(1).replace('.', ',');
-    (async () => { const q = await personaDeCliente(p.cliente_id).catch(() => null); avisarAdminClientes('⭐ Nueva valoración' + (q ? ' de un cliente de ' + q.nombre : ''), 'Media ' + media + '/5' + (comentario ? ' · con comentario por revisar' : '') + '.', { etiqueta: 'star' }); })();   // 15/10: las valoraciones solo a los admins
+    (async () => { const q = await personaDeCliente(p.cliente_id).catch(() => null); avisarAdminClientes('⭐ Nueva valoración' + (q ? ' para ' + q.nombre : ''), 'Media ' + media + '/5' + (comentario ? ' · con comentario por revisar' : '') + '.', { etiqueta: 'star' }); })();   // 15/10: las valoraciones solo a los admins
     res.status(201).json({ ok: true });
   } finally { conn.release(); }
 });
@@ -5220,7 +5587,7 @@ app.get('/api/admin/copias-bd/:id/descargar', requiereSesionAsesor, requiereRol(
 
 app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
   if (!NTFY_TOPIC) return res.status(400).json({ error: 'Falta la variable NTFY_TOPIC en Railway: sin ella no se envía ningún aviso.' });
-  const ok = await avisar('🔔 Aviso de prueba · canal de clientes', 'Si ves esto, los avisos de clientes funcionan. Lo ha enviado ' + req.asesor.nombre + ' desde el panel.', { etiqueta: 'tada' });
+  const ok = await avisar('🔔 Aviso de prueba · canal de clientes', 'Si ves esto, los avisos de clientes funcionan.', { etiqueta: 'tada' });
   if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso. Revisa el nombre del canal en NTFY_TOPIC.' });
   // 15/10: también al canal de administración y al propio del asesor, si los hay
   if (NTFY_TOPIC_ADMIN) await avisarEn(NTFY_TOPIC_ADMIN, '🔔 Aviso de prueba · canal de administración', 'Si ves esto, los avisos de administración funcionan.', { etiqueta: 'tada' });
