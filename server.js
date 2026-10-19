@@ -887,6 +887,25 @@ async function asegurarEsquema() {
       );
       await creaIndiceSiFalta('idx_entregas_servicio ON entregas (`propuesta_id`, `servicio`, `version`)');
 
+      // IA (16/10, Vikn): solo métricas de uso, NUNCA el texto enviado ni el
+      // recibido. «sin_ia» = el cliente pidió que no se use IA en su caso.
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS ia_uso (' +
+        ' `id`              INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `creado_en`       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' `funcion`         VARCHAR(40)  NOT NULL,' +
+        ' `persona_id`      INT          NULL,' +   // asesores.id de quien lo pidió
+        ' `cliente_id`      INT          NULL,' +
+        ' `modelo`          VARCHAR(60)  NOT NULL,' +
+        ' `tokens_entrada`  INT          NOT NULL DEFAULT 0,' +
+        ' `tokens_salida`   INT          NOT NULL DEFAULT 0,' +
+        ' `coste_micro_usd` BIGINT       NOT NULL DEFAULT 0,' +
+        ' `ok`              TINYINT(1)   NOT NULL DEFAULT 1,' +
+        ' `error`           VARCHAR(200) NULL)'
+      );
+      await creaIndiceSiFalta('idx_ia_uso_fecha ON ia_uso (`creado_en`)');
+      await agregaColumnaSiFalta('clientes', '`sin_ia`', 'TINYINT(1) NOT NULL DEFAULT 0');
+
       console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes, copias, entregas).');
       return;
     } catch (err) {
@@ -3754,7 +3773,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [cli] = await conn.execute(
-      'SELECT id, correo, telefono, telefono2, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id`, `totp_activo`, `codigo`, (`contrasena_hash` IS NOT NULL) AS tiene_contrasena, (`preferencias_avisos` IS NOT NULL) AS avisos_personalizados FROM clientes WHERE id = ?', [id]);
+      'SELECT id, correo, telefono, telefono2, nombre, apellidos, tipo_documento, numero_documento, estado, creado_en, `asesor_persona_id`, `sin_ia`, `totp_activo`, `codigo`, (`contrasena_hash` IS NOT NULL) AS tiene_contrasena, (`preferencias_avisos` IS NOT NULL) AS avisos_personalizados FROM clientes WHERE id = ?', [id]);
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
@@ -4712,6 +4731,205 @@ app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => 
     conn.release();
   }
 });
+// =====================================================================
+// IA (16/10, Vikn) — apoyo para el asesor con la API de Claude
+// ---------------------------------------------------------------------
+// Capa OPCIONAL: sin ANTHROPIC_API_KEY, apagada desde el panel, sin
+// créditos o con el tope del mes alcanzado, los botones de IA no aparecen
+// y todo funciona como siempre. La clave vive solo en Railway.
+// Datos: a la IA nunca le llegan nombre, correo, teléfono, documento,
+// IBAN ni direcciones de monederos (seudonimizarTexto); los documentos del
+// cliente no se leen (siguen cifrados). En la base de datos solo quedan
+// métricas de uso (ia_uso), nunca los textos.
+// Variables: ANTHROPIC_API_KEY (obligatoria para usarla),
+// IA_MODELO_BORRADOR (por defecto claude-sonnet-5-5).
+// =====================================================================
+const IA_CLAVE = (process.env.ANTHROPIC_API_KEY || '').trim();
+const IA_URL = (process.env.IA_URL || 'https://api.anthropic.com/v1/messages').trim();   // solo se cambia para pruebas
+const IA_MODELO_BORRADOR = (process.env.IA_MODELO_BORRADOR || 'claude-sonnet-5-5').trim();
+// Dólares por millón de tokens (entrada, salida). Si cambian, IA_PRECIOS='{"modelo":[ent,sal]}'.
+const IA_PRECIOS = Object.assign({ 'claude-sonnet-5-5': [2, 10], 'claude-haiku-5-5': [0.10, 0.50] },
+  (() => { try { return JSON.parse(process.env.IA_PRECIOS || '{}'); } catch (e) { return {}; } })());
+const IA_TOPE_POR_DEFECTO = 60;   // USD/mes; los créditos del plan Max son 100
+let iaUltimaAlerta = 0;
+
+async function iaAjustes() {
+  const a = { activa: true, borradores: true, tope_usd: IA_TOPE_POR_DEFECTO };
+  try {
+    const [f] = await pool.execute("SELECT clave, valor FROM ajustes WHERE clave IN ('ia_activa','ia_borradores','ia_tope_usd')");
+    f.forEach(x => {
+      if (x.clave === 'ia_activa') a.activa = x.valor !== '0';
+      if (x.clave === 'ia_borradores') a.borradores = x.valor !== '0';
+      if (x.clave === 'ia_tope_usd') { const n = Number(x.valor); if (Number.isFinite(n) && n >= 0) a.tope_usd = n; }
+    });
+  } catch (e) { /* sin tabla aún */ }
+  return a;
+}
+async function iaGastoMes() {
+  try {
+    const [f] = await pool.execute("SELECT COALESCE(SUM(`coste_micro_usd`),0) AS c, COUNT(*) AS n, COALESCE(SUM(`ok` = 0),0) AS e FROM ia_uso WHERE `creado_en` >= DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-01')");
+    return { usd: Number(f[0].c) / 1e6, llamadas: Number(f[0].n), errores: Number(f[0].e) };
+  } catch (e) { return { usd: 0, llamadas: 0, errores: 0 }; }
+}
+// ¿Se puede usar ahora mismo esta función? Devuelve null si sí, o el motivo.
+async function iaMotivoNo(funcion) {
+  if (!IA_CLAVE) return 'La IA no está configurada';
+  const a = await iaAjustes();
+  if (!a.activa) return 'La IA está apagada';
+  if (funcion === 'borrador' && !a.borradores) return 'Los borradores con IA están apagados';
+  const g = await iaGastoMes();
+  if (g.usd >= a.tope_usd) return 'Se ha alcanzado el tope de IA de este mes';
+  return null;
+}
+async function iaRegistrar(d) {
+  try {
+    await pool.execute('INSERT INTO ia_uso (`funcion`, `persona_id`, `cliente_id`, `modelo`, `tokens_entrada`, `tokens_salida`, `coste_micro_usd`, `ok`, `error`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [d.funcion, d.persona_id || null, d.cliente_id || null, d.modelo, d.ent || 0, d.sal || 0, d.coste || 0, d.ok ? 1 : 0, d.error ? String(d.error).slice(0, 200) : null]);
+  } catch (e) { console.error('No se pudo registrar el uso de IA:', e.message); }
+}
+// Una llamada a la API de mensajes. Lanza Error con .publico (texto para el panel).
+async function iaLlamar({ funcion, modelo, sistema, mensajes, maxTokens, personaId, clienteId }) {
+  const fallo = (publico, tecnico) => { const e = new Error(tecnico || publico); e.publico = publico; return e; };
+  let r;
+  try {
+    r = await axios.post(IA_URL, { model: modelo, max_tokens: maxTokens || 700, system: sistema, messages: mensajes },
+      { timeout: 45000, headers: { 'x-api-key': IA_CLAVE, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, validateStatus: () => true });
+  } catch (e) {
+    await iaRegistrar({ funcion, persona_id: personaId, cliente_id: clienteId, modelo, ok: false, error: 'red: ' + e.message });
+    throw fallo('La IA no responde ahora mismo. Escribe la respuesta como siempre.', e.message);
+  }
+  const cuerpo = r.data || {};
+  if (r.status !== 200) {
+    const msg = (cuerpo.error && cuerpo.error.message) || ('HTTP ' + r.status);
+    await iaRegistrar({ funcion, persona_id: personaId, cliente_id: clienteId, modelo, ok: false, error: r.status + ': ' + msg });
+    const sinCredito = /credit|balance|billing/i.test(msg);
+    if ((r.status === 401 || r.status === 403 || sinCredito) && Date.now() - iaUltimaAlerta > 6 * 3600e3) {
+      iaUltimaAlerta = Date.now();
+      avisarAlerta('✨ IA sin servicio', sinCredito ? 'Se han agotado los créditos de la API de Claude. Los botones de IA seguirán fallando hasta el próximo ciclo; el panel funciona igual.' : 'La clave ANTHROPIC_API_KEY de Railway no es válida o fue revocada.', { prioridad: 4, etiqueta: 'warning' });
+    }
+    if (sinCredito) throw fallo('Se han agotado los créditos de IA de este mes. Escribe la respuesta como siempre.', msg);
+    if (r.status === 429 || r.status === 529 || r.status >= 500) throw fallo('La IA está saturada. Prueba otra vez en un momento.', msg);
+    throw fallo('La IA no está disponible ahora mismo.', msg);
+  }
+  const texto = (cuerpo.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  const u = cuerpo.usage || {}, precio = IA_PRECIOS[modelo] || [0, 0];
+  const ent = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0), sal = u.output_tokens || 0;
+  const coste = Math.round(ent * precio[0] + sal * precio[1]);   // tokens × $/MTok = micro-dólares
+  await iaRegistrar({ funcion, persona_id: personaId, cliente_id: clienteId, modelo, ent, sal, coste, ok: true });
+  return texto;
+}
+// Quita lo que identifica al cliente antes de mandar nada a la IA.
+function seudonimizarTexto(t, cli) {
+  let s = String(t || '');
+  const esc = x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // datos propios del cliente (exactos), del más largo al más corto
+  const propios = [];
+  if (cli) {
+    if (cli.correo) propios.push([cli.correo, '[correo]']);
+    if (cli.numero_documento) propios.push([cli.numero_documento, '[documento]']);
+    [cli.nombre, cli.apellidos].filter(Boolean).join(' ').split(/\s+/).filter(w => w.length >= 3).forEach(w => propios.push([w, '[nombre]']));
+  }
+  propios.sort((a, b) => b[0].length - a[0].length).forEach(([v, r]) => { s = s.replace(new RegExp('(?<![\\p{L}\\d])' + esc(v) + '(?![\\p{L}\\d])', 'giu'), r); });
+  s = s.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[correo]')
+    .replace(/\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){3,7}(?:[ ]?[A-Z0-9]{1,3})?\b/g, '[IBAN]')
+    .replace(/\b0x[a-fA-F0-9]{40,64}\b/g, '[dirección o hash]')
+    .replace(/\b(?:bc1|tb1)[a-z0-9]{20,80}\b/gi, '[dirección]')
+    .replace(/\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g, '[dirección]')
+    .replace(/\b[TX][a-km-zA-HJ-NP-Z1-9]{33}\b/g, '[dirección]')
+    .replace(/\b[XYZ]?\d{7,8}[-\s]?[A-Z]\b/gi, '[documento]')
+    .replace(/(?:\+|00)\d[\d\s.-]{7,16}\d|\b[6789]\d{2}[\s.-]?\d{2,3}[\s.-]?\d{2,3}(?:[\s.-]?\d{1,3})?\b/g, m => (m.replace(/\D/g, '').length >= 9 ? '[teléfono]' : m));
+  return s;
+}
+const IA_SISTEMA_BORRADOR = [
+  'Eres el asistente de redacción de los asesores de Acros, una asesoría fiscal española especializada en criptoactivos (particulares y empresas).',
+  'Tu tarea: redactar un BORRADOR de respuesta al último mensaje del cliente en el chat de su área privada. Un asesor lo revisará y corregirá antes de enviarlo; tú nunca hablas directamente con el cliente.',
+  'Estilo: tutea al cliente, tono cercano y profesional, frases cortas, sin tecnicismos innecesarios. Breve: lo justo para responder (normalmente 2-6 frases). Sin saludos largos ni despedidas formales, sin firma.',
+  'Nunca inventes datos, importes, plazos, fechas ni conclusiones fiscales sobre su caso concreto. Si para responder hace falta algo que no está en el contexto, deja un hueco así: [COMPLETAR: qué falta], para que el asesor lo rellene.',
+  'No prometas resultados ante Hacienda. Si la respuesta depende de revisar su documentación, dilo con naturalidad («lo reviso y te digo»).',
+  'Los datos identificativos vienen sustituidos por marcadores como [nombre], [correo] o [documento]. No intentes adivinarlos; si quieres dirigirte al cliente por su nombre, escribe [nombre].',
+  'Responde solo con el texto del mensaje, sin comillas, sin explicaciones y sin encabezados. Escribe en el mismo idioma que use el cliente.'
+].join('\n');
+
+app.get('/api/admin/ia/estado', requiereSesionAsesor, async (req, res) => {
+  const motivo = await iaMotivoNo('borrador');
+  res.json({ configurada: !!IA_CLAVE, borradores: !motivo, motivo: motivo || null });
+});
+app.get('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
+  const a = await iaAjustes(), g = await iaGastoMes();
+  let porFuncion = [], ultimos = [];
+  try {
+    [porFuncion] = await pool.execute("SELECT `funcion`, COUNT(*) AS llamadas, COALESCE(SUM(`coste_micro_usd`),0) AS coste, COALESCE(SUM(`ok`=0),0) AS errores FROM ia_uso WHERE `creado_en` >= DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-01') GROUP BY `funcion`");
+    [ultimos] = await pool.execute('SELECT u.`creado_en`, u.`funcion`, u.`modelo`, u.`tokens_entrada`, u.`tokens_salida`, u.`coste_micro_usd`, u.`ok`, u.`error`, p.`nombre` AS persona FROM ia_uso u LEFT JOIN asesores p ON p.`id` = u.`persona_id` ORDER BY u.`id` DESC LIMIT 15');
+  } catch (e) { /* tabla aún vacía */ }
+  res.json({ configurada: !!IA_CLAVE, modelo_borrador: IA_MODELO_BORRADOR, activa: a.activa, borradores: a.borradores, tope_usd: a.tope_usd,
+    mes: { gasto_usd: g.usd, llamadas: g.llamadas, errores: g.errores, por_funcion: porFuncion.map(x => ({ funcion: x.funcion, llamadas: Number(x.llamadas), gasto_usd: Number(x.coste) / 1e6, errores: Number(x.errores) })) },
+    ultimos: ultimos.map(x => ({ creado_en: x.creado_en, funcion: x.funcion, modelo: x.modelo, tokens_entrada: x.tokens_entrada, tokens_salida: x.tokens_salida, gasto_usd: Number(x.coste_micro_usd) / 1e6, ok: !!x.ok, error: x.error, persona: x.persona })) });
+});
+app.put('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
+  const b = req.body || {}, filas = [];
+  if (typeof b.activa === 'boolean') filas.push(['ia_activa', b.activa ? '1' : '0']);
+  if (typeof b.borradores === 'boolean') filas.push(['ia_borradores', b.borradores ? '1' : '0']);
+  if (b.tope_usd !== undefined) {
+    const n = Number(b.tope_usd);
+    if (!Number.isFinite(n) || n < 0 || n > 1000) return res.status(400).json({ error: 'El tope debe ser un número entre 0 y 1000' });
+    filas.push(['ia_tope_usd', String(Math.round(n * 100) / 100)]);
+  }
+  for (const [k, v] of filas) await pool.execute('INSERT INTO ajustes (clave, valor) VALUES (?, ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)', [k, v]);
+  res.json({ ok: true });
+});
+// El cliente pidió que no se use IA en su caso (lo marca su asesor).
+app.put('/api/admin/clientes/:id/sin-ia', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Cliente no válido' });
+  const [r] = await pool.execute('UPDATE clientes SET `sin_ia` = ? WHERE id = ?', [req.body && req.body.sin_ia ? 1 : 0, id]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Cliente no encontrado' });
+  res.json({ ok: true });
+});
+// «Proponer respuesta»: borrador para el hilo (encargo + servicio). No envía nada.
+app.post('/api/admin/propuestas/:id/ia-borrador', requiereSesionAsesor, async (req, res) => {
+  const motivo = await iaMotivoNo('borrador');
+  if (motivo) return res.status(503).json({ error: motivo, sin_ia: true });
+  const conn = await pool.getConnection();
+  try {
+    const [ps] = await conn.execute('SELECT p.id, p.cliente_id, p.servicios, p.estado, p.creado_en, c.nombre, c.apellidos, c.correo, c.numero_documento, c.`sin_ia` FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?', [Number(req.params.id)]);
+    if (!ps.length) return res.status(404).json({ error: 'Encargo no encontrado' });
+    const p = ps[0];
+    if (p.sin_ia) return res.status(409).json({ error: 'Este cliente ha pedido que no se use IA en su caso', sin_ia: true });
+    const servicio = servicioDeHilo(p, req.body && req.body.servicio);
+    const [msgs] = await conn.execute("SELECT autor, texto, creado_en FROM mensajes WHERE propuesta_id = ? AND servicio = ? AND retirado_en IS NULL ORDER BY creado_en DESC, id DESC LIMIT 20", [p.id, servicio]);
+    if (!msgs.length) return res.status(400).json({ error: 'Todavía no hay mensajes en este hilo' });
+    msgs.reverse();
+    const [docs] = await conn.execute("SELECT nombre, estado, razon_rechazo FROM documentos_fiscales WHERE propuesta_id = ? AND (servicio = ? OR servicio IS NULL) ORDER BY creado_en", [p.id, servicio]);
+    const [ents] = await conn.execute("SELECT `version`, `estado`, `subido_en` FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ? ORDER BY `version`", [p.id, servicio]);
+    const fecha = d => d ? new Date(d).toISOString().slice(0, 10) : '';
+    const sz = t => seudonimizarTexto(t, p);
+    const contexto = [
+      'CONTEXTO DEL ENCARGO (datos del panel; los identificativos van sustituidos):',
+      '- Servicios del encargo: ' + (serviciosDePropuesta(p).join(', ') || 'sin detallar'),
+      '- Hilo de chat: ' + servicio,
+      '- Estado de la propuesta: ' + p.estado + ' (creada el ' + fecha(p.creado_en) + ')',
+      '- Documentación pedida al cliente: ' + (docs.length ? docs.map(d => sz(d.nombre) + ' → ' + d.estado + (d.razon_rechazo ? ' (motivo: ' + sz(d.razon_rechazo) + ')' : '')).join('; ') : 'ninguna todavía'),
+      '- Informe entregado: ' + (ents.length ? ents.map(e => 'versión ' + e.version + ' el ' + fecha(e.subido_en) + ' → ' + e.estado).join('; ') : 'aún no'),
+      '- Fecha de hoy: ' + fecha(new Date()),
+      '',
+      'CONVERSACIÓN (de la más antigua a la más reciente):',
+      ...msgs.map(m => (m.autor === 'cliente' ? 'Cliente' : 'Asesor') + ' (' + fecha(m.creado_en) + '): ' + sz(m.texto)),
+      '',
+      msgs[msgs.length - 1].autor === 'cliente'
+        ? 'Redacta el borrador de la respuesta del asesor al último mensaje del cliente.'
+        : 'El último mensaje es del asesor. Redacta un mensaje breve de seguimiento coherente con la conversación.'
+    ].join('\n');
+    let texto;
+    try {
+      texto = await iaLlamar({ funcion: 'borrador', modelo: IA_MODELO_BORRADOR, sistema: IA_SISTEMA_BORRADOR, mensajes: [{ role: 'user', content: contexto }], maxTokens: 700, personaId: req.asesor && req.asesor.id, clienteId: p.cliente_id });
+    } catch (e) { return res.status(503).json({ error: e.publico || 'La IA no está disponible ahora mismo.', sin_ia: true }); }
+    if (!texto) return res.status(503).json({ error: 'La IA no ha devuelto nada. Prueba otra vez.', sin_ia: true });
+    res.json({ texto: textoMensaje(texto) || texto.slice(0, 4000), servicio });
+  } finally {
+    conn.release();
+  }
+});
+
 app.post('/api/admin/resumen-diario/prueba', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const r = await enviarResumenDiario({ forzarFecha: fechaMadrid().fecha });
   res.json(r || { error: 'No se pudo preparar el resumen' });
