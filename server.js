@@ -4747,6 +4747,9 @@ app.delete('/api/admin/mensajes/:id', requiereSesionAsesor, async (req, res) => 
 const IA_CLAVE = (process.env.ANTHROPIC_API_KEY || '').trim();
 const IA_URL = (process.env.IA_URL || 'https://api.anthropic.com/v1/messages').trim();   // solo se cambia para pruebas
 const IA_MODELO_BORRADOR = (process.env.IA_MODELO_BORRADOR || 'claude-sonnet-5-5').trim();
+const IA_MODELO_ASISTENTE = (process.env.IA_MODELO_ASISTENTE || 'claude-sonnet-5-5').trim();   // 19/10: Asistente Acros (chat interno)
+const IA_MAX_CONOCIMIENTO = 30000;
+const IA_PRECIO_BUSQUEDA_MICRO = 10000;   // búsqueda web: 10 $ por 1.000 = 0,01 $ (en micro-dólares)   // caracteres de «Instrucciones y conocimiento de Acros»
 // Dólares por millón de tokens (entrada, salida). Si cambian, IA_PRECIOS='{"modelo":[ent,sal]}'.
 const IA_PRECIOS = Object.assign({ 'claude-sonnet-5-5': [2, 10], 'claude-haiku-5-5': [0.10, 0.50] },
   (() => { try { return JSON.parse(process.env.IA_PRECIOS || '{}'); } catch (e) { return {}; } })());
@@ -4754,12 +4757,16 @@ const IA_TOPE_POR_DEFECTO = 60;   // USD/mes; los créditos del plan Max son 100
 let iaUltimaAlerta = 0;
 
 async function iaAjustes() {
-  const a = { activa: true, borradores: true, tope_usd: IA_TOPE_POR_DEFECTO };
+  const a = { activa: true, borradores: true, asistente: true, web: true, tope_usd: IA_TOPE_POR_DEFECTO, conocimiento: '', conocimiento_anterior: null };
   try {
-    const [f] = await pool.execute("SELECT clave, valor FROM ajustes WHERE clave IN ('ia_activa','ia_borradores','ia_tope_usd')");
+    const [f] = await pool.execute("SELECT clave, valor FROM ajustes WHERE clave IN ('ia_activa','ia_borradores','ia_asistente','ia_web','ia_tope_usd','ia_conocimiento','ia_conocimiento_anterior')");
     f.forEach(x => {
       if (x.clave === 'ia_activa') a.activa = x.valor !== '0';
       if (x.clave === 'ia_borradores') a.borradores = x.valor !== '0';
+      if (x.clave === 'ia_asistente') a.asistente = x.valor !== '0';
+      if (x.clave === 'ia_web') a.web = x.valor !== '0';
+      if (x.clave === 'ia_conocimiento') a.conocimiento = x.valor || '';
+      if (x.clave === 'ia_conocimiento_anterior') a.conocimiento_anterior = x.valor;
       if (x.clave === 'ia_tope_usd') { const n = Number(x.valor); if (Number.isFinite(n) && n >= 0) a.tope_usd = n; }
     });
   } catch (e) { /* sin tabla aún */ }
@@ -4777,6 +4784,7 @@ async function iaMotivoNo(funcion) {
   const a = await iaAjustes();
   if (!a.activa) return 'La IA está apagada';
   if (funcion === 'borrador' && !a.borradores) return 'Los borradores con IA están apagados';
+  if (funcion === 'asistente' && !a.asistente) return 'El Asistente Acros está apagado';
   const g = await iaGastoMes();
   if (g.usd >= a.tope_usd) return 'Se ha alcanzado el tope de IA de este mes';
   return null;
@@ -4788,11 +4796,11 @@ async function iaRegistrar(d) {
   } catch (e) { console.error('No se pudo registrar el uso de IA:', e.message); }
 }
 // Una llamada a la API de mensajes. Lanza Error con .publico (texto para el panel).
-async function iaLlamar({ funcion, modelo, sistema, mensajes, maxTokens, personaId, clienteId }) {
+async function iaLlamar({ funcion, modelo, sistema, mensajes, maxTokens, personaId, clienteId, herramientas, completo }) {
   const fallo = (publico, tecnico) => { const e = new Error(tecnico || publico); e.publico = publico; return e; };
   let r;
   try {
-    r = await axios.post(IA_URL, { model: modelo, max_tokens: maxTokens || 700, system: sistema, messages: mensajes },
+    r = await axios.post(IA_URL, Object.assign({ model: modelo, max_tokens: maxTokens || 700, system: sistema, messages: mensajes }, herramientas ? { tools: herramientas } : {}),
       { timeout: 45000, headers: { 'x-api-key': IA_CLAVE, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, validateStatus: () => true });
   } catch (e) {
     await iaRegistrar({ funcion, persona_id: personaId, cliente_id: clienteId, modelo, ok: false, error: 'red: ' + e.message });
@@ -4814,9 +4822,10 @@ async function iaLlamar({ funcion, modelo, sistema, mensajes, maxTokens, persona
   const texto = (cuerpo.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
   const u = cuerpo.usage || {}, precio = IA_PRECIOS[modelo] || [0, 0];
   const ent = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0), sal = u.output_tokens || 0;
-  const coste = Math.round(ent * precio[0] + sal * precio[1]);   // tokens × $/MTok = micro-dólares
+  const busquedas = Number((u.server_tool_use && u.server_tool_use.web_search_requests) || 0);
+  const coste = Math.round(ent * precio[0] + sal * precio[1]) + busquedas * IA_PRECIO_BUSQUEDA_MICRO;   // tokens × $/MTok = micro-dólares
   await iaRegistrar({ funcion, persona_id: personaId, cliente_id: clienteId, modelo, ent, sal, coste, ok: true });
-  return texto;
+  return completo ? { texto, cuerpo, busquedas } : texto;
 }
 // Quita lo que identifica al cliente antes de mandar nada a la IA.
 function seudonimizarTexto(t, cli) {
@@ -4851,8 +4860,8 @@ const IA_SISTEMA_BORRADOR = [
 ].join('\n');
 
 app.get('/api/admin/ia/estado', requiereSesionAsesor, async (req, res) => {
-  const motivo = await iaMotivoNo('borrador');
-  res.json({ configurada: !!IA_CLAVE, borradores: !motivo, motivo: motivo || null });
+  const motivo = await iaMotivoNo('borrador'), motivoAs = await iaMotivoNo('asistente');
+  res.json({ configurada: !!IA_CLAVE, borradores: !motivo, asistente: !motivoAs, motivo: motivo || null, motivo_asistente: motivoAs || null });
 });
 app.get('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
   const a = await iaAjustes(), g = await iaGastoMes();
@@ -4861,7 +4870,8 @@ app.get('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), asy
     [porFuncion] = await pool.execute("SELECT `funcion`, COUNT(*) AS llamadas, COALESCE(SUM(`coste_micro_usd`),0) AS coste, COALESCE(SUM(`ok`=0),0) AS errores FROM ia_uso WHERE `creado_en` >= DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-01') GROUP BY `funcion`");
     [ultimos] = await pool.execute('SELECT u.`creado_en`, u.`funcion`, u.`modelo`, u.`tokens_entrada`, u.`tokens_salida`, u.`coste_micro_usd`, u.`ok`, u.`error`, p.`nombre` AS persona FROM ia_uso u LEFT JOIN asesores p ON p.`id` = u.`persona_id` ORDER BY u.`id` DESC LIMIT 15');
   } catch (e) { /* tabla aún vacía */ }
-  res.json({ configurada: !!IA_CLAVE, modelo_borrador: IA_MODELO_BORRADOR, activa: a.activa, borradores: a.borradores, tope_usd: a.tope_usd,
+  res.json({ configurada: !!IA_CLAVE, modelo_borrador: IA_MODELO_BORRADOR, modelo_asistente: IA_MODELO_ASISTENTE, activa: a.activa, borradores: a.borradores, asistente: a.asistente, web: a.web, tope_usd: a.tope_usd,
+    conocimiento: a.conocimiento, hay_conocimiento_anterior: a.conocimiento_anterior !== null, max_conocimiento: IA_MAX_CONOCIMIENTO,
     mes: { gasto_usd: g.usd, llamadas: g.llamadas, errores: g.errores, por_funcion: porFuncion.map(x => ({ funcion: x.funcion, llamadas: Number(x.llamadas), gasto_usd: Number(x.coste) / 1e6, errores: Number(x.errores) })) },
     ultimos: ultimos.map(x => ({ creado_en: x.creado_en, funcion: x.funcion, modelo: x.modelo, tokens_entrada: x.tokens_entrada, tokens_salida: x.tokens_salida, gasto_usd: Number(x.coste_micro_usd) / 1e6, ok: !!x.ok, error: x.error, persona: x.persona })) });
 });
@@ -4869,6 +4879,16 @@ app.put('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), asy
   const b = req.body || {}, filas = [];
   if (typeof b.activa === 'boolean') filas.push(['ia_activa', b.activa ? '1' : '0']);
   if (typeof b.borradores === 'boolean') filas.push(['ia_borradores', b.borradores ? '1' : '0']);
+  if (typeof b.asistente === 'boolean') filas.push(['ia_asistente', b.asistente ? '1' : '0']);
+  if (typeof b.web === 'boolean') filas.push(['ia_web', b.web ? '1' : '0']);
+  // 19/10: «Instrucciones y conocimiento de Acros». Se guarda la versión anterior para poder deshacer.
+  if (typeof b.conocimiento === 'string' || b.deshacer_conocimiento) {
+    const a = await iaAjustes();
+    let nuevo = b.deshacer_conocimiento ? a.conocimiento_anterior : b.conocimiento.replace(/\r\n/g, '\n').trim();
+    if (nuevo === null) return res.status(400).json({ error: 'No hay ninguna versión anterior' });
+    if (nuevo.length > IA_MAX_CONOCIMIENTO) return res.status(400).json({ error: 'El texto es demasiado largo (máximo ' + IA_MAX_CONOCIMIENTO + ' caracteres)' });
+    if (nuevo !== a.conocimiento) { filas.push(['ia_conocimiento_anterior', a.conocimiento]); filas.push(['ia_conocimiento', nuevo]); }
+  }
   if (b.tope_usd !== undefined) {
     const n = Number(b.tope_usd);
     if (!Number.isFinite(n) || n < 0 || n > 1000) return res.status(400).json({ error: 'El tope debe ser un número entre 0 y 1000' });
@@ -4877,6 +4897,193 @@ app.put('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), asy
   for (const [k, v] of filas) await pool.execute('INSERT INTO ajustes (clave, valor) VALUES (?, ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)', [k, v]);
   res.json({ ok: true });
 });
+// Instrucciones fijas + las del despacho (editables en Sistema → IA). Se envían con
+// caché: el texto largo de conocimiento solo se cobra entero la primera vez.
+function iaSistemaCon(base, conocimiento) {
+  const bloques = [{ type: 'text', text: base }];
+  if (conocimiento && conocimiento.trim()) bloques.push({ type: 'text', text: 'INSTRUCCIONES Y CONOCIMIENTO DE ACROS (escritas por el despacho; si chocan con lo anterior en estilo o criterio, mandan estas, salvo las reglas sobre no inventar datos y sobre datos personales):\n\n' + conocimiento.trim() });
+  bloques[bloques.length - 1].cache_control = { type: 'ephemeral' };
+  return bloques;
+}
+const IA_SISTEMA_ASISTENTE = [
+  'Eres «Asistente Acros», el asistente interno del equipo de Acros, una asesoría fiscal española especializada en criptoactivos (IRPF, modelo 721, origen de fondos, certificados de valoración, informes de pérdidas y ganancias, empresas con criptoactivos). Hablas con asesores y personal del despacho, nunca con clientes.',
+  'Ayudas con: dudas de fiscalidad española de criptoactivos y su aplicación práctica; redacción de textos (correos y explicaciones para clientes, publicaciones); procedimientos internos y uso del panel cuando te los hayan explicado en las instrucciones; y revisión de razonamientos.',
+  'Estilo: español (o el idioma en que te escriban), directo y concreto. Usa Markdown sencillo (listas, **negritas**) solo cuando ayude a leer.',
+  'Fiscalidad: distingue lo que dice la norma, lo que es criterio administrativo (consultas vinculantes de la DGT, doctrina del TEAC) y lo que es interpretación. Cita la norma o la consulta solo si estás seguro de ella. No inventes cifras, plazos, tipos ni números de consulta. El criterio final es siempre del asesor.',
+  'Datos personales: los datos identificativos que te lleguen vienen sustituidos por marcadores como [correo], [documento] o [IBAN]; no intentes reconstruirlos. Si alguien pega datos de un cliente, recuérdale en una frase que no hace falta para que puedas ayudar.'
+].join('\n');
+const IA_ASISTENTE_SIN_WEB = 'No puedes consultar internet y tu conocimiento tiene fecha de corte: avisa cuando algo pueda haber cambiado.';
+const IA_ASISTENTE_CON_WEB = [
+  'Puedes buscar en internet con la herramienta web_search. Úsala cuando algo pueda haber cambiado o haya que confirmarlo (normativa, plazos, tipos, criterios recientes, consultas de la DGT, novedades de exchanges); para lo que sabes con seguridad, no hace falta.',
+  'Prefiere siempre fuentes oficiales: boe.es, agenciatributaria.es y sede.agenciatributaria.gob.es, petete.tributos.hacienda.gob.es (consultas de la DGT), hacienda.gob.es, eur-lex.europa.eu, cnmv.es, bde.es. Después, despachos y publicaciones profesionales reconocidas. Evita foros y blogs anónimos; si no hay otra cosa, dilo.',
+  'Di de dónde sale cada dato importante. No busques información sobre personas concretas.'
+].join(' ');
+const IA_HERRAMIENTA_WEB = { type: 'web_search_20250305', name: 'web_search', max_uses: 5, user_location: { type: 'approximate', country: 'ES', city: 'Madrid', region: 'Madrid', timezone: 'Europe/Madrid' } };
+// Fuentes citadas en la respuesta (enlaces únicos, como mucho 8)
+function iaFuentes(cuerpo) {
+  const vistas = new Map();
+  (cuerpo.content || []).forEach(b => (b.type === 'text' && Array.isArray(b.citations) ? b.citations : []).forEach(c => {
+    if (c && c.url && /^https?:\/\//.test(c.url) && !vistas.has(c.url)) vistas.set(c.url, String(c.title || '').slice(0, 140));
+  }));
+  return [...vistas].slice(0, 8).map(([url, titulo]) => ({ url, titulo }));
+}
+// =====================================================================
+// HERRAMIENTAS DEL ASISTENTE SOBRE EL PANEL (19/10, Vikn)
+// La IA puede consultar chats y equipo. Reglas:
+//  1) Solo ve los clientes que ve quien pregunta (mismo cálculo que el
+//     panel: rol + «Ver» de la cabecera x-ambito).
+//  2) A Anthropic no le llegan nombres: cada cliente va como su código
+//     (clientes.codigo) y los textos pasan por seudonimizarTexto. El
+//     panel cambia el código por el nombre al enseñar la respuesta.
+// =====================================================================
+const IA_HERRAMIENTAS_PANEL = [
+  { name: 'chats_esperando_respuesta', description: 'Conversaciones del chat en las que el cliente ha escrito y nadie del despacho le ha contestado todavía (el último mensaje es del cliente). Devuelve, de más antiguo a más reciente, el código del cliente, su asesor, el servicio, desde cuándo espera, cuántos mensajes sin contestar y un extracto del último.',
+    input_schema: { type: 'object', properties: { asesor: { type: 'string', description: 'Opcional: nombre (o parte) del asesor para filtrar' }, limite: { type: 'integer', description: 'Máximo de resultados (por defecto 30)' } } } },
+  { name: 'clientes_sin_contestarnos', description: 'Conversaciones en las que el despacho escribió lo último y el cliente no ha respondido. Devuelve, de más días a menos, el código del cliente, su asesor, el servicio, cuántos días lleva sin contestar, si ha leído nuestro último mensaje y un extracto de ese mensaje.',
+    input_schema: { type: 'object', properties: { asesor: { type: 'string', description: 'Opcional: nombre (o parte) del asesor para filtrar' }, dias_minimos: { type: 'integer', description: 'Opcional: solo los que llevan al menos estos días' }, limite: { type: 'integer', description: 'Máximo de resultados (por defecto 30)' } } } },
+  { name: 'mensajes_de_clientes', description: 'Mensajes que han escrito los clientes en el chat en un periodo, para analizar de qué preguntan o de qué se quejan. Puede filtrarse por asesor. Devuelve los más recientes primero (texto recortado y sin datos identificativos) y el total del periodo.',
+    input_schema: { type: 'object', properties: { dias: { type: 'integer', description: 'Últimos N días (por defecto 30, máximo 365)' }, asesor: { type: 'string', description: 'Opcional: nombre (o parte) del asesor' }, maximo: { type: 'integer', description: 'Máximo de mensajes (por defecto 150, máximo 300)' } } } },
+  { name: 'equipo', description: 'Personas del despacho que atienden clientes (las que puede ver quien pregunta): nombre, equipo y cuántos clientes y conversaciones pendientes tiene cada una.',
+    input_schema: { type: 'object', properties: {} } }
+];
+const sinAcentos = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const recorte = (t, n) => { t = String(t || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n) + '…' : t; };
+async function iaAlcance(req) {
+  // el «Ver» de la cabecera también vale aquí aunque la petición sea POST
+  return clientesPermitidos({ method: 'GET', get: n => req.get(n), asesor: req.asesor });
+}
+// Hilos (encargo + servicio) visibles, con sus mensajes (máx. un año)
+async function iaHilos(permitidos, filtroAsesor) {
+  const [ms] = await pool.query(
+    "SELECT m.id, m.propuesta_id, m.servicio, m.cliente_id, m.autor, m.texto, m.leido_en, m.creado_en, " +
+    "c.codigo, c.nombre AS c_nombre, c.apellidos AS c_apellidos, c.correo AS c_correo, c.numero_documento AS c_documento, q.nombre AS asesor " +
+    "FROM mensajes m JOIN clientes c ON c.id = m.cliente_id LEFT JOIN personas q ON q.id = c.asesor_persona_id " +
+    "WHERE m.retirado_en IS NULL AND m.creado_en >= UTC_TIMESTAMP() - INTERVAL 365 DAY ORDER BY m.creado_en, m.id LIMIT 20000");
+  const f = filtroAsesor ? sinAcentos(filtroAsesor) : '';
+  const hilos = new Map();
+  for (const m of ms) {
+    if (permitidos && !permitidos.has(m.cliente_id)) continue;
+    if (f && !sinAcentos(m.asesor).includes(f)) continue;
+    const k = m.propuesta_id + '|' + m.servicio;
+    if (!hilos.has(k)) hilos.set(k, { cliente_id: m.cliente_id, codigo: m.codigo || ('C' + m.cliente_id), asesor: m.asesor || 'sin asignar', servicio: m.servicio, cli: { nombre: m.c_nombre, apellidos: m.c_apellidos, correo: m.c_correo, numero_documento: m.c_documento }, mensajes: [] });
+    hilos.get(k).mensajes.push(m);
+  }
+  return [...hilos.values()];
+}
+const horasDesde = d => Math.round((Date.now() - new Date(d).getTime()) / 36e5);
+async function iaEjecutarHerramienta(nombre, entrada, req, usados) {
+  const permitidos = await iaAlcance(req), e = entrada || {};
+  const apunta = h => { usados.set(h.codigo, h.cliente_id); };
+  if (nombre === 'chats_esperando_respuesta' || nombre === 'clientes_sin_contestarnos') {
+    const hilos = await iaHilos(permitidos, e.asesor), filas = [];
+    for (const h of hilos) {
+      const ult = h.mensajes[h.mensajes.length - 1];
+      if (nombre === 'chats_esperando_respuesta' && ult.autor === 'cliente') {
+        let i = h.mensajes.length - 1; while (i > 0 && h.mensajes[i - 1].autor === 'cliente') i--;
+        filas.push({ codigo: h.codigo, asesor: h.asesor, servicio: h.servicio, esperando_desde: h.mensajes[i].creado_en, horas_esperando: horasDesde(h.mensajes[i].creado_en), mensajes_sin_contestar: h.mensajes.length - i, ultimo_mensaje: recorte(seudonimizarTexto(ult.texto, h.cli), 300) });
+      }
+      if (nombre === 'clientes_sin_contestarnos' && ult.autor === 'asesor') {
+        const dias = Math.floor(horasDesde(ult.creado_en) / 24);
+        if (e.dias_minimos && dias < Number(e.dias_minimos)) continue;
+        filas.push({ codigo: h.codigo, asesor: h.asesor, servicio: h.servicio, nuestro_ultimo_mensaje: ult.creado_en, dias_sin_contestar: dias, lo_ha_leido: !!ult.leido_en, extracto: recorte(seudonimizarTexto(ult.texto, h.cli), 200) });
+      }
+    }
+    filas.sort((a, b) => nombre === 'chats_esperando_respuesta' ? b.horas_esperando - a.horas_esperando : b.dias_sin_contestar - a.dias_sin_contestar);
+    const lim = Math.min(100, Math.max(1, Number(e.limite) || 30)), sel = filas.slice(0, lim);
+    sel.forEach(x => apunta(hilos.find(h => h.codigo === x.codigo)));
+    return { total: filas.length, mostrados: sel.length, ahora: new Date().toISOString(), resultados: sel };
+  }
+  if (nombre === 'mensajes_de_clientes') {
+    const dias = Math.min(365, Math.max(1, Number(e.dias) || 30)), max = Math.min(300, Math.max(1, Number(e.maximo) || 150));
+    const desde = Date.now() - dias * 864e5, lista = [];
+    for (const h of await iaHilos(permitidos, e.asesor)) h.mensajes.forEach(m => { if (m.autor === 'cliente' && new Date(m.creado_en).getTime() >= desde) lista.push({ h, m }); });
+    lista.sort((a, b) => new Date(b.m.creado_en) - new Date(a.m.creado_en));
+    const sel = lista.slice(0, max);
+    sel.forEach(x => apunta(x.h));
+    return { periodo_dias: dias, total: lista.length, mostrados: sel.length, mensajes: sel.map(x => ({ codigo: x.h.codigo, asesor: x.h.asesor, servicio: x.h.servicio, fecha: x.m.creado_en, texto: recorte(seudonimizarTexto(x.m.texto, x.h.cli), 400) })) };
+  }
+  if (nombre === 'equipo') {
+    const [ps] = await pool.query('SELECT q.id, q.nombre, e.nombre AS equipo FROM personas q LEFT JOIN equipos e ON e.id = q.equipo_id WHERE q.activa = 1 AND q.atiende_clientes = 1 ORDER BY q.nombre');
+    const [cs] = await pool.query('SELECT id, asesor_persona_id FROM clientes');
+    const hilos = await iaHilos(permitidos, null);
+    const res = ps.map(q => {
+      const suyos = cs.filter(c => c.asesor_persona_id === q.id && (!permitidos || permitidos.has(c.id)));
+      const pend = hilos.filter(h => h.asesor === q.nombre && h.mensajes[h.mensajes.length - 1].autor === 'cliente').length;
+      return { nombre: q.nombre, equipo: q.equipo || null, clientes: suyos.length, chats_esperando_respuesta: pend };
+    }).filter(x => !permitidos || x.clientes > 0);
+    return { personas: res };
+  }
+  return { error: 'Herramienta desconocida' };
+}
+const IA_ASISTENTE_CON_PANEL = 'Tienes herramientas para consultar el panel de Acros (chats y equipo). Úsalas cuando te pregunten por clientes, conversaciones o asesores; no te lo inventes. Los clientes aparecen con un código (por ejemplo LF19J6Z8XE): menciónalos siempre por ese código exacto, tal cual, sin añadir nombres; el panel lo cambiará por el nombre al enseñárselo a la persona. Solo ves los clientes que puede ver quien pregunta: si algo no aparece, puede ser por eso. Las fechas vienen en UTC; habla en hora de España.';
+const IA_ASISTENTE_LIMITE_HORA = 60;
+const iaAsistenteUso = new Map();   // asesor id → marcas de tiempo (última hora)
+app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
+  const motivo = await iaMotivoNo('asistente');
+  if (motivo) return res.status(503).json({ error: motivo, sin_ia: true });
+  const lista = Array.isArray(req.body && req.body.mensajes) ? req.body.mensajes : [];
+  const limpios = lista.slice(-20).map(m => ({ role: m && m.role === 'assistant' ? 'assistant' : 'user', content: String((m && m.content) || '').slice(0, 8000) })).filter(m => m.content.trim());
+  if (!limpios.length || limpios[limpios.length - 1].role !== 'user') return res.status(400).json({ error: 'Falta tu pregunta' });
+  while (limpios.length && limpios[0].role !== 'user') limpios.shift();   // la API exige empezar por el usuario
+  const yo = req.asesor && req.asesor.id, ahora = Date.now();
+  const marcas = (iaAsistenteUso.get(yo) || []).filter(t => ahora - t < 3600e3);
+  if (marcas.length >= IA_ASISTENTE_LIMITE_HORA) return res.status(429).json({ error: 'Has llegado al máximo de ' + IA_ASISTENTE_LIMITE_HORA + ' preguntas por hora. Prueba un poco más tarde.' });
+  marcas.push(ahora); iaAsistenteUso.set(yo, marcas);
+  // lo que escribe el equipo también pasa por el filtro (correos, DNI, IBAN, teléfonos, monederos)
+  const mensajes = limpios.map(m => m.role === 'user' ? { role: 'user', content: seudonimizarTexto(m.content, null) } : m);
+  const a = await iaAjustes();
+  const base = IA_SISTEMA_ASISTENTE + '\nHablas con: ' + ((req.asesor && req.asesor.nombre) || 'una persona del equipo') + '. Fecha de hoy: ' + new Date().toISOString().slice(0, 10) + '.\n';
+  const usados = new Map();   // código → id de cliente de lo que ha consultado (para poner nombres en el panel)
+  const conPanel = !!(req.asesor && req.asesor.roles && ['asesor', 'jefe', 'encargado', 'admin'].some(x => req.asesor.roles.has(x)));
+  const llamar = async conWeb => {
+    const sistema = iaSistemaCon(base + (conWeb ? IA_ASISTENTE_CON_WEB : IA_ASISTENTE_SIN_WEB) + (conPanel ? '\n' + IA_ASISTENTE_CON_PANEL : ''), a.conocimiento);
+    let conv = mensajes, textos = [], fuentes = [], busquedas = 0, consultas = [];
+    const herramientas = (conWeb ? [IA_HERRAMIENTA_WEB] : []).concat(conPanel ? IA_HERRAMIENTAS_PANEL : []);
+    // Vueltas: «pause_turn» (búsquedas largas) o «tool_use» (consultas al panel). Máx. 8.
+    for (let vuelta = 0; vuelta < 8; vuelta++) {
+      const r = await iaLlamar({ funcion: 'asistente', modelo: IA_MODELO_ASISTENTE, sistema, mensajes: conv, maxTokens: 1500, personaId: yo, clienteId: null, herramientas: herramientas.length ? herramientas : null, completo: true });
+      const parada = r.cuerpo.stop_reason;
+      if (parada !== 'tool_use') textos.push((r.cuerpo.content || []).filter(b => b.type === 'text').map(b => b.text).join(''));   // sin recortar: tras una pausa el texto continúa
+      fuentes = fuentes.concat(iaFuentes(r.cuerpo)); busquedas += r.busquedas;
+      if (parada === 'pause_turn') { conv = conv.concat([{ role: 'assistant', content: r.cuerpo.content }]); continue; }
+      if (parada !== 'tool_use') break;
+      const resultados = [];
+      for (const b of (r.cuerpo.content || []).filter(x => x.type === 'tool_use')) {
+        let salida;
+        try { salida = await iaEjecutarHerramienta(b.name, b.input, req, usados); consultas.push(b.name); }
+        catch (err) { console.error('Herramienta IA', b.name, err.message); salida = { error: 'No se pudo consultar: ' + err.message }; }
+        resultados.push({ type: 'tool_result', tool_use_id: b.id, content: JSON.stringify(salida).slice(0, 60000) });
+      }
+      conv = conv.concat([{ role: 'assistant', content: r.cuerpo.content }, { role: 'user', content: resultados }]);
+    }
+    const unicas = []; fuentes.forEach(f => { if (!unicas.some(x => x.url === f.url)) unicas.push(f); });
+    return { texto: textos.join('').trim(), fuentes: unicas.slice(0, 8), busquedas, consultas };
+  };
+  try {
+    let r, sinWeb = false;
+    if (a.web) {
+      try { r = await llamar(true); }
+      catch (e) {
+        // Si la organización no tiene activada la búsqueda web, se responde sin ella (y se avisa)
+        if (!/web.?search|tool|server_tool/i.test(String(e.message || ''))) throw e;
+        sinWeb = true; r = await llamar(false);
+      }
+    } else r = await llamar(false);
+    if (!r.texto) return res.status(503).json({ error: 'La IA no ha devuelto nada. Prueba otra vez.', sin_ia: true });
+    // Nombres de los clientes que salen en la respuesta (solo para el panel; a la IA no le han llegado)
+    const clientes = {};
+    const codigos = [...usados.keys()].filter(c => r.texto.includes(c));
+    if (codigos.length) {
+      const [cs] = await pool.query('SELECT id, codigo, nombre, apellidos, correo FROM clientes WHERE id IN (?)', [codigos.map(c => usados.get(c))]);
+      cs.forEach(c => { const cod = c.codigo || ('C' + c.id); clientes[cod] = { id: c.id, nombre: [c.nombre, c.apellidos].filter(Boolean).join(' ') || c.correo }; });
+    }
+    res.json({ texto: r.texto, fuentes: r.fuentes, busquedas: r.busquedas, consultas: r.consultas, clientes, sin_web: sinWeb || undefined });
+  } catch (e) {
+    const det = req.asesor && req.asesor.esAdmin && e.message && e.message !== e.publico ? ' (Motivo: ' + String(e.message).slice(0, 160) + ')' : '';
+    res.status(503).json({ error: (e.publico || 'La IA no está disponible ahora mismo.') + det, sin_ia: true });
+  }
+});
+
 // El cliente pidió que no se use IA en su caso (lo marca su asesor).
 app.put('/api/admin/clientes/:id/sin-ia', requiereSesionAsesor, async (req, res) => {
   const id = Number(req.params.id);
@@ -4921,8 +5128,12 @@ app.post('/api/admin/propuestas/:id/ia-borrador', requiereSesionAsesor, async (r
     ].join('\n');
     let texto;
     try {
-      texto = await iaLlamar({ funcion: 'borrador', modelo: IA_MODELO_BORRADOR, sistema: IA_SISTEMA_BORRADOR, mensajes: [{ role: 'user', content: contexto }], maxTokens: 700, personaId: req.asesor && req.asesor.id, clienteId: p.cliente_id });
-    } catch (e) { return res.status(503).json({ error: e.publico || 'La IA no está disponible ahora mismo.', sin_ia: true }); }
+      texto = await iaLlamar({ funcion: 'borrador', modelo: IA_MODELO_BORRADOR, sistema: iaSistemaCon(IA_SISTEMA_BORRADOR, (await iaAjustes()).conocimiento), mensajes: [{ role: 'user', content: contexto }], maxTokens: 700, personaId: req.asesor && req.asesor.id, clienteId: p.cliente_id });
+    } catch (e) {
+      // 19/10: a los administradores se les dice también el motivo técnico (clave, permisos, modelo…)
+      const det = req.asesor && req.asesor.esAdmin && e.message && e.message !== e.publico ? ' (Motivo: ' + String(e.message).slice(0, 160) + ')' : '';
+      return res.status(503).json({ error: (e.publico || 'La IA no está disponible ahora mismo.') + det, sin_ia: true });
+    }
     if (!texto) return res.status(503).json({ error: 'La IA no ha devuelto nada. Prueba otra vez.', sin_ia: true });
     res.json({ texto: textoMensaje(texto) || texto.slice(0, 4000), servicio });
   } finally {
