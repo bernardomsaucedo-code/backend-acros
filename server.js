@@ -906,6 +906,73 @@ async function asegurarEsquema() {
       await creaIndiceSiFalta('idx_ia_uso_fecha ON ia_uso (`creado_en`)');
       await agregaColumnaSiFalta('clientes', '`sin_ia`', 'TINYINT(1) NOT NULL DEFAULT 0');
 
+      // --- Servicios por ejercicio, plazos y cierre a dos bandas (20/10, ACROS 7 · fase 1) ---
+      await agregaColumnaSiFalta('propuestas', '`servicios_detalle`', 'TEXT NULL');   // ejercicios que indicó el asesor al enviar la propuesta
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS servicios_cliente (' +
+        ' `id`               INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `cliente_id`       INT          NOT NULL,' +
+        ' `propuesta_id`     INT          NOT NULL,' +
+        ' `servicio`         VARCHAR(50)  NOT NULL,' +   // id en la propuesta: enlaza con documentos, mensajes y entregas
+        ' `tipo`             VARCHAR(40)  NOT NULL,' +
+        ' `ejercicio_desde`  SMALLINT     NOT NULL,' +
+        ' `ejercicio_hasta`  SMALLINT     NOT NULL,' +
+        ' `clave`            VARCHAR(80)  NOT NULL,' +   // tipo-ejercicio (renta-2025), única por cliente
+        ' `plazo_propio`     DATE         NULL,' +       // solo si se editó a mano; si no, se calcula
+        ' `ventana_propia`   SMALLINT     NULL,' +
+        ' `presentado_en`    DATE         NULL,' +
+        " `estado`           ENUM('abierto','por_confirmar','terminado','cerrado_sin_respuesta') NOT NULL DEFAULT 'abierto'," +
+        ' `propuesto_en`     DATETIME     NULL,' +
+        ' `propuesto_por`    INT          NULL,' +
+        ' `cerrado_en`       DATETIME     NULL,' +
+        ' `cerrado_por`      INT          NULL,' +
+        " `cierre_via`       ENUM('cliente','informe','asesor') NULL," +
+        " `ejercicio_origen` ENUM('asesor','defecto','migracion') NOT NULL DEFAULT 'defecto'," +
+        ' `confirmado`       TINYINT(1)   NOT NULL DEFAULT 1,' +   // 0 = deducido en la migración, pendiente de confirmar
+        ' `deduccion`        VARCHAR(300) NULL,' +
+        ' `confianza`        VARCHAR(10)  NULL,' +
+        ' `creado_en`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' `actualizado_en`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,' +
+        ' UNIQUE KEY `uq_servicio_propuesta` (`propuesta_id`, `servicio`),' +
+        ' UNIQUE KEY `uq_servicio_clave` (`cliente_id`, `clave`),' +
+        ' KEY `idx_servicios_estado` (`estado`, `confirmado`),' +
+        ' FOREIGN KEY (`cliente_id`) REFERENCES clientes(`id`),' +
+        ' FOREIGN KEY (`propuesta_id`) REFERENCES propuestas(`id`))'
+      );
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS plazos_defecto (' +
+        ' `tipo`           VARCHAR(40) NOT NULL,' +
+        ' `ejercicio`      SMALLINT    NOT NULL,' +
+        ' `plazo`          DATE        NULL,' +
+        ' `ventana_dias`   SMALLINT    NULL,' +
+        ' `actualizado_por` INT        NULL,' +
+        ' `actualizado_en` DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,' +
+        ' PRIMARY KEY (`tipo`, `ejercicio`))'
+      );
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS servicios_historial (' +
+        ' `id`          INT AUTO_INCREMENT PRIMARY KEY,' +
+        ' `servicio_id` INT          NOT NULL,' +
+        " `evento`      VARCHAR(40)  NOT NULL," +
+        " `autor`       ENUM('asesor','cliente','sistema') NOT NULL," +
+        ' `asesor_id`   INT          NULL,' +
+        ' `detalle`     VARCHAR(300) NULL,' +
+        ' `creado_en`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' KEY `idx_servicios_historial` (`servicio_id`, `creado_en`))'
+      );
+      await pool.execute(
+        'CREATE TABLE IF NOT EXISTS recordatorios_cliente (' +
+        ' `id`         INT AUTO_INCREMENT PRIMARY KEY,' +
+        " `tipo`       VARCHAR(12) NOT NULL," +
+        ' `objeto_id`  INT         NOT NULL,' +
+        ' `cliente_id` INT         NOT NULL,' +
+        ' `asesor_id`  INT         NULL,' +
+        ' `creado_en`  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+        ' KEY `idx_recordatorios` (`tipo`, `objeto_id`, `creado_en`))'
+      );
+      // Los encargos aceptados antes de esto pasan a servicios con el ejercicio deducido (sin confirmar)
+      try { await migrarServiciosExistentes(); } catch (err) { console.error('Migración de servicios:', err.message); }
+
       console.log('Todas las tablas están listas (llamada, presupuesto, propuestas, pagos, diligencias, acceso, documentos fiscales, asesores, sesiones de cliente, empresas, web pública, mensajes, copias, entregas).');
       return;
     } catch (err) {
@@ -1295,6 +1362,7 @@ app.post('/api/admin/clientes/:id/fusionar', requiereSesionAsesor, requiereAdmin
       catch (err) { return res.status(500).json({ error: 'No se ha fusionado: la copia de seguridad previa ha fallado (' + err.message + ')' }); }
     }
     await conn.beginTransaction();
+    await moverServiciosDeCliente(conn, duplicado, principal);   // 20/10: con clave nueva si chocan
     for (const t of ['propuestas', 'diligencias', 'documentos_fiscales', 'mensajes', 'entregas', 'valoraciones', 'cambios_asesor', 'sesiones_cliente', 'tokens_acceso', 'sugerencias', 'actividad']) {
       await conn.execute(`UPDATE ${t} SET cliente_id = ? WHERE cliente_id = ?`, [principal, duplicado]).catch(() => {});
     }
@@ -1688,6 +1756,7 @@ async function permisoCliente(req, res, next) {
     else if ((m = ruta.match(/^\/api\/admin\/propuestas\/(\d+)/))) clienteId = await clienteDePropuestaId(m[1]);
     else if ((m = ruta.match(/^\/api\/admin\/documentos\/(\d+)/))) clienteId = await clienteDeObjeto('documentos_fiscales', m[1]);
     else if ((m = ruta.match(/^\/api\/admin\/entregas\/(\d+)/))) clienteId = await clienteDeObjeto('entregas', m[1]);
+    else if ((m = ruta.match(/^\/api\/admin\/servicios\/(\d+)/))) clienteId = await clienteDeObjeto('servicios_cliente', m[1]);
     else if ((m = ruta.match(/^\/api\/admin\/mensajes\/(\d+)/))) clienteId = await clienteDeObjeto('mensajes', m[1]);
     else if ((m = ruta.match(/^\/api\/admin\/diligencias\/(\d+)/))) clienteId = await clienteDeObjeto('diligencias', m[1]);
     else if ((m = ruta.match(/^\/api\/admin\/pagos\/(\d+)/))) { const [f] = await pool.execute('SELECT p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(m[1])]); clienteId = f.length ? f[0].cliente_id : null; }
@@ -1703,7 +1772,7 @@ async function permisoCliente(req, res, next) {
   } catch (err) { next(err); }
 }
 // Registro de actividad: todo lo que un asesor cambia desde el panel
-const RESUMEN_CLAVES = ['cliente', 'metodo', 'decision', 'razon', 'nombre', 'servicio', 'estado', 'accion', 'importe_centimos', 'activo', 'persona_id', 'correo', 'motivo', 'canal', 'tipo', 'urgente', 'respuesta'];
+const RESUMEN_CLAVES = ['cliente', 'metodo', 'decision', 'razon', 'nombre', 'servicio', 'estado', 'accion', 'importe_centimos', 'activo', 'persona_id', 'correo', 'motivo', 'canal', 'tipo', 'urgente', 'respuesta', 'plazo', 'ejercicio_desde', 'ejercicio_hasta', 'presentado_en', 'ventana_dias'];
 function registrarActividad(req, status) {
   // 14/10: además de los cambios, cada descarga de un documento, del DNI, de un
   // informe o de una copia de la base de datos queda registrada
@@ -1720,6 +1789,7 @@ function registrarActividad(req, status) {
       else if ((m = req.path.match(/^\/api\/admin\/propuestas\/(\d+)/))) clienteId = await clienteDePropuestaId(m[1]);
       else if ((m = req.path.match(/^\/api\/admin\/documentos\/(\d+)/))) clienteId = await clienteDeObjeto('documentos_fiscales', m[1]);
       else if ((m = req.path.match(/^\/api\/admin\/entregas\/(\d+)/))) clienteId = await clienteDeObjeto('entregas', m[1]);
+      else if ((m = req.path.match(/^\/api\/admin\/servicios\/(\d+)/))) clienteId = await clienteDeObjeto('servicios_cliente', m[1]);
       else if ((m = req.path.match(/^\/api\/admin\/diligencias\/(\d+)/))) clienteId = await clienteDeObjeto('diligencias', m[1]);
       else if ((m = req.path.match(/^\/api\/admin\/pagos\/(\d+)/))) { const [f] = await pool.execute('SELECT p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(m[1])]); clienteId = f.length ? f[0].cliente_id : null; }
       else if (req.path === '/api/admin/documentos' && req.body) clienteId = await clienteDePropuestaId(req.body.propuesta_id);
@@ -2965,6 +3035,9 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
   if (!correo || !normalizado) {
     return res.status(400).json({ error: 'Faltan datos: correo, y servicios — o bien un array de ids + importe_centimos, o bien un array de {id, precio_centimos} con el desglose' });
   }
+  // 20/10: ejercicio (o rango) y plazo por servicio, opcionales: { renta: 2025, pganterior: { desde: 2021, hasta: 2024 } }
+  const ejerciciosN = normalizarEjerciciosPropuesta(req.body.ejercicios, serviciosDePropuesta({ servicios: JSON.stringify(normalizado.servicios) }));
+  if (ejerciciosN.error) return res.status(400).json({ error: ejerciciosN.error });
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -2981,8 +3054,8 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     const token = generarToken();
     const expira = finValidezPropuesta();
     const [r] = await conn.execute(
-      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id) VALUES (?, ?, ?, ?, ?, ?)',
-      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id]
+      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id, servicios_detalle) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id, ejerciciosN.detalle ? JSON.stringify(ejerciciosN.detalle) : null]
     );
     await conn.commit();
     if (brevoActivo()) {
@@ -3152,6 +3225,8 @@ app.post('/api/propuestas/:token/aceptar', async (req, res) => {
     // acaben los 14 días de desistimiento). Se guarda cuándo lo marcó.
     if (!(req.body && req.body.inicio_inmediato === true)) return res.status(400).json({ error: 'Para aceptar, marca la casilla de inicio inmediato del servicio' });
     await conn.execute('UPDATE propuestas SET estado = ?, `inicio_inmediato_en` = NOW() WHERE id = ?', ['aceptada', p.id]);
+    // 20/10: cada servicio contratado pasa a tener su ejercicio, plazo y estado (si falla, se completa al reiniciar)
+    await crearServiciosDePropuesta(conn, p).catch(err => console.error('Servicios del encargo ' + p.id + ':', err.message));
     avisarCliente(p.cliente_id, '✅', 'un cliente ha aceptado su propuesta', 'El siguiente paso es su pago.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'aceptada' });
   } finally {
@@ -3785,7 +3860,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
       [pagos] = await conn.query('SELECT id, propuesta_id, metodo, estado, creado_en FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [diligencias] = await conn.query('SELECT id, propuesta_id, estado, coherencia, nota_asesor, resuelto_en, creado_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [documentos] = await conn.query(
-        `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en
+        `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en, nombre_original
          FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en`, [ids]);
       [entregasF] = await conn.query('SELECT `id`, `propuesta_id`, `servicio`, `version`, `nombre_archivo`, `bytes`, `subido_en`, `estado`, `comentario`, `respondido_en` FROM entregas WHERE `propuesta_id` IN (?) ORDER BY `servicio`, `version` DESC', [ids]);
     }
@@ -3806,6 +3881,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
         entregas: entregasF.filter(x => x.propuesta_id === p.id),
       })),
       solicitudes,
+      servicios: await listarServiciosCliente(conn, id),
       colaboraciones: (await conn.query('SELECT co.*, q.nombre AS persona_nombre, a.nombre AS anotado_nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id LEFT JOIN asesores a ON a.id = co.anotado_por WHERE co.propuesta_id IN (SELECT id FROM propuestas WHERE cliente_id = ?) ORDER BY co.id', [id]))[0],
       cambios_asesor: (await conn.execute('SELECT ca.*, qd.nombre AS desde_nombre, qa.nombre AS a_nombre FROM cambios_asesor ca LEFT JOIN personas qd ON qd.id = ca.desde_persona_id LEFT JOIN personas qa ON qa.id = ca.a_persona_id WHERE ca.cliente_id = ? ORDER BY ca.id DESC LIMIT 10', [id]))[0],
     });
@@ -4493,16 +4569,66 @@ app.put('/api/admin/web/:clave', requiereSesionAsesor, requiereRol('marketing'),
     conn.release();
   }
 });
+// ================================================================
+// Historial de la web pública: qué cambió en cada versión (20/10)
+// El panel pintaba solo versión, fecha y autor, y el resumen salía vacío
+// hasta pulsar «Ver» (que enseñaba la versión entera, no lo que cambió). Ahora
+// cada versión llega con la lista de cambios respecto a la anterior, ya
+// estructurada (el panel pone las palabras y los nombres de servicio).
+// ================================================================
+function cambiosWeb(clave, antes, despues) {
+  const a = antes && typeof antes === 'object' ? antes : {}, d = despues && typeof despues === 'object' ? despues : {};
+  const cambios = [];
+  const igual = (x, y) => JSON.stringify(x === undefined ? null : x) === JSON.stringify(y === undefined ? null : y);
+  if (clave === 'marca') {
+    const la = a.logo || null, ld = d.logo || null;
+    if (la !== ld) cambios.push({ k: !la ? 'logo_pone' : !ld ? 'logo_quita' : 'logo_cambia' });
+    const idDe = p => (p && p.persona_id) ? 'p' + p.persona_id : 'n' + (p && p.nombre);
+    const ea = new Map((a.equipo || []).map(p => [idDe(p), p])), ed = new Map((d.equipo || []).map(p => [idDe(p), p]));
+    for (const [k, p] of ed) if (!ea.has(k)) cambios.push({ k: 'equipo_alta', nombre: p.nombre });
+    for (const [k, p] of ea) if (!ed.has(k)) cambios.push({ k: 'equipo_baja', nombre: p.nombre });
+    for (const [k, p] of ed) {
+      if (!ea.has(k)) continue;
+      const q = ea.get(k), campos = [];
+      if (p.nombre !== q.nombre) campos.push('nombre');
+      if ((p.foto || null) !== (q.foto || null)) campos.push('foto');
+      if (!igual(p.puesto, q.puesto)) campos.push('puesto');
+      if (!igual(p.bio, q.bio)) campos.push('bio');
+      if (campos.length) cambios.push({ k: 'equipo_edita', nombre: p.nombre, campos });
+    }
+    const comunes = [...ed.keys()].filter(k => ea.has(k)), ordenAntes = [...ea.keys()].filter(k => ed.has(k));
+    if (!igual(comunes, ordenAntes)) cambios.push({ k: 'equipo_orden' });
+    if (!igual(a.equipo_titulo, d.equipo_titulo) || !igual(a.equipo_subtitulo, d.equipo_subtitulo)) cambios.push({ k: 'equipo_textos' });
+  } else {
+    const da = new Set(a.destacados || []), dd = new Set(d.destacados || []);
+    for (const id of dd) if (!da.has(id)) cambios.push({ k: 'dest_alta', id });
+    for (const id of da) if (!dd.has(id)) cambios.push({ k: 'dest_baja', id });
+    const oa = a.ofertas || {}, od = d.ofertas || {};
+    for (const id of Object.keys(od)) {
+      if (!oa[id]) cambios.push({ k: 'oferta_alta', id, descuento: od[id].descuento, fin: od[id].fin });
+      else if (oa[id].descuento !== od[id].descuento || oa[id].fin !== od[id].fin) cambios.push({ k: 'oferta_cambia', id, antes: { descuento: oa[id].descuento, fin: oa[id].fin }, despues: { descuento: od[id].descuento, fin: od[id].fin } });
+    }
+    for (const id of Object.keys(oa)) if (!od[id]) cambios.push({ k: 'oferta_baja', id });
+  }
+  return cambios.length ? cambios : [{ k: 'sin_cambios' }];
+}
+
 app.get('/api/admin/web/:clave/historial', requiereSesionAsesor, requiereRol('marketing'), async (req, res) => {
   if (!CLAVES_WEB.includes(req.params.clave)) return res.status(404).json({ error: 'Bloque desconocido' });
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT h.version, h.guardado_en, a.nombre AS guardado_por
+      `SELECT h.version, h.guardado_en, h.datos, a.nombre AS guardado_por
        FROM web_contenido_historial h LEFT JOIN asesores a ON a.id = h.guardado_por_asesor_id
        WHERE h.clave = ? ORDER BY h.version DESC`, [req.params.clave]
     );
-    res.json(filas);
+    const leer = t => { try { return JSON.parse(t); } catch (e) { return null; } };
+    // Cada versión se compara con la inmediatamente anterior; si esa ya se podó (solo se guardan 30), no hay con qué comparar
+    res.json(filas.map((f, i) => {
+      const previa = filas[i + 1];
+      const cambios = f.version === 1 ? [{ k: 'inicial' }] : (previa && previa.version === f.version - 1) ? cambiosWeb(req.params.clave, leer(previa.datos), leer(f.datos)) : null;
+      return { version: f.version, guardado_en: f.guardado_en, guardado_por: f.guardado_por, cambios };
+    }));
   } finally {
     conn.release();
   }
@@ -5477,7 +5603,9 @@ async function encargoTerminado(conn, p) {
   const servicios = serviciosDePropuesta(p);
   if (!servicios.length) return false;
   const [ult] = await conn.execute('SELECT e.`servicio`, e.`estado` FROM entregas e WHERE e.`propuesta_id` = ? AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`)', [p.id]);
-  return servicios.every(sv => ult.some(u => u.servicio === sv && u.estado === 'conforme'));
+  // 20/10: un servicio también está terminado si el cliente lo confirmó («Sí, terminado») sin informe de por medio
+  const [cerr] = await conn.execute("SELECT `servicio` FROM servicios_cliente WHERE `propuesta_id` = ? AND `estado` = 'terminado'", [p.id]);
+  return servicios.every(sv => ult.some(u => u.servicio === sv && u.estado === 'conforme') || cerr.some(c => c.servicio === sv));
 }
 app.post('/api/propuestas/:token/valoracion', async (req, res) => {
   const b = req.body || {};
@@ -5662,6 +5790,7 @@ app.post('/api/propuestas/:token/entregas/:id/conformidad', async (req, res) => 
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
     await conn.execute("UPDATE entregas SET `estado` = 'conforme', `respondido_en` = NOW() WHERE `id` = ?", [r.e.id]);
+    await cerrarServicioPorInforme(conn, r.p, r.e.servicio).catch(err => console.error('Cierre del servicio por informe:', err.message));
     avisarCliente(r.e.cliente_id, '✅', 'un cliente ha dado su conformidad a su informe', 'Ese servicio queda terminado.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'conforme' });
   } finally { conn.release(); }
@@ -5674,6 +5803,7 @@ app.post('/api/propuestas/:token/entregas/:id/cambios', async (req, res) => {
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
     await conn.execute("UPDATE entregas SET `estado` = 'cambios', `comentario` = ?, `respondido_en` = NOW() WHERE `id` = ?", [comentario, r.e.id]);
+    await reabrirServicioPorCambios(conn, r.p, r.e.servicio).catch(err => console.error('Reapertura del servicio por cambios:', err.message));
     // El comentario va también al chat de ese servicio, para hablarlo ahí
     await conn.execute("INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, texto) VALUES (?, ?, ?, 'cliente', ?)",
       [r.p.id, r.p.cliente_id, r.e.servicio, 'Sobre el informe entregado (versión ' + r.e.version + '): ' + comentario]);
@@ -6024,6 +6154,654 @@ app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
   if (q.length && q[0].ntfy_topic !== NTFY_TOPIC) await avisarEn(q[0].ntfy_topic, '🔔 Aviso de prueba · tu canal', 'Si ves esto, te llegan los avisos de tus clientes.', { etiqueta: 'tada' });
   res.json({ ok: true, canal_admin: !!NTFY_TOPIC_ADMIN, canal_propio: !!q.length });
 });
+
+// ================================================================
+// SERVICIOS: EJERCICIO, PLAZOS Y CIERRE A DOS BANDAS (20/10, ACROS 7 · fase 1)
+// Cada servicio contratado es ahora una fila propia (servicios_cliente) con
+// su tipo, su ejercicio fiscal (o rango) y su estado. La clave interna es
+// «tipo-ejercicio» (renta-2025), única por cliente; el nombre visible se
+// genera a partir de ella. El plazo y la ventana de urgencia NO se guardan
+// salvo que se editen a mano: se calculan al leer (por servicio → ajuste
+// anual del panel → valor por defecto del tipo), así un cambio del ajuste
+// anual alcanza a lo que sigue abierto.
+//   Estados: abierto → (asesor «Dar por terminado») por_confirmar →
+//   terminado (cliente «Sí, terminado», o su conformidad al informe) |
+//   cerrado_sin_respuesta (el asesor, a los 15 días). «Tengo algo
+//   pendiente» (o pedir cambios en el informe) lo devuelve a abierto.
+//   Un servicio NUNCA se cierra por plazo: vencer solo lo marca.
+// El enlace con documentos, mensajes y entregas sigue siendo
+// propuesta_id + servicio (el id de la propuesta, p. ej. 'pg2025').
+// ================================================================
+const DIAS_CIERRE_SIN_RESPUESTA = 15;
+const ANIO_MINIMO_EJERCICIO = 2009;
+const AVISO_PLAZO_VENTANA_GENERAL = 10;   // días de urgencia si el tipo no dice otra cosa
+const TIPOS_SERVICIO = {
+  pyg:            { legacy: 'pg2025',     rango: false, nombre: { es: a => `Informe de pérdidas y ganancias ${a}`, en: a => `Gains and losses report ${a}` } },
+  pyg_anteriores: { legacy: 'pganterior', rango: true,  nombre: { es: a => `Informe de pérdidas y ganancias ${a}`, en: a => `Gains and losses report ${a}` } },
+  origen:         { legacy: 'origen',     rango: true,  sinAnio: true, nombre: { es: () => 'Origen de fondos', en: () => 'Source of funds' } },
+  certificado:    { legacy: 'certificado', rango: true, sinAnio: true, nombre: { es: () => 'Certificado de valoración', en: () => 'Valuation certificate' } },
+  nft:            { legacy: 'nft',        rango: true,  sinAnio: true, nombre: { es: () => 'Operaciones con NFT', en: () => 'NFT transactions' } },
+  renta:          { legacy: 'renta',      rango: false, plazo: { mes: 6, dia: 30, sig: 1 }, ventana: 10, nombre: { es: a => `Declaración de la Renta ${a}`, en: a => `${a} income tax return` } },
+  m714:           { legacy: 'm714',       rango: false, plazo: { mes: 6, dia: 30, sig: 1 }, ventana: 10, nombre: { es: a => `Modelo 714 (${a})`, en: a => `Form 714 (${a})` } },
+  m720:           { legacy: 'm720',       rango: false, plazo: { mes: 3, dia: 31, sig: 1 }, ventana: 10, nombre: { es: a => `Modelo 720 (${a})`, en: a => `Form 720 (${a})` } },
+  m721:           { legacy: 'm721',       rango: false, plazo: { mes: 3, dia: 31, sig: 1 }, ventana: 10, nombre: { es: a => `Modelo 721 (${a})`, en: a => `Form 721 (${a})` } },
+  requerimiento:  { legacy: 'requerimiento', rango: true, ventana: 5, nombre: { es: a => `Requerimiento de Hacienda (${a})`, en: a => `Tax office request (${a})` } },   // el plazo es el de la carta: se pone a mano
+  acompanamiento: { legacy: 'acompanamiento', rango: true, sinAnio: true, nombre: { es: () => 'Acompañamiento fiscal', en: () => 'Tax support' } },
+  optimizacion:   { legacy: 'optimizacion', rango: false, plazo: { mes: 12, dia: 31, sig: 0 }, ventana: 16, nombre: { es: a => `Optimización fin de año ${a}`, en: a => `Year-end optimisation ${a}` } },   // urgente desde el 15/12
+};
+const TIPOS_ANIO_AMBIGUO = new Set(['renta', 'm714', 'm720', 'm721', 'pyg', 'pyg_anteriores', 'requerimiento']);   // su ejercicio, deducido, se enseña a revisar
+
+// --- Fechas (todo en texto AAAA-MM-DD; sin zonas horarias de por medio) ---
+const FECHA_ISO_SERV = /^\d{4}-\d{2}-\d{2}$/;
+function fechaISOValida(s) {
+  if (typeof s !== 'string' || !FECHA_ISO_SERV.test(s)) return false;
+  const d = new Date(s + 'T12:00:00Z');
+  return !isNaN(d) && d.toISOString().slice(0, 10) === s;
+}
+const diasEntreISO = (aISO, bISO) => Math.round((Date.parse(aISO + 'T12:00:00Z') - Date.parse(bISO + 'T12:00:00Z')) / 864e5);
+const sumaDiasISO = (iso, n) => new Date(Date.parse(iso + 'T12:00:00Z') + n * 864e5).toISOString().slice(0, 10);
+const fechaES = iso => iso ? iso.slice(8, 10) + '/' + iso.slice(5, 7) + '/' + iso.slice(0, 4) : '';
+const hoyMadridISO = () => fechaMadrid().fecha;
+function anioValido(n) { return Number.isInteger(n) && n >= ANIO_MINIMO_EJERCICIO && n <= Number(hoyMadridISO().slice(0, 4)) + 1; }
+
+// --- Tipo, ejercicio y plazo por defecto ---
+function tipoDeServicio(id) {
+  const s = String(id);
+  for (const [t, d] of Object.entries(TIPOS_SERVICIO)) if (d.legacy === s || t === s) return t;
+  return s.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'otro';
+}
+// Ejercicio que se asume si el asesor no lo ha indicado: el de la próxima
+// presentación por vencer (si la fecha está dentro del plazo de la campaña,
+// el ejercicio anterior; si ya pasó, el actual). Siempre se enseña a revisar.
+function ejercicioPorDefecto(tipo, fechaISO) {
+  const anio = Number(fechaISO.slice(0, 4)), md = fechaISO.slice(5);
+  switch (tipo) {
+    case 'renta': case 'm714': case 'pyg': return md <= '06-30' ? anio - 1 : anio;
+    case 'm720': case 'm721': return md <= '03-31' ? anio - 1 : anio;
+    case 'pyg_anteriores': case 'requerimiento': return anio - 1;
+    default: return anio;
+  }
+}
+function textoDeduccion(tipo, fechaISO, ejercicio) {
+  const anio = Number(fechaISO.slice(0, 4)), base = 'Encargo del ' + fechaES(fechaISO) + ': ';
+  if (['renta', 'm714', 'm720', 'm721', 'pyg'].includes(tipo)) {
+    return base + (ejercicio === anio - 1 ? 'dentro de la campaña, se asume el ejercicio anterior (' + ejercicio + ')' : 'pasado el plazo de la campaña, se asume el ejercicio en curso (' + ejercicio + ')');
+  }
+  if (tipo === 'pyg_anteriores' || tipo === 'requerimiento') return base + 'se asume el ejercicio anterior (' + ejercicio + '); indica el rango o el año real';
+  return 'Año de referencia: el del encargo (' + ejercicio + ')';
+}
+function plazoPorDefectoDeTipo(tipo, ejercicioHasta) {
+  const d = TIPOS_SERVICIO[tipo];
+  if (!d || !d.plazo) return null;
+  return `${ejercicioHasta + d.plazo.sig}-${String(d.plazo.mes).padStart(2, '0')}-${String(d.plazo.dia).padStart(2, '0')}`;
+}
+function validarEjercicio(tipo, desdeIn, hastaIn) {
+  const def = TIPOS_SERVICIO[tipo];
+  const desde = Number(desdeIn), hasta = (hastaIn === undefined || hastaIn === null || hastaIn === '') ? desde : Number(hastaIn);
+  if (!anioValido(desde) || !anioValido(hasta)) return { error: 'El ejercicio debe ser un año entre ' + ANIO_MINIMO_EJERCICIO + ' y ' + (Number(hoyMadridISO().slice(0, 4)) + 1) };
+  if (hasta < desde) return { error: 'El ejercicio final no puede ser anterior al inicial' };
+  if (hasta !== desde && !(def && def.rango)) return { error: 'Este servicio es de un único ejercicio' };
+  return { desde, hasta };
+}
+const etiquetaEjercicio = (desde, hasta) => desde === hasta ? String(hasta) : `${desde}–${hasta}`;
+function nombreServicio(f, idioma, duplicado) {
+  const def = TIPOS_SERVICIO[f.tipo];
+  if (!def) return f.servicio;
+  const a = etiquetaEjercicio(f.ejercicio_desde, f.ejercicio_hasta);
+  let n = def.nombre[idioma](a);
+  if (def.sinAnio && duplicado) n += ` (${a})`;   // dos del mismo tipo: se distinguen por el año
+  return n;
+}
+
+// --- Claves internas, únicas por cliente ---
+async function claveUnica(conn, clienteId, tipo, desde, hasta, excluirId) {
+  const base = `${tipo}-${desde}` + (hasta !== desde ? `-${hasta}` : '');
+  for (let n = 1; n < 200; n++) {
+    const clave = n === 1 ? base : `${base}-${n}`;
+    const [f] = await conn.execute('SELECT id FROM servicios_cliente WHERE cliente_id = ? AND clave = ? AND id <> ?', [clienteId, clave, excluirId || 0]);
+    if (!f.length) return clave;
+  }
+  throw new Error('No se pudo generar una clave de servicio única');
+}
+async function apuntarServicio(conn, servicioId, evento, autor, asesorId, detalle) {
+  await conn.execute('INSERT INTO servicios_historial (servicio_id, evento, autor, asesor_id, detalle) VALUES (?, ?, ?, ?, ?)',
+    [servicioId, evento, autor, asesorId || null, detalle ? String(detalle).slice(0, 300) : null]).catch(err => console.error('Historial de servicio:', err.message));
+}
+
+// --- Alta de las filas de servicio de un encargo (idempotente) ---
+// Nativo (al aceptar la propuesta): ejercicio del asesor o, si no lo indicó,
+// el que corresponde por la fecha de hoy. Migración (encargos anteriores a
+// esta función): ejercicio deducido de la fecha del encargo, SIN confirmar:
+// no se usa hasta que un administrador lo confirma.
+async function crearServiciosDePropuesta(conn, p, { migracion = false } = {}) {
+  const ids = [...new Set(serviciosDePropuesta(p))];
+  if (!ids.length) return 0;
+  const [ya] = await conn.execute('SELECT servicio FROM servicios_cliente WHERE propuesta_id = ?', [p.id]);
+  const existentes = new Set(ya.map(x => x.servicio));
+  let detalle = {}; try { detalle = JSON.parse(p.servicios_detalle || '{}') || {}; } catch (e) { detalle = {}; }
+  const refISO = migracion ? fechaMadrid(new Date(p.creado_en)).fecha : hoyMadridISO();
+  let creados = 0;
+  for (const id of ids) {
+    if (existentes.has(id)) continue;
+    const tipo = tipoDeServicio(id);
+    const d = detalle[id];
+    let desde, hasta, origen, deduccion = null, confianza = null, plazoPropio = null;
+    if (d && anioValido(d.desde) && anioValido(d.hasta)) {
+      desde = d.desde; hasta = d.hasta; origen = 'asesor'; plazoPropio = fechaISOValida(d.plazo) ? d.plazo : null;
+    } else {
+      desde = hasta = ejercicioPorDefecto(tipo, refISO);
+      origen = migracion ? 'migracion' : 'defecto';
+      deduccion = textoDeduccion(tipo, refISO, hasta);
+      confianza = TIPOS_ANIO_AMBIGUO.has(tipo) ? 'revisar' : 'alta';
+    }
+    // En una migración, lo que ya tenga un informe aceptado por el cliente está terminado
+    let estado = 'abierto', cierreVia = null, cerradoEn = null;
+    if (migracion) {
+      const [ult] = await conn.execute('SELECT estado, respondido_en FROM entregas WHERE propuesta_id = ? AND servicio = ? ORDER BY id DESC LIMIT 1', [p.id, id]);
+      if (ult.length && ult[0].estado === 'conforme') { estado = 'terminado'; cierreVia = 'informe'; cerradoEn = ult[0].respondido_en || null; }
+    }
+    let insertado = false;
+    for (let intento = 0; intento < 5 && !insertado; intento++) {
+      const clave = await claveUnica(conn, p.cliente_id, tipo, desde, hasta, 0);
+      try {
+        const [r] = await conn.execute(
+          'INSERT INTO servicios_cliente (cliente_id, propuesta_id, servicio, tipo, ejercicio_desde, ejercicio_hasta, clave, plazo_propio, estado, cierre_via, cerrado_en, ejercicio_origen, confirmado, deduccion, confianza) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          [p.cliente_id, p.id, id, tipo, desde, hasta, clave, plazoPropio, estado, cierreVia, cerradoEn, origen, migracion ? 0 : 1, deduccion, confianza]);
+        insertado = true; creados++;
+        await apuntarServicio(conn, r.insertId, migracion ? 'migrado' : 'creado', 'sistema', null, clave);
+      } catch (err) { if (err.code !== 'ER_DUP_ENTRY') throw err; }   // otro proceso tomó la clave: se recalcula
+    }
+  }
+  return creados;
+}
+async function migrarServiciosExistentes() {
+  const [ps] = await pool.query("SELECT p.* FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.estado = 'aceptada' AND c.estado = 'activo' AND NOT EXISTS (SELECT 1 FROM servicios_cliente s WHERE s.propuesta_id = p.id) ORDER BY p.id");
+  let n = 0;
+  for (const p of ps) {
+    const conn = await pool.getConnection();
+    try { n += await crearServiciosDePropuesta(conn, p, { migracion: true }); }
+    catch (err) { console.error('Migración de servicios del encargo ' + p.id + ':', err.message); }
+    finally { conn.release(); }
+  }
+  if (n) console.log('Servicios migrados a ejercicio/plazo/estado: ' + n + ' (pendientes de confirmar por un administrador).');
+}
+// Los ejercicios que indica el asesor al enviar la propuesta: { "renta": 2025 } o
+// { "pganterior": { desde: 2021, hasta: 2024 }, "requerimiento": { desde: 2024, plazo: "2026-12-15" } }
+function normalizarEjerciciosPropuesta(ejercicios, ids) {
+  if (ejercicios === undefined || ejercicios === null) return { detalle: null };
+  if (typeof ejercicios !== 'object' || Array.isArray(ejercicios)) return { error: 'Los ejercicios deben indicarse por servicio' };
+  const detalle = {};
+  for (const [id, v] of Object.entries(ejercicios)) {
+    if (!ids.includes(id)) return { error: `Has indicado un ejercicio para «${id}», que no está en la propuesta` };
+    const o = (v && typeof v === 'object') ? v : { desde: v };
+    const e = validarEjercicio(tipoDeServicio(id), o.desde !== undefined ? o.desde : o.ejercicio_desde, o.hasta !== undefined ? o.hasta : o.ejercicio_hasta);
+    if (e.error) return { error: `${id}: ${e.error}` };
+    let plazo = null;
+    if (o.plazo !== undefined && o.plazo !== null && o.plazo !== '') { if (!fechaISOValida(o.plazo)) return { error: `${id}: el plazo debe ser una fecha AAAA-MM-DD` }; plazo = o.plazo; }
+    detalle[id] = { desde: e.desde, hasta: e.hasta, plazo };
+  }
+  return { detalle: Object.keys(detalle).length ? detalle : null };
+}
+
+// --- Lectura: plazo efectivo, estado del plazo y vista de un servicio ---
+async function plazosConfigurados(conn) {
+  const [f] = await conn.query("SELECT tipo, ejercicio, DATE_FORMAT(plazo, '%Y-%m-%d') AS plazo, ventana_dias FROM plazos_defecto");
+  return new Map(f.map(x => [`${x.tipo}|${x.ejercicio}`, { plazo: x.plazo, ventana_dias: x.ventana_dias }]));
+}
+const SQL_SERVICIOS = `SELECT s.id, s.cliente_id, s.propuesta_id, s.servicio, s.tipo, s.ejercicio_desde, s.ejercicio_hasta, s.clave,
+    DATE_FORMAT(s.plazo_propio, '%Y-%m-%d') AS plazo_propio, s.ventana_propia, DATE_FORMAT(s.presentado_en, '%Y-%m-%d') AS presentado_en,
+    s.estado, s.propuesto_en, s.propuesto_por, s.cerrado_en, s.cerrado_por, s.cierre_via, s.ejercicio_origen, s.confirmado, s.deduccion, s.confianza, s.creado_en,
+    (SELECT a.nombre FROM asesores a WHERE a.id = s.propuesto_por) AS propuesto_por_nombre,
+    (SELECT COUNT(*) FROM documentos_fiscales d WHERE d.propuesta_id = s.propuesta_id AND d.servicio = s.servicio AND d.estado IN ('pendiente','rechazado')) AS docs_pendientes,
+    (SELECT COUNT(*) FROM documentos_fiscales d WHERE d.propuesta_id = s.propuesta_id AND d.servicio = s.servicio AND d.estado = 'enviado') AS docs_por_revisar,
+    (SELECT e.estado FROM entregas e WHERE e.propuesta_id = s.propuesta_id AND e.servicio = s.servicio ORDER BY e.id DESC LIMIT 1) AS entrega_estado
+  FROM servicios_cliente s`;
+function vistaServicio(f, cfg, hoyISO, duplicado) {
+  const def = TIPOS_SERVICIO[f.tipo];
+  const c = cfg.get(`${f.tipo}|${f.ejercicio_hasta}`) || {};
+  let plazo = null, plazoOrigen = null;
+  if (f.plazo_propio) { plazo = f.plazo_propio; plazoOrigen = 'servicio'; }
+  else if (c.plazo) { plazo = c.plazo; plazoOrigen = 'config'; }
+  else { const d = plazoPorDefectoDeTipo(f.tipo, f.ejercicio_hasta); if (d) { plazo = d; plazoOrigen = 'defecto'; } }
+  const ventana = f.ventana_propia != null ? f.ventana_propia : (c.ventana_dias != null ? c.ventana_dias : (def && def.ventana != null ? def.ventana : AVISO_PLAZO_VENTANA_GENERAL));
+  const enCurso = f.estado === 'abierto' || f.estado === 'por_confirmar';
+  let plazoEstado = null, dias = null;
+  // Un servicio sin confirmar (migración) o ya presentado no avisa: su plazo no cuenta
+  if (plazo && enCurso && !f.presentado_en && f.confirmado) {
+    dias = diasEntreISO(plazo, hoyISO);
+    plazoEstado = dias < 0 ? 'vencido' : dias <= ventana ? 'urgente' : 'normal';
+  }
+  let puedeCerrar = false, cerrarDesde = null;
+  if (f.estado === 'por_confirmar' && f.propuesto_en) {
+    cerrarDesde = sumaDiasISO(fechaMadrid(new Date(f.propuesto_en)).fecha, DIAS_CIERRE_SIN_RESPUESTA);
+    puedeCerrar = hoyISO >= cerrarDesde;
+  }
+  const motivos = [];
+  if (enCurso && f.confirmado) {
+    if (f.estado === 'por_confirmar') motivos.push('confirmar');
+    if (f.docs_pendientes > 0) motivos.push('documentos');
+    if (plazoEstado === 'vencido') motivos.push('plazo_vencido');
+    else if (plazoEstado === 'urgente') motivos.push('plazo_urgente');
+  }
+  return {
+    id: f.id, cliente_id: f.cliente_id, propuesta_id: f.propuesta_id, servicio: f.servicio, tipo: f.tipo, clave: f.clave,
+    ejercicio_desde: f.ejercicio_desde, ejercicio_hasta: f.ejercicio_hasta, ejercicio: f.ejercicio_hasta,   // «ejercicio» = el de la burbuja (el último del rango)
+    es_rango: f.ejercicio_desde !== f.ejercicio_hasta,
+    admite_rango: !!(def && def.rango),
+    nombre_es: nombreServicio(f, 'es', duplicado), nombre_en: nombreServicio(f, 'en', duplicado),
+    estado: f.estado, en_curso: enCurso,
+    plazo, plazo_origen: plazoOrigen, ventana_dias: ventana, plazo_estado: plazoEstado, dias_restantes: dias,
+    presentado_en: f.presentado_en,
+    propuesto_en: f.propuesto_en, propuesto_por_nombre: f.propuesto_por_nombre || null,
+    puede_cerrar_sin_respuesta: puedeCerrar, cerrar_sin_respuesta_desde: cerrarDesde,
+    cerrado_en: f.cerrado_en, cierre_via: f.cierre_via,
+    docs_pendientes: f.docs_pendientes, docs_por_revisar: f.docs_por_revisar, entrega_estado: f.entrega_estado || null,
+    necesita_atencion: motivos.length > 0, motivos_atencion: motivos,
+    ejercicio_origen: f.ejercicio_origen, confirmado: !!f.confirmado, deduccion: f.deduccion, confianza: f.confianza, creado_en: f.creado_en,
+  };
+}
+const CAMPOS_CLIENTE_SERVICIO = ['id', 'propuesta_id', 'servicio', 'tipo', 'clave', 'ejercicio_desde', 'ejercicio_hasta', 'ejercicio', 'es_rango', 'nombre_es', 'nombre_en', 'estado', 'en_curso',
+  'plazo', 'ventana_dias', 'plazo_estado', 'dias_restantes', 'presentado_en', 'propuesto_en', 'cerrado_en', 'cierre_via', 'docs_pendientes', 'entrega_estado', 'necesita_atencion', 'motivos_atencion'];
+const paraCliente = v => Object.fromEntries(CAMPOS_CLIENTE_SERVICIO.map(k => [k, v[k]]));
+// Dos servicios del mismo tipo en un cliente se distinguen por el año en el nombre; se mira en TODA su
+// lista (no solo en las filas devueltas), para que el nombre no cambie según el filtro
+async function vistasDeFilas(conn, filas) {
+  const [dup] = await conn.query('SELECT cliente_id, tipo FROM servicios_cliente GROUP BY cliente_id, tipo HAVING COUNT(*) > 1');
+  const dups = new Set(dup.map(x => x.cliente_id + '|' + x.tipo));
+  const cfg = await plazosConfigurados(conn), hoy = hoyMadridISO();
+  return filas.map(f => vistaServicio(f, cfg, hoy, dups.has(f.cliente_id + '|' + f.tipo)));
+}
+async function listarServiciosCliente(conn, clienteId, { soloConfirmados = false } = {}) {
+  const [filas] = await conn.query(SQL_SERVICIOS + ' WHERE s.cliente_id = ?' + (soloConfirmados ? ' AND s.confirmado = 1' : '') + ' ORDER BY s.ejercicio_hasta DESC, s.id', [clienteId]);
+  return vistasDeFilas(conn, filas);
+}
+async function servicioPorId(conn, id) {
+  const [f] = await conn.query(SQL_SERVICIOS + ' WHERE s.id = ?', [id]);
+  return f[0] || null;
+}
+async function vistaPorId(conn, id) {
+  const f = await servicioPorId(conn, id);
+  if (!f) return null;
+  return (await vistasDeFilas(conn, [f]))[0];
+}
+async function reclaveServicio(conn, f, desde, hasta) {
+  const clave = await claveUnica(conn, f.cliente_id, f.tipo, desde, hasta, f.id);
+  await conn.execute('UPDATE servicios_cliente SET ejercicio_desde = ?, ejercicio_hasta = ?, clave = ? WHERE id = ?', [desde, hasta, clave, f.id]);
+  return clave;
+}
+// Fusión de fichas: los servicios del duplicado pasan a la principal con clave nueva si chocan
+async function moverServiciosDeCliente(conn, desde, hacia) {
+  const [fs] = await conn.execute('SELECT id, tipo, ejercicio_desde, ejercicio_hasta FROM servicios_cliente WHERE cliente_id = ? ORDER BY id', [desde]);
+  for (const f of fs) {
+    const clave = await claveUnica(conn, hacia, f.tipo, f.ejercicio_desde, f.ejercicio_hasta, f.id);
+    await conn.execute('UPDATE servicios_cliente SET cliente_id = ?, clave = ? WHERE id = ?', [hacia, clave, f.id]);
+  }
+}
+// La conformidad del cliente a un informe da el servicio por terminado; pedir cambios lo reabre
+async function cerrarServicioPorInforme(conn, propuesta, servicio) {
+  const [r] = await conn.execute("UPDATE servicios_cliente SET estado = 'terminado', cierre_via = 'informe', cerrado_en = NOW() WHERE propuesta_id = ? AND servicio = ? AND estado IN ('abierto','por_confirmar')", [propuesta.id, servicio]);
+  if (r.affectedRows) { const [f] = await conn.execute('SELECT id FROM servicios_cliente WHERE propuesta_id = ? AND servicio = ?', [propuesta.id, servicio]); if (f.length) await apuntarServicio(conn, f[0].id, 'terminado_informe', 'cliente', null, 'conformidad al informe'); }
+}
+async function reabrirServicioPorCambios(conn, propuesta, servicio) {
+  const [f] = await conn.execute("SELECT id FROM servicios_cliente WHERE propuesta_id = ? AND servicio = ? AND estado <> 'abierto'", [propuesta.id, servicio]);
+  if (!f.length) return;
+  await conn.execute("UPDATE servicios_cliente SET estado = 'abierto', propuesto_en = NULL, propuesto_por = NULL, cerrado_en = NULL, cerrado_por = NULL, cierre_via = NULL WHERE id = ?", [f[0].id]);
+  await apuntarServicio(conn, f[0].id, 'reabierto', 'cliente', null, 'pide cambios en el informe');
+}
+
+// --- Rutas del panel ---
+const soloAdministrador = (req, res, next) => (req.asesor && req.asesor.esAdmin) ? next() : res.status(403).json({ error: 'Solo un administrador puede hacer esto' });
+const TEXTO_CIERRE_PROPUESTO = 'He dado por terminado este servicio. Si estás conforme, confírmalo desde tu área; si te falta algo, cuéntamelo por aquí y lo seguimos.';
+
+// Tipos de servicio con su plazo de ese ejercicio (para el formulario de propuesta y el ajuste anual)
+app.get('/api/admin/servicios/tipos', requiereSesionAsesor, async (req, res) => {
+  const ejercicio = Number(req.query.ejercicio) || Number(hoyMadridISO().slice(0, 4));
+  const cfg = await plazosConfigurados(pool);
+  res.json({
+    ejercicio, cierre_sin_respuesta_dias: DIAS_CIERRE_SIN_RESPUESTA,
+    tipos: Object.entries(TIPOS_SERVICIO).map(([tipo, d]) => {
+      const c = cfg.get(`${tipo}|${ejercicio}`) || {};
+      const defecto = plazoPorDefectoDeTipo(tipo, ejercicio);
+      return {
+        tipo, servicio: d.legacy, nombre_es: d.nombre.es(ejercicio), nombre_en: d.nombre.en(ejercicio), admite_rango: !!d.rango,
+        tiene_plazo: !!d.plazo, plazo: c.plazo || defecto, plazo_origen: c.plazo ? 'config' : defecto ? 'defecto' : null, plazo_defecto: defecto,
+        ventana_dias: c.ventana_dias != null ? c.ventana_dias : (d.ventana != null ? d.ventana : AVISO_PLAZO_VENTANA_GENERAL), ventana_defecto: d.ventana != null ? d.ventana : AVISO_PLAZO_VENTANA_GENERAL,
+        ejercicio_sugerido: ejercicioPorDefecto(tipo, hoyMadridISO()),
+      };
+    }),
+  });
+});
+// Ajuste anual de plazos (solo administradores): { ejercicio, plazos: { renta: { plazo: 'AAAA-MM-DD'|null, ventana_dias: n|null } } }
+app.put('/api/admin/plazos', requiereSesionAsesor, soloAdministrador, async (req, res) => {
+  const b = req.body || {};
+  const ejercicio = Number(b.ejercicio);
+  if (!anioValido(ejercicio)) return res.status(400).json({ error: 'Indica el ejercicio (un año válido)' });
+  if (!b.plazos || typeof b.plazos !== 'object' || Array.isArray(b.plazos)) return res.status(400).json({ error: 'Faltan los plazos' });
+  const cambios = [];
+  for (const [tipo, v] of Object.entries(b.plazos)) {
+    if (!TIPOS_SERVICIO[tipo]) return res.status(400).json({ error: `Tipo de servicio desconocido: ${tipo}` });
+    const o = v || {};
+    const plazo = (o.plazo === undefined || o.plazo === null || o.plazo === '') ? null : o.plazo;
+    if (plazo !== null && !fechaISOValida(plazo)) return res.status(400).json({ error: `${tipo}: el plazo debe ser una fecha AAAA-MM-DD` });
+    let ventana = null;
+    if (o.ventana_dias !== undefined && o.ventana_dias !== null && o.ventana_dias !== '') {
+      ventana = Number(o.ventana_dias);
+      if (!Number.isInteger(ventana) || ventana < 0 || ventana > 120) return res.status(400).json({ error: `${tipo}: la ventana de urgencia son entre 0 y 120 días` });
+    }
+    cambios.push([tipo, plazo, ventana]);
+  }
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const [tipo, plazo, ventana] of cambios) {
+      if (plazo === null && ventana === null) await conn.execute('DELETE FROM plazos_defecto WHERE tipo = ? AND ejercicio = ?', [tipo, ejercicio]);   // vuelve al valor por defecto
+      else await conn.execute('INSERT INTO plazos_defecto (tipo, ejercicio, plazo, ventana_dias, actualizado_por) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE plazo = VALUES(plazo), ventana_dias = VALUES(ventana_dias), actualizado_por = VALUES(actualizado_por)', [tipo, ejercicio, plazo, ventana, req.asesor.id]);
+    }
+    await conn.commit();
+    res.json({ ok: true, ejercicio, actualizados: cambios.length });
+  } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+});
+
+// Migración: los servicios de encargos anteriores, con el ejercicio deducido, para que un administrador los confirme
+app.get('/api/admin/servicios/migracion', requiereSesionAsesor, soloAdministrador, async (req, res) => {
+  const [filas] = await pool.query(SQL_SERVICIOS.replace('FROM servicios_cliente s', ', c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.correo AS cliente_correo, c.codigo AS cliente_codigo, p.creado_en AS encargo_creado_en FROM servicios_cliente s JOIN clientes c ON c.id = s.cliente_id JOIN propuestas p ON p.id = s.propuesta_id') + ' WHERE s.confirmado = 0 ORDER BY s.cliente_id, s.propuesta_id, s.id');
+  const vistas = await vistasDeFilas(pool, filas);
+  res.json({
+    pendientes: vistas.length,
+    items: vistas.map((v, i) => Object.assign(v, {
+      cliente: { id: filas[i].cliente_id, nombre: [filas[i].cliente_nombre, filas[i].cliente_apellidos].filter(Boolean).join(' '), correo: filas[i].cliente_correo, codigo: filas[i].cliente_codigo },
+      encargo_creado_en: filas[i].encargo_creado_en, admite_rango: !!(TIPOS_SERVICIO[v.tipo] && TIPOS_SERVICIO[v.tipo].rango),
+    })),
+  });
+});
+// { ids: [..] | todos: true, cambios: { "<id>": { ejercicio_desde, ejercicio_hasta, plazo } } }
+app.post('/api/admin/servicios/migracion/confirmar', requiereSesionAsesor, soloAdministrador, async (req, res) => {
+  const b = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const [pend] = await conn.query('SELECT id, tipo, cliente_id, ejercicio_desde, ejercicio_hasta FROM servicios_cliente WHERE confirmado = 0');
+    const porId = new Map(pend.map(x => [x.id, x]));
+    const objetivo = b.todos === true ? pend.map(x => x.id) : (Array.isArray(b.ids) ? b.ids.map(Number) : []);
+    const cambios = (b.cambios && typeof b.cambios === 'object') ? b.cambios : {};
+    for (const id of [...objetivo, ...Object.keys(cambios).map(Number)]) if (!porId.has(id)) return res.status(409).json({ error: `El servicio ${id} no está pendiente de confirmar` });
+    if (!objetivo.length && !Object.keys(cambios).length) return res.status(400).json({ error: 'No hay nada que confirmar' });
+    const aplicar = [];   // se valida todo antes de tocar nada
+    for (const [idTxt, c] of Object.entries(cambios)) {
+      const f = porId.get(Number(idTxt)); const o = c || {};
+      const e = validarEjercicio(f.tipo, o.ejercicio_desde !== undefined ? o.ejercicio_desde : f.ejercicio_desde, o.ejercicio_hasta !== undefined ? o.ejercicio_hasta : (o.ejercicio_desde !== undefined && f.ejercicio_desde === f.ejercicio_hasta ? o.ejercicio_desde : f.ejercicio_hasta));
+      if (e.error) return res.status(400).json({ error: `Servicio ${idTxt}: ${e.error}` });
+      let plazo;   // undefined = no tocar
+      if (o.plazo !== undefined) { if (o.plazo !== null && o.plazo !== '' && !fechaISOValida(o.plazo)) return res.status(400).json({ error: `Servicio ${idTxt}: el plazo debe ser una fecha AAAA-MM-DD` }); plazo = o.plazo || null; }
+      aplicar.push({ f, e, plazo });
+    }
+    await conn.beginTransaction();
+    for (const { f, e, plazo } of aplicar) {
+      if (e.desde !== f.ejercicio_desde || e.hasta !== f.ejercicio_hasta) { await reclaveServicio(conn, f, e.desde, e.hasta); await apuntarServicio(conn, f.id, 'ejercicio_cambiado', 'asesor', req.asesor.id, `${etiquetaEjercicio(f.ejercicio_desde, f.ejercicio_hasta)} → ${etiquetaEjercicio(e.desde, e.hasta)}`); }
+      if (plazo !== undefined) { await conn.execute('UPDATE servicios_cliente SET plazo_propio = ? WHERE id = ?', [plazo, f.id]); await apuntarServicio(conn, f.id, 'plazo_cambiado', 'asesor', req.asesor.id, plazo || 'sin plazo propio'); }
+    }
+    const confirmar = [...new Set([...objetivo, ...Object.keys(cambios).map(Number)])];
+    if (confirmar.length) {
+      await conn.query('UPDATE servicios_cliente SET confirmado = 1 WHERE id IN (?)', [confirmar]);
+      for (const id of confirmar) await apuntarServicio(conn, id, 'confirmado', 'asesor', req.asesor.id, 'ejercicio confirmado');
+    }
+    await conn.commit();
+    res.json({ ok: true, confirmados: confirmar.length, pendientes: pend.length - confirmar.length });
+  } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+});
+
+// Lista (p. ej. «Plazos que vencen»): ?estado=abierto,por_confirmar  ?plazo_estado=vencido,urgente  ?cliente_id=  ?ejercicio=
+app.get('/api/admin/servicios', requiereSesionAsesor, async (req, res) => {
+  const where = ['s.confirmado = 1', "c.estado = 'activo'"], params = [];   // un cliente inerte (alta rechazada, reembolsado) no genera avisos de plazo
+  if (req.query.cliente_id) { where.push('s.cliente_id = ?'); params.push(Number(req.query.cliente_id)); }
+  if (req.query.ejercicio) { where.push('s.ejercicio_hasta = ?'); params.push(Number(req.query.ejercicio)); }
+  const estados = String(req.query.estado || '').split(',').filter(x => ['abierto', 'por_confirmar', 'terminado', 'cerrado_sin_respuesta'].includes(x));
+  if (estados.length) { where.push('s.estado IN (?)'); params.push(estados); }
+  const [filas] = await pool.query(SQL_SERVICIOS.replace('FROM servicios_cliente s', ', c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.codigo AS cliente_codigo, (SELECT q.nombre FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_nombre FROM servicios_cliente s JOIN clientes c ON c.id = s.cliente_id') + ' WHERE ' + where.join(' AND ') + ' LIMIT 3000', params);
+  let vistas = await vistasDeFilas(pool, filas);
+  vistas.forEach((v, i) => { v.cliente_nombre = [filas[i].cliente_nombre, filas[i].cliente_apellidos].filter(Boolean).join(' '); v.cliente_codigo = filas[i].cliente_codigo; v.asesor_nombre = filas[i].asesor_nombre; });
+  const pe = String(req.query.plazo_estado || '').split(',').filter(Boolean);
+  if (pe.length) vistas = vistas.filter(v => pe.includes(v.plazo_estado));
+  const rango = v => !v.en_curso ? 5 : v.plazo_estado === 'vencido' ? 0 : v.plazo_estado === 'urgente' ? 1 : v.plazo ? 2 : 3;
+  vistas.sort((a, b) => rango(a) - rango(b) || (a.dias_restantes == null ? 1e9 : a.dias_restantes) - (b.dias_restantes == null ? 1e9 : b.dias_restantes) || a.id - b.id);
+  res.json(vistas);
+});
+app.get('/api/admin/clientes/:id(\\d+)/servicios', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try { res.json(await listarServiciosCliente(conn, Number(req.params.id))); } finally { conn.release(); }
+});
+app.get('/api/admin/servicios/:id(\\d+)/historial', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT h.evento, h.autor, h.detalle, h.creado_en, a.nombre AS asesor FROM servicios_historial h LEFT JOIN asesores a ON a.id = h.asesor_id WHERE h.servicio_id = ? ORDER BY h.id DESC', [Number(req.params.id)]);
+  res.json(f);
+});
+// Editar un servicio: ejercicio (o rango), plazo propio (null = vuelve al del ajuste anual), ventana de urgencia y fecha de presentación
+app.put('/api/admin/servicios/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), b = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const f = await servicioPorId(conn, id);
+    if (!f) return res.status(404).json({ error: 'Servicio no encontrado' });
+    const sets = [], vals = [], notas = [];
+    let nuevoDesde = f.ejercicio_desde, nuevoHasta = f.ejercicio_hasta;
+    if (b.ejercicio_desde !== undefined || b.ejercicio_hasta !== undefined) {
+      const desdeIn = b.ejercicio_desde !== undefined ? b.ejercicio_desde : f.ejercicio_desde;
+      const hastaIn = b.ejercicio_hasta !== undefined ? b.ejercicio_hasta : (b.ejercicio_desde !== undefined && f.ejercicio_desde === f.ejercicio_hasta ? b.ejercicio_desde : f.ejercicio_hasta);
+      const e = validarEjercicio(f.tipo, desdeIn, hastaIn);
+      if (e.error) return res.status(400).json({ error: e.error });
+      nuevoDesde = e.desde; nuevoHasta = e.hasta;
+    }
+    if (b.plazo !== undefined) {
+      if (b.plazo !== null && b.plazo !== '' && !fechaISOValida(b.plazo)) return res.status(400).json({ error: 'El plazo debe ser una fecha AAAA-MM-DD' });
+      sets.push('plazo_propio = ?'); vals.push(b.plazo || null); notas.push(['plazo_cambiado', b.plazo ? 'plazo ' + b.plazo : 'plazo propio quitado']);
+    }
+    if (b.ventana_dias !== undefined) {
+      const v = (b.ventana_dias === null || b.ventana_dias === '') ? null : Number(b.ventana_dias);
+      if (v !== null && (!Number.isInteger(v) || v < 0 || v > 120)) return res.status(400).json({ error: 'La ventana de urgencia son entre 0 y 120 días' });
+      sets.push('ventana_propia = ?'); vals.push(v); notas.push(['plazo_cambiado', v === null ? 'ventana por defecto' : 'ventana ' + v + ' días']);
+    }
+    if (b.presentado_en !== undefined) {
+      if (b.presentado_en !== null && b.presentado_en !== '' && !fechaISOValida(b.presentado_en)) return res.status(400).json({ error: 'La fecha de presentación debe ser AAAA-MM-DD' });
+      sets.push('presentado_en = ?'); vals.push(b.presentado_en || null); notas.push(['presentado', b.presentado_en ? 'presentado el ' + b.presentado_en : 'presentación quitada']);
+    }
+    const cambiaEjercicio = nuevoDesde !== f.ejercicio_desde || nuevoHasta !== f.ejercicio_hasta;
+    if (!sets.length && !cambiaEjercicio) return res.status(400).json({ error: 'No hay nada que cambiar' });
+    await conn.beginTransaction();
+    if (sets.length) await conn.execute('UPDATE servicios_cliente SET ' + sets.join(', ') + ' WHERE id = ?', [...vals, id]);
+    if (cambiaEjercicio) { await reclaveServicio(conn, f, nuevoDesde, nuevoHasta); await apuntarServicio(conn, id, 'ejercicio_cambiado', 'asesor', req.asesor.id, `${etiquetaEjercicio(f.ejercicio_desde, f.ejercicio_hasta)} → ${etiquetaEjercicio(nuevoDesde, nuevoHasta)}`); }
+    for (const [ev, det] of notas) await apuntarServicio(conn, id, ev, 'asesor', req.asesor.id, det);
+    await conn.commit();
+    res.json({ ok: true, servicio: await vistaPorId(conn, id) });
+  } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
+});
+// El asesor da el servicio por terminado: pasa a «por confirmar» y el cliente lo ve en su aviso y en el chat
+app.post('/api/admin/servicios/:id(\\d+)/dar-por-terminado', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), b = req.body || {};
+  if (b.presentado_en !== undefined && b.presentado_en !== null && b.presentado_en !== '' && !fechaISOValida(b.presentado_en)) return res.status(400).json({ error: 'La fecha de presentación debe ser AAAA-MM-DD' });
+  const conn = await pool.getConnection();
+  try {
+    const f = await servicioPorId(conn, id);
+    if (!f) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (!f.confirmado) return res.status(409).json({ error: 'Antes de cerrarlo hay que confirmar su ejercicio (migración pendiente)' });
+    const [r] = await conn.execute("UPDATE servicios_cliente SET estado = 'por_confirmar', propuesto_en = NOW(), propuesto_por = ?, presentado_en = COALESCE(?, presentado_en) WHERE id = ? AND estado = 'abierto'", [req.asesor.id, b.presentado_en || null, id]);
+    if (!r.affectedRows) return res.status(409).json({ error: 'Este servicio ya no está abierto (' + f.estado + ')' });
+    const texto = textoMensaje(b.mensaje) || TEXTO_CIERRE_PROPUESTO;
+    await conn.execute("INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, asesor_id, texto) VALUES (?, ?, ?, 'asesor', ?, ?)", [f.propuesta_id, f.cliente_id, f.servicio, req.asesor.id, texto]);
+    await apuntarServicio(conn, id, 'propuesto_cierre', 'asesor', req.asesor.id, b.presentado_en ? 'presentado el ' + b.presentado_en : null);
+    res.json({ ok: true, servicio: await vistaPorId(conn, id) });
+  } finally { conn.release(); }
+});
+// A los 15 días sin respuesta del cliente, el asesor lo cierra
+app.post('/api/admin/servicios/:id(\\d+)/cerrar-sin-respuesta', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  const conn = await pool.getConnection();
+  try {
+    const f = await servicioPorId(conn, id);
+    if (!f) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (f.estado !== 'por_confirmar') return res.status(409).json({ error: 'Solo se puede cerrar sin respuesta un servicio que espera la confirmación del cliente (ahora: ' + f.estado + ')' });
+    const v = (await vistasDeFilas(conn, [f]))[0];
+    if (!v.puede_cerrar_sin_respuesta) return res.status(409).json({ error: 'Podrás cerrarlo sin respuesta a partir del ' + fechaES(v.cerrar_sin_respuesta_desde) + ' (' + DIAS_CIERRE_SIN_RESPUESTA + ' días después de pedir la confirmación)', desde: v.cerrar_sin_respuesta_desde });
+    const [r] = await conn.execute("UPDATE servicios_cliente SET estado = 'cerrado_sin_respuesta', cierre_via = 'asesor', cerrado_en = NOW(), cerrado_por = ? WHERE id = ? AND estado = 'por_confirmar'", [req.asesor.id, id]);
+    if (!r.affectedRows) return res.status(409).json({ error: 'El cliente acaba de responder' });
+    await apuntarServicio(conn, id, 'cerrado_sin_respuesta', 'asesor', req.asesor.id, null);
+    res.json({ ok: true, servicio: await vistaPorId(conn, id) });
+  } finally { conn.release(); }
+});
+// Volver a abrir (retirar la petición de confirmación, o reabrir uno terminado o cerrado sin respuesta)
+app.post('/api/admin/servicios/:id(\\d+)/reabrir', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  const conn = await pool.getConnection();
+  try {
+    const f = await servicioPorId(conn, id);
+    if (!f) return res.status(404).json({ error: 'Servicio no encontrado' });
+    const [r] = await conn.execute("UPDATE servicios_cliente SET estado = 'abierto', propuesto_en = NULL, propuesto_por = NULL, cerrado_en = NULL, cerrado_por = NULL, cierre_via = NULL WHERE id = ? AND estado <> 'abierto'", [id]);
+    if (!r.affectedRows) return res.status(409).json({ error: 'Este servicio ya está abierto' });
+    await apuntarServicio(conn, id, 'reabierto', 'asesor', req.asesor.id, 'estaba ' + f.estado + (req.body && req.body.motivo ? ': ' + textoMensaje(req.body.motivo).slice(0, 200) : ''));
+    res.json({ ok: true, servicio: await vistaPorId(conn, id) });
+  } finally { conn.release(); }
+});
+
+// --- Rutas del Área del cliente (por el token de su propuesta, como el resto) ---
+app.get('/api/propuestas/:token/servicios', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const lista = await listarServiciosCliente(conn, p.cliente_id, { soloConfirmados: true });
+    const porEj = new Map();
+    lista.forEach(v => {
+      const e = porEj.get(v.ejercicio) || { ejercicio: v.ejercicio, en_curso: 0, terminados: 0, necesita_atencion: false };
+      if (v.en_curso) e.en_curso++; else e.terminados++;
+      if (v.necesita_atencion) e.necesita_atencion = true;
+      porEj.set(v.ejercicio, e);
+    });
+    res.json({
+      hoy: hoyMadridISO(),
+      en_curso: lista.filter(v => v.en_curso).length, necesita_atencion: lista.filter(v => v.necesita_atencion).length,
+      ejercicios: [...porEj.values()].sort((a, b) => b.ejercicio - a.ejercicio),
+      servicios: lista.map(paraCliente),
+    });
+  } finally { conn.release(); }
+});
+async function servicioDelCliente(conn, token, id) {
+  const p = await propuestaVigente(conn, token);
+  if (!p) return { error: [404, 'Propuesta no encontrada'] };
+  const f = await servicioPorId(conn, Number(id));
+  if (!f || f.cliente_id !== p.cliente_id || !f.confirmado) return { error: [404, 'Servicio no encontrado'] };
+  return { p, f };
+}
+app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const r = await servicioDelCliente(conn, req.params.token, req.params.id);
+    if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    const [u] = await conn.execute("UPDATE servicios_cliente SET estado = 'terminado', cierre_via = 'cliente', cerrado_en = NOW() WHERE id = ? AND estado = 'por_confirmar'", [r.f.id]);
+    if (!u.affectedRows) return res.status(409).json({ error: r.f.estado === 'abierto' ? 'Tu asesor aún no ha dado este servicio por terminado' : 'Este servicio ya no espera tu confirmación' });
+    await apuntarServicio(conn, r.f.id, 'terminado_cliente', 'cliente', null, null);
+    avisarCliente(r.f.cliente_id, '✅', 'un cliente ha confirmado que su servicio está terminado', 'Queda cerrado.', { etiqueta: 'white_check_mark' });
+    res.json({ ok: true, estado: 'terminado' });
+  } finally { conn.release(); }
+});
+app.post('/api/propuestas/:token/servicios/:id(\\d+)/pendiente', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const r = await servicioDelCliente(conn, req.params.token, req.params.id);
+    if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    const [u] = await conn.execute("UPDATE servicios_cliente SET estado = 'abierto', propuesto_en = NULL, propuesto_por = NULL WHERE id = ? AND estado = 'por_confirmar'", [r.f.id]);
+    if (!u.affectedRows) return res.status(409).json({ error: 'Este servicio ya no espera tu confirmación' });
+    const detalle = textoMensaje(req.body && req.body.texto);
+    await conn.execute("INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, texto) VALUES (?, ?, ?, 'cliente', ?)", [r.f.propuesta_id, r.f.cliente_id, r.f.servicio, 'Tengo algo pendiente en este servicio.' + (detalle ? ' ' + detalle : '')]);
+    await apuntarServicio(conn, r.f.id, 'pendiente_cliente', 'cliente', null, detalle ? detalle.slice(0, 200) : null);
+    avisarCliente(r.f.cliente_id, '✏️', 'un cliente dice que tiene algo pendiente en un servicio', 'Lo tienes en «Mensajes sin leer» y en su ficha.', { prioridad: 4, etiqueta: 'pencil2' });
+    res.json({ ok: true, estado: 'abierto' });
+  } finally { conn.release(); }
+});
+
+
+// ================================================================
+// «RECORDÁRSELO» DESDE LA FICHA (20/10, ACROS 7 · fase 2)
+// En «Le toca al cliente» cada cosa que espera al cliente (un documento
+// pedido o rechazado, la confirmación de un servicio dado por terminado) tiene
+// su «Recordárselo»: un correo corto con el enlace a su área, respetando sus
+// preferencias de avisos. Tope: uno al día por cosa, para no agobiar. Todo
+// queda en la actividad del equipo (y, si es un servicio, en su historial).
+// ================================================================
+const HORAS_ENTRE_RECORDATORIOS = 24;
+async function enviarRecordatorioCliente(conn, req, o) {
+  const [ult] = await conn.execute('SELECT MAX(creado_en) AS ultimo FROM recordatorios_cliente WHERE tipo = ? AND objeto_id = ? AND creado_en > NOW() - INTERVAL ? HOUR', [o.tipo, o.objetoId, HORAS_ENTRE_RECORDATORIOS]);
+  if (ult[0].ultimo) return { limite: true, ultimo: ult[0].ultimo };
+  await conn.execute('INSERT INTO recordatorios_cliente (tipo, objeto_id, cliente_id, asesor_id) VALUES (?, ?, ?, ?)', [o.tipo, o.objetoId, o.clienteId, req.asesor.id]);
+  const [cl] = await conn.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [o.clienteId]);
+  const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+  let correo = 'sin_correo';
+  if (cl.length && cl[0].correo) {
+    if (!brevoActivo()) correo = 'sin_servicio';
+    else {
+      const c = plantillaCorreo({
+        titulo: o.titulo,
+        parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:', ...o.parrafos],
+        boton: enlace ? { texto: 'Entrar en mi área', url: enlace } : null,
+        nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
+      });
+      try {
+        const salio = await notificarCliente(conn, o.clienteId, 'recordatorios', () => enviarCorreo(cl[0].correo, o.asunto, c.html, c.texto), o.textoWA + (enlace ? ' ' + enlace : ''));
+        correo = salio ? 'enviado' : 'desactivado_por_cliente';
+      } catch (err) { console.error('Recordatorio al cliente no enviado:', err.message); correo = 'fallo'; }
+    }
+  }
+  return { ok: true, correo };
+}
+const respuestaRecordatorio = (res, r) => r.limite
+  ? res.status(429).json({ error: 'Ya se lo recordaste hoy. Podrás volver a hacerlo pasadas ' + HORAS_ENTRE_RECORDATORIOS + ' horas.', ultimo: r.ultimo })
+  : res.json({ ok: true, correo: r.correo });
+
+app.post('/api/admin/documentos/:id(\\d+)/recordar', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT id, cliente_id, nombre, estado, razon_rechazo FROM documentos_fiscales WHERE id = ?', [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'Documento no encontrado' });
+    const d = f[0];
+    if (!['pendiente', 'rechazado'].includes(d.estado)) return res.status(409).json({ error: 'Ese documento ya no está pendiente del cliente' });
+    const asesor = await personaDeCliente(d.cliente_id, conn).catch(() => null);
+    const quien = asesor ? ESC_HTML(asesor.nombre) : 'tu asesor';
+    const r = await enviarRecordatorioCliente(conn, req, {
+      clienteId: d.cliente_id, tipo: 'documento', objetoId: d.id,
+      asunto: (asesor ? asesor.nombre + ', tu asesor de Acros' : 'Tu asesor de Acros') + ', te recuerda un documento',
+      titulo: d.estado === 'rechazado' ? 'Hay que volver a subir un documento' : 'Te falta un documento',
+      parrafos: d.estado === 'rechazado'
+        ? [`${quien} no ha podido dar por bueno este documento: <strong>${ESC_HTML(d.nombre)}</strong>.`, d.razon_rechazo ? 'Motivo: ' + ESC_HTML(d.razon_rechazo) : '', 'Cuando puedas, súbelo de nuevo desde tu área.'].filter(Boolean)
+        : [`${quien} sigue esperando este documento para avanzar con tu encargo:`, `<strong>${ESC_HTML(d.nombre)}</strong>`, 'Súbelo desde tu área de cliente; viaja y se guarda cifrado.'],
+      textoWA: 'Acros: ' + (asesor ? asesor.nombre : 'tu asesor') + ' te recuerda un documento pendiente en tu área.',
+    });
+    respuestaRecordatorio(res, r);
+  } finally { conn.release(); }
+});
+app.post('/api/admin/servicios/:id(\\d+)/recordar', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const v = await vistaPorId(conn, Number(req.params.id));
+    if (!v) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (v.estado !== 'por_confirmar') return res.status(409).json({ error: 'Solo se puede recordar un servicio que espera la confirmación del cliente' });
+    const asesor = await personaDeCliente(v.cliente_id, conn).catch(() => null);
+    const quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
+    const r = await enviarRecordatorioCliente(conn, req, {
+      clienteId: v.cliente_id, tipo: 'servicio', objetoId: v.id,
+      asunto: (asesor ? asesor.nombre + ', tu asesor de Acros' : 'Tu asesor de Acros') + ', espera tu confirmación',
+      titulo: 'Falta tu confirmación',
+      parrafos: [`${quien} ha dado por terminado este servicio: <strong>${ESC_HTML(v.nombre_es)}</strong>.`, 'Entra en tu área y dinos si está todo bien o si te falta algo.'],
+      textoWA: 'Acros: ' + (asesor ? asesor.nombre : 'tu asesor') + ' espera tu confirmación de un servicio terminado.',
+    });
+    if (r.ok) await apuntarServicio(conn, v.id, 'recordado', 'asesor', req.asesor.id, 'correo: ' + r.correo);
+    respuestaRecordatorio(res, r);
+  } finally { conn.release(); }
+});
+// Todo lo que ha pasado con los servicios de un cliente (para el historial de su ficha)
+app.get('/api/admin/clientes/:id(\\d+)/servicios/historial', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute(
+    `SELECT h.servicio_id, s.clave, h.evento, h.autor, h.detalle, h.creado_en, a.nombre AS asesor
+     FROM servicios_historial h JOIN servicios_cliente s ON s.id = h.servicio_id LEFT JOIN asesores a ON a.id = h.asesor_id
+     WHERE s.cliente_id = ? ORDER BY h.id DESC LIMIT 400`, [Number(req.params.id)]);
+  res.json(f);
+});
+
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
 // express.json() (15mb) llegaba antes como una página HTML cruda de
