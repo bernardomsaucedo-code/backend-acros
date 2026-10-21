@@ -6439,7 +6439,7 @@ async function vistasDeFilas(conn, filas) {
   return filas.map(f => vistaServicio(f, cfg, hoy, dups.has(f.cliente_id + '|' + f.tipo)));
 }
 async function listarServiciosCliente(conn, clienteId, { soloConfirmados = false } = {}) {
-  const [filas] = await conn.query(SQL_SERVICIOS + ' WHERE s.cliente_id = ?' + (soloConfirmados ? ' AND s.confirmado = 1' : '') + ' ORDER BY s.ejercicio_hasta DESC, s.id', [clienteId]);
+  const [filas] = await conn.query(SQL_SERVICIOS + ' WHERE s.cliente_id = ?' + (soloConfirmados ? ' AND s.confirmado = 1' : ' AND s.confirmado IN (0, 1)') + ' ORDER BY s.ejercicio_hasta DESC, s.id', [clienteId]);   // 20/10: sin los fusionados (duplicados)
   return vistasDeFilas(conn, filas);
 }
 async function servicioPorId(conn, id) {
@@ -6533,11 +6533,15 @@ app.put('/api/admin/plazos', requiereSesionAsesor, soloAdministrador, async (req
 app.get('/api/admin/servicios/migracion', requiereSesionAsesor, soloAdministrador, async (req, res) => {
   const [filas] = await pool.query(SQL_SERVICIOS.replace('FROM servicios_cliente s', ', c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.correo AS cliente_correo, c.codigo AS cliente_codigo, p.creado_en AS encargo_creado_en FROM servicios_cliente s JOIN clientes c ON c.id = s.cliente_id JOIN propuestas p ON p.id = s.propuesta_id') + ' WHERE s.confirmado = 0 ORDER BY s.cliente_id, s.propuesta_id, s.id');
   const vistas = await vistasDeFilas(pool, filas);
+  const cands = await candidatosDuplicado(pool, [...new Set(filas.map(f => f.cliente_id))]);   // 20/10: posibles duplicados
   res.json({
     pendientes: vistas.length,
     items: vistas.map((v, i) => Object.assign(v, {
       cliente: { id: filas[i].cliente_id, nombre: [filas[i].cliente_nombre, filas[i].cliente_apellidos].filter(Boolean).join(' '), correo: filas[i].cliente_correo, codigo: filas[i].cliente_codigo },
       encargo_creado_en: filas[i].encargo_creado_en, admite_rango: !!(TIPOS_SERVICIO[v.tipo] && TIPOS_SERVICIO[v.tipo].rango),
+      yo: cands.find(c => c.id === v.id) || null,
+      candidatos_duplicado: cands.filter(c => c.id !== v.id && c.cliente_id === filas[i].cliente_id && c.tipo === v.tipo),
+      posible_duplicado: cands.some(c => c.id !== v.id && c.cliente_id === filas[i].cliente_id && c.tipo === v.tipo && c.ejercicio_desde === v.ejercicio_desde && c.ejercicio_hasta === v.ejercicio_hasta),
     })),
   });
 });
@@ -6550,8 +6554,10 @@ app.post('/api/admin/servicios/migracion/confirmar', requiereSesionAsesor, soloA
     const porId = new Map(pend.map(x => [x.id, x]));
     const objetivo = b.todos === true ? pend.map(x => x.id) : (Array.isArray(b.ids) ? b.ids.map(Number) : []);
     const cambios = (b.cambios && typeof b.cambios === 'object') ? b.cambios : {};
+    const duplicados = (b.duplicados && typeof b.duplicados === 'object') ? Object.fromEntries(Object.entries(b.duplicados).map(([k, v]) => [Number(k), Number(v)])) : {};   // 20/10
+    for (const [dId, tId] of Object.entries(duplicados)) if (duplicados[tId]) return res.status(400).json({ error: `El servicio ${tId} no puede quedarse y ser a la vez duplicado de otro` });
     for (const id of [...objetivo, ...Object.keys(cambios).map(Number)]) if (!porId.has(id)) return res.status(409).json({ error: `El servicio ${id} no está pendiente de confirmar` });
-    if (!objetivo.length && !Object.keys(cambios).length) return res.status(400).json({ error: 'No hay nada que confirmar' });
+    if (!objetivo.length && !Object.keys(cambios).length && !Object.keys(duplicados).length) return res.status(400).json({ error: 'No hay nada que confirmar' });
     const aplicar = [];   // se valida todo antes de tocar nada
     for (const [idTxt, c] of Object.entries(cambios)) {
       const f = porId.get(Number(idTxt)); const o = c || {};
@@ -6566,13 +6572,19 @@ app.post('/api/admin/servicios/migracion/confirmar', requiereSesionAsesor, soloA
       if (e.desde !== f.ejercicio_desde || e.hasta !== f.ejercicio_hasta) { await reclaveServicio(conn, f, e.desde, e.hasta); await apuntarServicio(conn, f.id, 'ejercicio_cambiado', 'asesor', req.asesor.id, `${etiquetaEjercicio(f.ejercicio_desde, f.ejercicio_hasta)} → ${etiquetaEjercicio(e.desde, e.hasta)}`); }
       if (plazo !== undefined) { await conn.execute('UPDATE servicios_cliente SET plazo_propio = ? WHERE id = ?', [plazo, f.id]); await apuntarServicio(conn, f.id, 'plazo_cambiado', 'asesor', req.asesor.id, plazo || 'sin plazo propio'); }
     }
-    const confirmar = [...new Set([...objetivo, ...Object.keys(cambios).map(Number)])];
+    const confirmar = [...new Set([...objetivo, ...Object.keys(cambios).map(Number)])].filter(id => !duplicados[id]);
     if (confirmar.length) {
       await conn.query('UPDATE servicios_cliente SET confirmado = 1 WHERE id IN (?)', [confirmar]);
       for (const id of confirmar) await apuntarServicio(conn, id, 'confirmado', 'asesor', req.asesor.id, 'ejercicio confirmado');
     }
+    let fusionados = 0;
+    for (const [dId, tId] of Object.entries(duplicados)) {
+      const r = await fusionarDuplicado(conn, Number(dId), tId, req.asesor.id);
+      if (r.error) { await conn.rollback(); return res.status(r.error[0]).json({ error: `Servicio ${dId}: ${r.error[1]}` }); }
+      fusionados++;
+    }
     await conn.commit();
-    res.json({ ok: true, confirmados: confirmar.length, pendientes: pend.length - confirmar.length });
+    res.json({ ok: true, confirmados: confirmar.length, fusionados, pendientes: pend.length - confirmar.length - fusionados });
   } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
 });
 
@@ -7099,6 +7111,66 @@ async function inicialesDeAsesor(asesorId) {
   } catch (e) { return ''; }
 }
 const quienIni = ini => ini || 'Alguien del equipo';
+
+
+// ================================================================
+// SERVICIOS DUPLICADOS (20/10)
+// Si un cliente tiene el mismo servicio en dos encargos (p. ej. el Informe de
+// P&G 2026 contratado dos veces), un administrador marca uno como «duplicado
+// de» el otro: sus documentos, mensajes e informes pasan al que se queda (los
+// informes, con versión siguiente) y el sobrante queda «fusionado»
+// (confirmado = 2): no cuenta en ningún sitio ni lo ve el cliente, pero no se
+// borra (si se borrara, la migración lo volvería a crear al arrancar). El pago
+// sigue en su encargo, sin tocarlo. El cliente no recibe ningún aviso.
+// Queda en el historial de los dos servicios.
+// ================================================================
+const FUSIONADO = 2;
+async function fusionarDuplicado(conn, id, destinoId, asesorId) {
+  if (Number(id) === Number(destinoId)) return { error: [400, 'Un servicio no puede ser duplicado de sí mismo'] };
+  const [[d]] = await conn.query('SELECT * FROM servicios_cliente WHERE id = ?', [id]);
+  const [[t]] = await conn.query('SELECT * FROM servicios_cliente WHERE id = ?', [destinoId]);
+  if (!d || !t) return { error: [404, 'Servicio no encontrado'] };
+  if (d.confirmado === FUSIONADO || t.confirmado === FUSIONADO) return { error: [409, 'Uno de los dos ya está fusionado con otro'] };
+  if (d.cliente_id !== t.cliente_id) return { error: [400, 'Los dos servicios tienen que ser del mismo cliente'] };
+  if (d.tipo !== t.tipo) return { error: [400, 'Solo se puede marcar como duplicado un servicio del mismo tipo'] };
+  const mover = [t.propuesta_id, t.servicio, d.propuesta_id, d.servicio];
+  const [rd] = await conn.execute('UPDATE documentos_fiscales SET propuesta_id = ?, servicio = ? WHERE propuesta_id = ? AND servicio = ?', mover);
+  const [rm] = await conn.execute('UPDATE mensajes SET propuesta_id = ?, servicio = ? WHERE propuesta_id = ? AND servicio = ?', mover);
+  const [[mx]] = await conn.execute('SELECT COALESCE(MAX(version), 0) AS v FROM entregas WHERE propuesta_id = ? AND servicio = ?', [t.propuesta_id, t.servicio]);
+  const [ents] = await conn.execute('SELECT id FROM entregas WHERE propuesta_id = ? AND servicio = ? ORDER BY version, id', [d.propuesta_id, d.servicio]);
+  let v = mx.v;
+  for (const e of ents) await conn.execute('UPDATE entregas SET propuesta_id = ?, servicio = ?, version = ? WHERE id = ?', [t.propuesta_id, t.servicio, ++v, e.id]);
+  await conn.execute('UPDATE servicios_cliente SET confirmado = ? WHERE id = ?', [FUSIONADO, d.id]);
+  const resumen = `${rd.affectedRows} documentos, ${rm.affectedRows} mensajes y ${ents.length} informes`;
+  await apuntarServicio(conn, d.id, 'fusionado', 'asesor', asesorId, `duplicado del servicio ${t.id}: ${resumen} pasan a él`);
+  await apuntarServicio(conn, t.id, 'fusion', 'asesor', asesorId, `recibe ${resumen} del servicio ${d.id} (duplicado)`);
+  return { ok: true, documentos: rd.affectedRows, mensajes: rm.affectedRows, informes: ents.length };
+}
+app.post('/api/admin/servicios/:id(\\d+)/duplicado', requiereSesionAsesor, soloAdministrador, async (req, res) => {
+  const destino = Number((req.body || {}).de);
+  if (!Number.isInteger(destino) || destino <= 0) return res.status(400).json({ error: 'Indica de qué servicio es duplicado' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const r = await fusionarDuplicado(conn, Number(req.params.id), destino, req.asesor.id);
+    if (r.error) { await conn.rollback(); return res.status(r.error[0]).json({ error: r.error[1] }); }
+    await conn.commit();
+    res.json(r);
+  } catch (err) { await conn.rollback().catch(() => {}); throw err; }
+  finally { conn.release(); }
+});
+// Para elegir bien cuál se queda: del mismo cliente y tipo, con sus documentos, mensajes y si su alta está aprobada
+async function candidatosDuplicado(conn, clienteIds) {
+  if (!clienteIds.length) return [];
+  const [f] = await conn.query(`SELECT s.id, s.cliente_id, s.tipo, s.ejercicio_desde, s.ejercicio_hasta, s.confirmado, p.creado_en AS encargo_creado_en,
+      (SELECT COUNT(*) FROM documentos_fiscales x WHERE x.propuesta_id = s.propuesta_id AND x.servicio = s.servicio) AS docs,
+      (SELECT COUNT(*) FROM mensajes m WHERE m.propuesta_id = s.propuesta_id AND m.servicio = s.servicio) AS mensajes,
+      (SELECT COUNT(*) FROM diligencias g WHERE g.propuesta_id = s.propuesta_id AND g.estado = 'aprobado') > 0 AS alta_aprobada
+    FROM servicios_cliente s JOIN propuestas p ON p.id = s.propuesta_id WHERE s.cliente_id IN (?) AND s.confirmado IN (0, 1)`, [clienteIds]);
+  const vistas = new Map();
+  for (const c of clienteIds) (await listarServiciosCliente(conn, c)).forEach(v => vistas.set(v.id, v));
+  return f.map(x => Object.assign(x, { nombre_es: (vistas.get(x.id) || {}).nombre_es || x.tipo, alta_aprobada: !!x.alta_aprobada }));
+}
 
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
