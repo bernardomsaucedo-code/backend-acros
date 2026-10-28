@@ -954,7 +954,10 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('servicios_cliente', '`aviso_urgencia`', "VARCHAR(40) NULL DEFAULT 'base'");
       await agregaColumnaSiFalta('personas', '`iniciales`', 'VARCHAR(4) NULL');
       await agregaColumnaSiFalta('diligencias', '`heredada_de`', 'INT NULL');   // 21/10: alta una vez por cliente
-      await agregaColumnaSiFalta('solicitudes_llamada', '`motivo`', 'VARCHAR(500) NULL');   // 21/10: de qué quiere hablar (opcional, desde la web)
+      await agregaColumnaSiFalta('solicitudes_llamada', '`motivo`', 'VARCHAR(500) NULL');
+      await agregaColumnaSiFalta('entregas', '`conformidad_pedida_en`', 'DATETIME NULL');
+      await pool.execute('CREATE TABLE IF NOT EXISTS notas_cliente (id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, asesor_id INT NULL, origen VARCHAR(20) NOT NULL DEFAULT \'ficha\', texto VARCHAR(4000) NOT NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_cliente (cliente_id))');   // 26/10: notas del cliente, como un blog   // 26/10: el visto bueno solo cuando el asesor lo pide   // 21/10: de qué quiere hablar (opcional, desde la web)
+      await pool.execute('CREATE TABLE IF NOT EXISTS cobertura_marcas (id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, tipo VARCHAR(40) NOT NULL, ejercicio INT NOT NULL, estado VARCHAR(12) NOT NULL, nota VARCHAR(1000) NULL, asesor_id INT NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_cliente (cliente_id))');   // 26/10: cobertura por ejercicio (historial)
       await pool.execute('CREATE TABLE IF NOT EXISTS llamadas_notas (id INT AUTO_INCREMENT PRIMARY KEY, llamada_id INT NOT NULL, asesor_id INT NULL, texto VARCHAR(1000) NOT NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_llamada (llamada_id))');   // 20/10: quién en los avisos de ntfy (sin nombres)   // avisos de urgencia: lo existente se da por sabido
       await pool.execute(
         'CREATE TABLE IF NOT EXISTS servicios_historial (' +
@@ -5833,6 +5836,7 @@ app.post('/api/propuestas/:token/entregas/:id/conformidad', async (req, res) => 
   try {
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    if (!r.e.conformidad_pedida_en) return res.status(409).json({ error: 'Tu asesor aún no te ha pedido el visto bueno de este informe' });   // 26/10
     await conn.execute("UPDATE entregas SET `estado` = 'conforme', `respondido_en` = NOW() WHERE `id` = ?", [r.e.id]);
     await cerrarServicioPorInforme(conn, r.p, r.e.servicio).catch(err => console.error('Cierre del servicio por informe:', err.message));
     avisarCliente(r.e.cliente_id, '✅', 'un cliente ha dado su conformidad a su informe', 'Ese servicio queda terminado.', { etiqueta: 'white_check_mark' });
@@ -6880,6 +6884,30 @@ app.get('/api/admin/clientes/:id(\\d+)/servicios/historial', requiereSesionAseso
   res.json(f);
 });
 
+// 26/10 (Vikn): «Recordar el pago». Un correo al cliente con el enlace a su área; desde entonces, en
+// «Te toca a ti» su botón «Pagar» sale en teja (lo urgente o pedido por el asesor), no en verde.
+app.post('/api/admin/propuestas/:id(\\d+)/recordar-pago', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT id, cliente_id, estado, servicios, creado_en FROM propuestas WHERE id = ?', [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'Encargo no encontrado' });
+    const p = f[0];
+    if (p.estado !== 'aceptada') return res.status(409).json({ error: 'Ese encargo no está aceptado' });
+    const [pg] = await conn.execute('SELECT COUNT(*) AS n FROM pagos WHERE propuesta_id = ?', [p.id]);
+    if (pg[0].n) return res.status(409).json({ error: 'El cliente ya ha hecho el pago de ese encargo' });
+    const asesor = await personaDeCliente(p.cliente_id, conn).catch(() => null);
+    const quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
+    const nombres = serviciosDePropuesta(p).map(id => { const t = TIPOS_SERVICIO[tipoDeServicio(id)]; return t && t.generico ? t.generico.es : id; });
+    const r = await enviarRecordatorioCliente(conn, req, {
+      clienteId: p.cliente_id, tipo: 'pago', objetoId: p.id,
+      asunto: (asesor ? asesor.nombre + ', tu asesor de Acros' : 'Tu asesor de Acros') + ', te recuerda el pago de tu encargo',
+      titulo: 'Falta el pago de tu encargo',
+      parrafos: [`${quien} te recuerda que, para empezar a trabajar en tu encargo, falta el pago:`, nombres.length ? '<strong>' + nombres.map(ESC_HTML).join(', ') + '</strong>' : '', 'Puedes hacerlo desde tu área de cliente, con el método que prefieras.'].filter(Boolean),
+      textoWA: 'Acros: ' + (asesor ? asesor.nombre : 'tu asesor') + ' te recuerda el pago de tu encargo. Puedes hacerlo desde tu área.',
+    });
+    respuestaRecordatorio(res, r);
+  } finally { conn.release(); }
+});
 
 // ================================================================
 // ÁREA DEL CLIENTE NUEVA (20/10, ACROS 7 · fase 3): datos de TODOS sus encargos
@@ -6906,7 +6934,7 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
     const sidDe = (pid, serv) => { const s = svs.find(x => x.propuesta_id === pid && x.servicio === serv); return s ? s.id : null; };
     // La documentación solo se ve cuando el alta de ESE encargo está aprobada (como siempre)
     const [docs] = aprobadas.size ? await conn.query('SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en, id', [[...aprobadas]]) : [[]];
-    const [ents] = await conn.execute('SELECT id, propuesta_id, servicio, version, nombre_archivo, bytes, subido_en, estado, comentario, respondido_en FROM entregas WHERE cliente_id = ? ORDER BY id', [p.cliente_id]);
+    const [ents] = await conn.execute('SELECT id, propuesta_id, servicio, version, nombre_archivo, bytes, subido_en, estado, comentario, respondido_en, conformidad_pedida_en FROM entregas WHERE cliente_id = ? ORDER BY id', [p.cliente_id]);
     const [msgs] = await conn.query(
       `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor
        FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
@@ -6922,8 +6950,10 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
     ents.forEach(x => { const sid = sidDe(x.propuesta_id, x.servicio); add(x.subido_en, 'informe', { servicio_id: sid, nombre: x.nombre_archivo, version: x.version }); if (x.respondido_en) add(x.respondido_en, x.estado === 'conforme' ? 'conforme' : 'cambios', { servicio_id: sid, motivo: x.estado === 'cambios' ? x.comentario : undefined }); });
     evS.forEach(x => add(x.creado_en, 'servicio', { servicio_id: x.servicio_id, evento: x.evento }));
     h.sort((a, b) => new Date(b.cuando) - new Date(a.cuando));
+    const [recPago] = await conn.execute("SELECT objeto_id, MAX(creado_en) AS ultimo FROM recordatorios_cliente WHERE tipo = 'pago' AND cliente_id = ? GROUP BY objeto_id", [p.cliente_id]);   // 26/10
     res.json({
       encargos: props.map(x => ({ id: x.id, token: x.token, estado: x.estado, creado_en: x.creado_en, alta_aprobada: aprobadas.has(x.id),
+        pago_recordado_en: ((recPago.find(r => r.objeto_id === x.id)) || {}).ultimo || null,
         pago: pagos.some(g => g.propuesta_id === x.id), alta: ((dils.filter(g => g.propuesta_id === x.id).slice(-1)[0]) || {}).estado || null, servicios_nombres: x.estado === 'aceptada' ? serviciosDePropuesta(x).map(id => { const t = TIPOS_SERVICIO[tipoDeServicio(id)]; return t && t.generico ? t.generico : { es: id, en: id }; }) : undefined, expira_en: x.estado === 'enviada' ? x.token_expira_en : null, servicios: x.estado === 'enviada' ? serviciosDePropuesta(x) : undefined })),
       documentos: docs, entregas: ents,
       mensajes: msgs.map(m => Object.assign(m, { servicio_id: sidDe(m.propuesta_id, m.servicio) })),
@@ -7224,7 +7254,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-10-26.1';
+const VERSION_ACROS = '2026-10-27.1';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -7340,7 +7370,8 @@ async function enriquecerLlamadas(conn, filas) {
     const sol = t.length === 9 ? sols.filter(x => nueveDigitos(x.telefono) === t).slice(0, 3).map(x => ({ creado_en: x.creado_en, servicios: (() => { try { return JSON.parse(x.servicios); } catch (e) { return []; } })() })) : [];
     const emp = t.length === 9 ? emps.find(x => nueveDigitos(x.telefono) === t) : null;
     f.contexto = { cliente, es_cliente_de_otro: !!(c && !cliente), solicitudes: sol, empresa: emp ? { nombre: emp.razon_social, estado: emp.estado } : null };
-    f.notas = notas.filter(n => n.llamada_id === f.id).map(n => ({ texto: n.texto, asesor: n.asesor, creado_en: n.creado_en }));
+    f.notas = notas.filter(n => n.llamada_id === f.id).map(n => ({ texto: n.texto, asesor: n.asesor, creado_en: n.creado_en, origen: 'llamada' }));
+    if (cliente) { const todas = await notasDeCliente(conn, cliente.id); if (todas) f.notas = todas.slice().reverse(); }   // 26/10: todas las del cliente
   }
   return filas;
 }
@@ -7351,6 +7382,14 @@ app.post('/api/admin/llamadas/:id(\\d+)/notas', requiereSesionAsesor, async (req
   if (!l.length) return res.status(404).json({ error: 'Llamada no encontrada' });
   await pool.execute('INSERT INTO llamadas_notas (llamada_id, asesor_id, texto) VALUES (?, ?, ?)', [Number(req.params.id), req.asesor.id, texto]);
   const [n] = await pool.execute('SELECT n.texto, n.creado_en, a.nombre AS asesor FROM llamadas_notas n LEFT JOIN asesores a ON a.id = n.asesor_id WHERE n.llamada_id = ? ORDER BY n.creado_en', [Number(req.params.id)]);
+  // 26/10: si es de un cliente que ve quien escribe, se devuelven todas las del cliente
+  const [ll] = await pool.execute('SELECT telefono FROM solicitudes_llamada WHERE id = ?', [Number(req.params.id)]);
+  const t = nueveDigitos(ll[0].telefono), permitidos = await clientesPermitidos(req).catch(() => null);
+  if (t.length === 9) {
+    const [cs] = await pool.query('SELECT id, telefono, telefono2 FROM clientes WHERE telefono IS NOT NULL OR telefono2 IS NOT NULL');
+    const c = cs.find(x => (nueveDigitos(x.telefono) === t || nueveDigitos(x.telefono2) === t) && (!permitidos || permitidos.has(x.id)));
+    if (c) { const conn = await pool.getConnection(); try { return res.status(201).json({ notas: (await notasDeCliente(conn, c.id)).slice().reverse() }); } finally { conn.release(); } }
+  }
   res.status(201).json({ notas: n });
 });
 
@@ -7432,6 +7471,176 @@ iaEjecutarHerramienta = async function (nombre, entrada, req, usados) {
 if (process.env.ACROS_PRUEBAS === '1') app.post('/api/admin/ia/herramienta-prueba', requiereSesionAsesor, async (req, res) => {
   const usados = new Map();
   res.json({ resultado: await iaEjecutarHerramienta(String((req.body || {}).nombre), (req.body || {}).entrada || {}, req, usados), codigos: [...usados.keys()] });
+});
+
+// ================================================================
+// «RECORDAR AL CLIENTE» (26/10, Vikn)
+// Un solo botón en la ficha: se ven todas las cosas que se le pueden recordar
+// a ese cliente (documentos, pagos, servicios por confirmar, el visto bueno de
+// sus informes, completar el alta), cada una con cuándo se le recordó por
+// última vez; se marcan las que se quieran y sale UN correo con todas.
+// El visto bueno de un informe («Todo correcto») ya no lo puede dar el cliente
+// por su cuenta: el asesor se lo pide desde aquí (la primera vez es «Pedir el
+// visto bueno»), y entonces en su área le aparece el botón, en teja.
+// ================================================================
+const nombreGenerico = id => { const t = TIPOS_SERVICIO[tipoDeServicio(id)]; return t && t.generico ? t.generico.es : (id || ''); };
+async function recordablesDeCliente(conn, clienteId) {
+  const [recs] = await conn.execute('SELECT tipo, objeto_id, MAX(creado_en) AS ultimo FROM recordatorios_cliente WHERE cliente_id = ? GROUP BY tipo, objeto_id', [clienteId]);
+  const ult = (t, id) => { const r = recs.find(x => x.tipo === t && x.objeto_id === id); return r ? r.ultimo : null; };
+  const hoy = f => !!f && (Date.now() - new Date(f).getTime()) < HORAS_ENTRE_RECORDATORIOS * 3600e3;
+  const it = [];
+  const [docs] = await conn.execute("SELECT id, nombre, servicio, estado, creado_en, revisado_en FROM documentos_fiscales WHERE cliente_id = ? AND estado IN ('pendiente','rechazado') ORDER BY id", [clienteId]);
+  docs.forEach(d => it.push({ tipo: 'documento', id: d.id, titulo: (d.estado === 'rechazado' ? 'Volver a subir «' : 'Subir «') + d.nombre + '»', sub: nombreGenerico(d.servicio) || 'Documento' }));
+  const [props] = await conn.execute("SELECT p.id, p.servicios, p.creado_en, (SELECT COUNT(*) FROM pagos g WHERE g.propuesta_id = p.id) AS n_pagos, (SELECT COUNT(*) FROM diligencias d WHERE d.propuesta_id = p.id) AS n_altas FROM propuestas p WHERE p.cliente_id = ? AND p.estado = 'aceptada' ORDER BY p.id", [clienteId]);
+  const dma = f => { const d = new Date(f); return String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear(); };
+  props.forEach(p => {
+    const sv = serviciosDePropuesta(p).map(nombreGenerico).join(', ');
+    if (!p.n_pagos) it.push({ tipo: 'pago', id: p.id, titulo: 'Pagar el encargo del ' + dma(p.creado_en), sub: sv });
+    else if (!p.n_altas) it.push({ tipo: 'alta', id: p.id, titulo: 'Completar el alta (cuestionario y documento de identidad)', sub: 'Encargo del ' + dma(p.creado_en) });
+  });
+  const sv = await listarServiciosCliente(conn, clienteId);
+  sv.filter(s => s.estado === 'por_confirmar').forEach(s => it.push({ tipo: 'servicio', id: s.id, titulo: 'Confirmar que está terminado', sub: s.nombre_es }));
+  const [ents] = await conn.execute("SELECT e.id, e.nombre_archivo, e.servicio, e.conformidad_pedida_en FROM entregas e WHERE e.cliente_id = ? AND e.estado = 'entregado' AND e.id = (SELECT MAX(e2.id) FROM entregas e2 WHERE e2.propuesta_id = e.propuesta_id AND e2.servicio = e.servicio) ORDER BY e.id", [clienteId]);
+  ents.forEach(e => it.push({ tipo: 'informe', id: e.id, titulo: e.conformidad_pedida_en ? 'Dar el visto bueno al informe «' + e.nombre_archivo + '»' : 'Pedirle el visto bueno del informe «' + e.nombre_archivo + '»', sub: nombreGenerico(e.servicio), pedida: e.conformidad_pedida_en }));
+  return it.map(x => { const u = ult(x.tipo, x.id); return Object.assign(x, { ultimo: u, recordado_hoy: hoy(u) }); });
+}
+app.get('/api/admin/clientes/:id(\\d+)/recordables', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try { res.json({ items: await recordablesDeCliente(conn, Number(req.params.id)) }); } finally { conn.release(); }
+});
+app.post('/api/admin/clientes/:id(\\d+)/recordar', requiereSesionAsesor, async (req, res) => {
+  const clienteId = Number(req.params.id);
+  const pedidos = Array.isArray((req.body || {}).items) ? req.body.items : [];
+  if (!pedidos.length) return res.status(400).json({ error: 'Marca al menos una cosa que recordarle' });
+  const conn = await pool.getConnection();
+  try {
+    const todos = await recordablesDeCliente(conn, clienteId);
+    const elegidos = [], omitidos = [];
+    for (const p of pedidos) {
+      const x = todos.find(t => t.tipo === p.tipo && t.id === Number(p.id));
+      if (!x) { omitidos.push({ tipo: p.tipo, id: p.id, motivo: 'ya no está pendiente' }); continue; }
+      if (x.recordado_hoy) { omitidos.push({ tipo: x.tipo, id: x.id, motivo: 'ya se le recordó hoy' }); continue; }
+      elegidos.push(x);
+    }
+    if (!elegidos.length) return res.status(409).json({ error: 'Nada que enviar: ' + omitidos.map(o => o.motivo).filter((v, i, a) => a.indexOf(v) === i).join('; '), omitidos });
+    for (const x of elegidos) {
+      await conn.execute('INSERT INTO recordatorios_cliente (tipo, objeto_id, cliente_id, asesor_id) VALUES (?, ?, ?, ?)', [x.tipo, x.id, clienteId, req.asesor.id]);
+      if (x.tipo === 'informe') await conn.execute('UPDATE entregas SET conformidad_pedida_en = COALESCE(conformidad_pedida_en, NOW()) WHERE id = ?', [x.id]);
+    }
+    const [cl] = await conn.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [clienteId]);
+    const asesor = await personaDeCliente(clienteId, conn).catch(() => null);
+    const quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
+    const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+    const linea = x => x.tipo === 'informe' ? 'Dar el visto bueno a tu informe «' + ESC_HTML(x.titulo.replace(/^.*«|»$/g, '')) + '» (' + ESC_HTML(x.sub) + ')' : ESC_HTML(x.titulo) + (x.sub ? ' (' + ESC_HTML(x.sub) + ')' : '');
+    let correo = 'sin_correo';
+    if (cl.length && cl[0].correo) {
+      if (!brevoActivo()) correo = 'sin_servicio';
+      else {
+        const c = plantillaCorreo({
+          titulo: elegidos.length === 1 ? 'Tienes algo pendiente en tu área' : 'Tienes ' + elegidos.length + ' cosas pendientes en tu área',
+          parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:', `${quien} te recuerda lo que tienes pendiente para avanzar con tu encargo:`, '<ul>' + elegidos.map(x => '<li>' + linea(x) + '</li>').join('') + '</ul>', 'Lo tienes todo en «Te toca a ti», dentro de tu área.'],
+          boton: enlace ? { texto: 'Entrar en mi área', url: enlace } : null,
+          nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
+        });
+        try {
+          const salio = await notificarCliente(conn, clienteId, 'recordatorios', () => enviarCorreo(cl[0].correo, (asesor ? asesor.nombre + ', tu asesor de Acros' : 'Tu asesor de Acros') + ', te recuerda lo que tienes pendiente', c.html, c.texto), 'Acros: ' + (asesor ? asesor.nombre : 'tu asesor') + ' te recuerda lo que tienes pendiente en tu área.' + (enlace ? ' ' + enlace : ''));
+          correo = salio ? 'enviado' : 'desactivado_por_cliente';
+        } catch (err) { console.error('Recordatorio conjunto no enviado:', err.message); correo = 'fallo'; }
+      }
+    }
+    res.json({ ok: true, correo, enviados: elegidos.length, omitidos });
+  } finally { conn.release(); }
+});
+
+// ================================================================
+// NOTAS DEL CLIENTE (26/10, Vikn)
+// Un solo historial por cliente, como un blog: no se borra ni se edita nada y
+// cada nota lleva quién, cuándo y desde dónde se escribió. Junta las notas
+// escritas en su ficha y las de sus llamadas (por su teléfono), se escribieran
+// donde se escribieran.
+// ================================================================
+async function notasDeCliente(conn, clienteId) {
+  const [cl] = await conn.execute('SELECT telefono, telefono2 FROM clientes WHERE id = ?', [clienteId]);
+  if (!cl.length) return null;
+  const [propias] = await conn.execute("SELECT n.id, n.texto, n.creado_en, n.origen, a.nombre AS asesor FROM notas_cliente n LEFT JOIN asesores a ON a.id = n.asesor_id WHERE n.cliente_id = ?", [clienteId]);
+  const tels = [cl[0].telefono, cl[0].telefono2].map(nueveDigitos).filter(t => t.length === 9);
+  let deLlamadas = [];
+  if (tels.length) {
+    const [ll] = await conn.query('SELECT id, telefono, creado_en FROM solicitudes_llamada');
+    const ids = ll.filter(l => tels.includes(nueveDigitos(l.telefono))).map(l => l.id);
+    if (ids.length) [deLlamadas] = await conn.query("SELECT n.id, n.texto, n.creado_en, 'llamada' AS origen, n.llamada_id, a.nombre AS asesor FROM llamadas_notas n LEFT JOIN asesores a ON a.id = n.asesor_id WHERE n.llamada_id IN (?)", [ids]);
+  }
+  return propias.map(n => Object.assign(n, { clave: 'c' + n.id })).concat(deLlamadas.map(n => Object.assign(n, { clave: 'l' + n.id })))
+    .sort((a, b) => new Date(b.creado_en) - new Date(a.creado_en) || (b.clave > a.clave ? 1 : -1));
+}
+app.get('/api/admin/clientes/:id(\\d+)/notas', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try { const n = await notasDeCliente(conn, Number(req.params.id)); if (!n) return res.status(404).json({ error: 'Cliente no encontrado' }); res.json({ notas: n }); } finally { conn.release(); }
+});
+app.post('/api/admin/clientes/:id(\\d+)/notas', requiereSesionAsesor, async (req, res) => {
+  const texto = String((req.body || {}).texto || '').trim().slice(0, 4000);
+  if (!texto) return res.status(400).json({ error: 'Escribe la nota' });
+  const conn = await pool.getConnection();
+  try {
+    const [c] = await conn.execute('SELECT id FROM clientes WHERE id = ?', [Number(req.params.id)]);
+    if (!c.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+    await conn.execute("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, 'ficha', ?)", [Number(req.params.id), req.asesor.id, texto]);
+    res.status(201).json({ notas: await notasDeCliente(conn, Number(req.params.id)) });
+  } finally { conn.release(); }
+});
+
+// ================================================================
+// RELACIÓN CON ACROS (26/10, Vikn)
+// Una vista propia por cliente con lo «comercial»: la cobertura por ejercicio
+// (qué servicios tiene con nosotros cada año, con «Sí» automático por sus
+// servicios y marcas a mano «No» o «Sí, fuera del sistema» con su nota, que
+// guardan historial: nada se borra), resumen de encargos y pagos y valoraciones.
+// ================================================================
+const FILAS_COBERTURA = ['renta', 'pyg', 'm720', 'm721', 'm714', 'optimizacion', 'requerimiento', 'origen', 'certificado', 'nft', 'acompanamiento'];
+const ESTADOS_MARCA = ['no', 'fuera', 'quitar'];
+app.get('/api/admin/clientes/:id(\\d+)/relacion', requiereSesionAsesor, async (req, res) => {
+  const clienteId = Number(req.params.id);
+  const conn = await pool.getConnection();
+  try {
+    const [cl] = await conn.execute('SELECT id, creado_en FROM clientes WHERE id = ?', [clienteId]);
+    if (!cl.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+    const [sv] = await conn.execute('SELECT id, tipo, ejercicio_desde, ejercicio_hasta, estado, confirmado FROM servicios_cliente WHERE cliente_id = ? AND confirmado IN (0, 1)', [clienteId]);
+    const [mar] = await conn.execute('SELECT m.id, m.tipo, m.ejercicio, m.estado, m.nota, m.creado_en, a.nombre AS asesor FROM cobertura_marcas m LEFT JOIN asesores a ON a.id = m.asesor_id WHERE m.cliente_id = ? ORDER BY m.creado_en, m.id', [clienteId]);
+    const [vals] = await conn.execute("SELECT v.propuesta_id, v.atencion, v.calidad, v.rapidez, COALESCE(v.comentario_revisado, v.comentario) AS comentario, v.estado, v.creado_en FROM valoraciones v WHERE v.cliente_id = ? AND v.estado <> 'omitida' ORDER BY v.creado_en DESC", [clienteId]);
+    const anioActual = Number(hoyMadridISO().slice(0, 4));
+    const anios = new Set();
+    for (let a = anioActual - 4; a <= anioActual; a++) anios.add(a);
+    const celdas = [];
+    sv.forEach(s => {
+      const fila = s.tipo === 'pyg_anteriores' ? 'pyg' : s.tipo;
+      if (!FILAS_COBERTURA.includes(fila)) return;
+      const d = s.ejercicio_desde || s.ejercicio_hasta, h = s.ejercicio_hasta || s.ejercicio_desde;
+      if (!d) return;
+      for (let a = d; a <= h && a <= anioActual + 1; a++) { anios.add(a); celdas.push({ fila, anio: a, servicio_id: s.id, estado: s.estado, sin_confirmar: !s.confirmado, via: s.tipo === 'pyg_anteriores' ? 'P&G de ejercicios anteriores' : null }); }
+    });
+    const ultima = {};
+    mar.forEach(m => { ultima[m.tipo + ':' + m.ejercicio] = m; anios.add(m.ejercicio); });
+    const marcas = Object.values(ultima).filter(m => m.estado !== 'quitar');
+    const medias = vals.filter(v => v.atencion || v.calidad || v.rapidez);
+    const media = medias.length ? Math.round(medias.reduce((t, v) => t + ((v.atencion || 0) + (v.calidad || 0) + (v.rapidez || 0)) / [v.atencion, v.calidad, v.rapidez].filter(Boolean).length, 0) / medias.length * 10) / 10 : null;
+    res.json({
+      filas: FILAS_COBERTURA.map(t => ({ tipo: t, nombre: (TIPOS_SERVICIO[t].generico || {}).es || t })),
+      anios: [...anios].filter(a => a >= 2010 && a <= anioActual + 1).sort((a, b) => a - b), anio_actual: anioActual,
+      celdas, marcas, historial_marcas: mar, valoraciones: vals, valoracion_media: media, cliente_desde: cl[0].creado_en,
+    });
+  } finally { conn.release(); }
+});
+app.post('/api/admin/clientes/:id(\\d+)/cobertura', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {};
+  const tipo = String(b.tipo || ''), anio = Number(b.ejercicio), estado = String(b.estado || ''), nota = String(b.nota || '').trim().slice(0, 1000);
+  if (!FILAS_COBERTURA.includes(tipo)) return res.status(400).json({ error: 'Servicio no válido' });
+  if (!Number.isInteger(anio) || anio < 2010 || anio > 2100) return res.status(400).json({ error: 'Ejercicio no válido' });
+  if (!ESTADOS_MARCA.includes(estado)) return res.status(400).json({ error: 'Marca no válida' });
+  if (estado !== 'quitar' && !nota) return res.status(400).json({ error: 'Escribe el motivo: es lo que explica por qué tiene o no tiene ese servicio con nosotros' });
+  const [c] = await pool.execute('SELECT id FROM clientes WHERE id = ?', [Number(req.params.id)]);
+  if (!c.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+  await pool.execute('INSERT INTO cobertura_marcas (cliente_id, tipo, ejercicio, estado, nota, asesor_id) VALUES (?, ?, ?, ?, ?, ?)', [Number(req.params.id), tipo, anio, estado, nota || null, req.asesor.id]);
+  res.status(201).json({ ok: true });
 });
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
