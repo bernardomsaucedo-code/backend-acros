@@ -79,6 +79,130 @@ process.on('unhandledRejection', err => {
 // base64.
 app.use(express.json({ limit: '15mb' }));
 
+// ================================================================
+// REGISTRO MAESTRO (30/10, Vikn)
+// Todo queda anotado: lo que hace el equipo (con el antes y el después en lo que cambia datos), quién abre qué ficha o documento,
+// entradas, salidas y PIN, lo que hacen los clientes y lo que hace el propio sistema (correos, avisos, copias). Nunca contraseñas, PIN,
+// códigos, tokens ni el contenido de documentos o mensajes. Solo se añade: no hay forma de editarlo ni de borrarlo (salvo el tope de
+// 15 años). Lo ven solo los administradores, y la IA cuando le pregunta un administrador.
+// ================================================================
+const CAMPOS_SECRETOS = /hash|secreto|recuperacion|token|clave|_ref$|_iv$|contrasena|^pin_|cifrad|totp/i;
+const CAMPOS_CONTENIDO = /^(texto|cuerpo|contenido|mensaje)$/i;
+const REG_SENSIBLES = [
+  [/^(PUT|POST|DELETE|PATCH)$/, /^\/api\/admin\/asesores\/(\d+)(\/[a-z0-9\/-]*)?$/, 'asesores'],
+  [/^(PUT|POST|PATCH)$/, /^\/api\/admin\/clientes\/(\d+)(\/(fusionar|2fa\/reiniciar|asesor|codigo|datos))?$/, 'clientes'],
+  [/^(PUT|POST|DELETE)$/, /^\/api\/admin\/personas\/(\d+)(\/horario)?$/, 'personas'],
+  [/^(PUT|POST|DELETE)$/, /^\/api\/admin\/equipos\/(\d+)(\/[a-z-]+)?$/, 'equipos'],
+  [/^(PUT|POST)$/, /^\/api\/admin\/documentos\/(\d+)\/revisar$/, 'documentos_fiscales'],
+  [/^(PUT|POST)$/, /^\/api\/admin\/pagos\/(\d+)(\/[a-z]+)?$/, 'pagos'],
+  [/^(PUT|POST)$/, /^\/api\/admin\/diligencias\/(\d+)(\/[a-z-]+)?$/, 'diligencias'],
+  [/^(PUT|POST)$/, /^\/api\/admin\/cambios-asesor\/(\d+)\/resolver$/, 'cambios_asesor'],
+  [/^(PUT|POST|DELETE)$/, /^\/api\/admin\/servicios\/(\d+)(\/[a-z-]+)?$/, 'servicios_cliente'],
+  [/^(PUT|POST|DELETE)$/, /^\/api\/admin\/entregas\/(\d+)(\/[a-z-]+)?$/, 'entregas'],
+];
+const REG_AJUSTES = /^\/api\/admin\/(ajustes-rendimiento|correo-ajustes|canales|ajustes|plazos)/;
+const REG_LECTURAS = /^\/api\/admin\/(clientes\/\d+(\/(cartera|relacion|notas|correos|servicios|ficha))?|documentos\/\d+\/descargar|entregas\/\d+\/descargar|diligencias\/\d+\/(documento|descargar)|mensajes\/\d+\/archivo|copias-bd\/\d+\/descargar|registro(\.csv)?)$/;
+const REG_LECTURAS_CLIENTE = /^\/api\/propuestas\/[0-9a-f]{32}\/(entregas\/\d+\/descargar|mensajes\/\d+\/archivo)$/;
+const ACCIONES = [
+  [/^POST \/api\/admin\/login/, (s) => s < 400 ? 'Entrada al panel' : 'Entrada al panel fallida'], [/^POST \/api\/admin\/logout$/, () => 'Salida del panel'],
+  [/^POST \/api\/admin\/pin\/desbloquear$/, (s) => s < 400 ? 'Desbloquea el panel con su PIN' : 'PIN incorrecto'], [/^POST \/api\/admin\/pin\/bloquear$/, () => 'Panel bloqueado por inactividad'],
+  [/^POST \/api\/admin\/pin\/(crear|cambiar|olvidado)$/, () => 'Crea, cambia o restablece su PIN'], [/^POST \/api\/admin\/asesores\/:id\/pin\/reiniciar$/, () => 'Reinicia el PIN de otra persona'],
+  [/^PUT \/api\/admin\/asesores\/:id\/roles$/, () => 'Cambia los roles de una persona'], [/^POST \/api\/admin\/asesores$/, () => 'Da de alta un asesor (clave maestra)'],
+  [/^POST \/api\/admin\/asesores\/:id\/rol$/, () => 'Cambia el rol de administrador (clave maestra)'],
+  [/^GET \/api\/admin\/clientes\/:id$/, () => 'Abre la ficha de un cliente'], [/^GET \/api\/admin\/clientes\/:id\/cartera$/, () => 'Abre la cartera de un cliente'],
+  [/^GET \/api\/admin\/clientes\/:id\/relacion$/, () => 'Abre «Relación con Acros»'], [/^GET \/api\/admin\/clientes\/:id\/notas$/, () => 'Lee las notas de un cliente'],
+  [/^GET \/api\/admin\/documentos\/:id\/descargar$/, () => 'Abre un documento del cliente'], [/^GET \/api\/admin\/entregas\/:id\/descargar$/, () => 'Abre un informe'],
+  [/^GET \/api\/admin\/diligencias\/:id\/(documento|descargar)$/, () => 'Abre un documento de identidad'], [/^GET \/api\/admin\/mensajes\/:id\/archivo$/, () => 'Abre un archivo del chat'],
+  [/^GET \/api\/admin\/registro/, () => 'Consulta el registro maestro'], [/^POST \/api\/admin\/clientes\/:id\/fusionar$/, () => 'Fusiona dos fichas'],
+  [/^POST \/api\/admin\/clientes\/:id\/correo$/, () => 'Escribe un correo a un cliente'], [/^PUT \/api\/admin\/clientes\/:id$/, () => 'Edita los datos de un cliente'],
+  [/^POST \/api\/admin\/documentos\/:id\/revisar$/, () => 'Revisa un documento'], [/^POST \/api\/admin\/cambios-asesor\/:id\/resolver$/, () => 'Resuelve un cambio de asesor'],
+  [/^POST \/api\/propuestas\/:token\/aceptar$/, () => 'El cliente acepta la propuesta'], [/^POST \/api\/propuestas\/:token\/rechazar$/, () => 'El cliente rechaza la propuesta'],
+  [/^POST \/api\/propuestas\/:token\/pago$/, () => 'El cliente declara el pago'], [/^POST \/api\/propuestas\/:token\/diligencia$/, () => 'El cliente envía el alta'],
+  [/^POST \/api\/propuestas\/:token\/documentos\/:id\/subir$/, () => 'El cliente sube un documento'], [/^POST \/api\/propuestas\/:token\/entregas\/:id\/conformidad$/, () => 'El cliente da el visto bueno'],
+  [/^POST \/api\/propuestas\/:token\/entregas\/:id\/cambios$/, () => 'El cliente pide un cambio en el informe'], [/^POST \/api\/propuestas\/:token\/cambio-asesor$/, () => 'El cliente pide cambiar de asesor'],
+  [/^POST \/api\/propuestas\/:token\/mensajes$/, () => 'El cliente escribe en el chat'], [/^GET \/api\/propuestas\/:token\/entregas\/:id\/descargar$/, () => 'El cliente descarga un informe'],
+  [/^GET \/api\/propuestas\/:token\/mensajes\/:id\/archivo$/, () => 'El cliente descarga un archivo del chat'], [/^POST \/api\/(presupuesto|llamada)/, () => 'Solicitud desde la web'],
+];
+const detalleSeguro = t => { if (!t) return null; try { return JSON.parse(t); } catch (e) { return { ilegible: true }; } };
+const rutaPatron = p => String(p).replace(/[0-9a-f]{32}/g, ':token').replace(/\/\d+/g, '/:id').slice(0, 200);
+function accionDe(metodo, ruta, s) { const k = metodo + ' ' + ruta; const a = ACCIONES.find(([re]) => re.test(k)); return a ? a[1](s) : k; }
+function tipoDe(actor, metodo, ruta) {
+  if (actor === 'sistema') return 'sistema'; if (actor === 'cliente' || actor === 'visitante') return 'cliente'; if (actor === 'clave_maestra') return 'cambio';
+  if (/\/(login|logout|pin\/)/.test(ruta)) return 'acceso';
+  return metodo === 'GET' ? 'lectura' : 'cambio';
+}
+function anotarRegistro(r) {
+  let detalle = r.detalle && Object.keys(r.detalle).length ? JSON.stringify(r.detalle) : null;
+  if (detalle && detalle.length > 8000) detalle = JSON.stringify({ estado: r.detalle.estado, recortado: true, campos_cambiados: r.detalle.cambios ? Object.keys(r.detalle.cambios.antes || {}) : undefined });   // nunca un JSON partido
+  pool.execute('INSERT INTO registro (actor_tipo, actor_id, actor_nombre, tipo, accion, metodo, ruta, estado_http, objeto_id, cliente_id, detalle, ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [r.actor_tipo, r.actor_id || null, (r.actor_nombre || '').slice(0, 120) || null, r.tipo || tipoDe(r.actor_tipo), String(r.accion || '').slice(0, 200), r.metodo || null, r.ruta || null, r.estado_http || null, r.objeto_id || null, r.cliente_id || null, detalle, r.ip || null])
+    .catch(e => console.error('Registro no anotado:', e.message));
+}
+async function filaReg(tabla, id) { try { const [f] = await pool.query('SELECT * FROM `' + tabla + '` WHERE id = ?', [id]); return f[0] || null; } catch (e) { return null; } }
+const valorReg = v => v instanceof Date ? v.toISOString() : Buffer.isBuffer(v) ? '(binario)' : v;
+function diferenciasReg(a, b) {
+  const out = { antes: {}, despues: {} }, secretos = [];
+  new Set([...Object.keys(a || {}), ...Object.keys(b || {})]).forEach(k => {
+    if (/^(actualizado_en|creado_en)$/.test(k)) return;
+    const x = a ? valorReg(a[k]) : undefined, y = b ? valorReg(b[k]) : undefined;
+    if (JSON.stringify(x) === JSON.stringify(y)) return;
+    if (CAMPOS_SECRETOS.test(k)) { secretos.push(k); return; }
+    if (CAMPOS_CONTENIDO.test(k)) { out.antes[k] = '(contenido)'; out.despues[k] = '(contenido)'; return; }
+    out.antes[k] = x === undefined ? null : x; out.despues[k] = y === undefined ? null : y;
+  });
+  if (!Object.keys(out.antes).length && !secretos.length) return null;
+  if (secretos.length) out.cambiados_sin_mostrar = secretos;
+  return out;
+}
+function resumenCuerpo(body) {
+  const r = {}; if (!body || typeof body !== 'object') return r;
+  Object.keys(body).slice(0, 25).forEach(k => {
+    if (CAMPOS_SECRETOS.test(k) || /^(pin|nuevo|actual|codigo|datos_base64|archivo|contrasena|clave_auth)$/i.test(k)) return;
+    const v = body[k]; if (v == null || v === '') return;
+    r[k] = CAMPOS_CONTENIDO.test(k) ? '(' + String(v).length + ' caracteres)' : typeof v === 'object' ? JSON.stringify(v).slice(0, 200) : String(v).slice(0, 200);
+  });
+  return r;
+}
+app.use(async (req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  const t0 = Date.now(), metodo = req.method;
+  let tabla = null, idObj = null, antes = null, ajAntes = null;
+  try {
+    const s = REG_SENSIBLES.find(([m, re]) => m.test(metodo) && re.test(req.path));
+    if (s) { tabla = s[2]; idObj = Number(req.path.match(s[1])[1]); antes = await filaReg(tabla, idObj); }
+    if (metodo !== 'GET' && REG_AJUSTES.test(req.path)) { const [f] = await pool.query('SELECT clave, valor FROM ajustes'); ajAntes = Object.fromEntries(f.map(x => [x.clave, x.valor])); }
+  } catch (e) { /* el registro nunca frena una petición */ }
+  if (metodo === 'OPTIONS' || metodo === 'HEAD') return next();
+  if (req.path.startsWith('/api/correo-entrante/')) return next();   // su dirección lleva un secreto: la recepción se anota aparte, sin él   // las comprobaciones previas del navegador no son actividad
+  res.on('finish', async () => {
+    try {
+      const est = res.statusCode, ruta = rutaPatron(req.path), admin = req.path.startsWith('/api/admin/');
+      let actor = null, actorId = null, actorNombre = null, clienteId = null;
+      if (admin) {
+        if (/^\/api\/admin\/(login|logout)/.test(req.path)) { if (metodo === 'GET') return; actor = 'asesor'; actorId = req.asesor ? req.asesor.id : null; actorNombre = req.asesor ? req.asesor.nombre : String((req.body || {}).correo || '').slice(0, 120) || 'desconocido'; }
+        else if (req.asesor) { if (metodo === 'GET' && !REG_LECTURAS.test(req.path)) return; if (/^\/api\/admin\/(pin\/latido|mensajes\/sin-leer|sesion)/.test(req.path)) return; actor = 'asesor'; actorId = req.asesor.id; actorNombre = req.asesor.nombre; }
+        else if (metodo !== 'GET' && /^\/api\/admin\/asesores/.test(req.path)) { actor = 'clave_maestra'; actorNombre = 'Clave maestra'; }
+        else return;
+        const m = req.path.match(/^\/api\/admin\/clientes\/(\d+)/); if (m) clienteId = Number(m[1]);
+      } else {
+        if (metodo === 'GET' && !REG_LECTURAS_CLIENTE.test(req.path)) return;
+        if (metodo === 'OPTIONS' || metodo === 'HEAD') return;
+        const m = req.path.match(/^\/api\/propuestas\/([0-9a-f]{32})/);
+        if (m) { const [p] = await pool.query('SELECT cliente_id FROM propuestas WHERE token = ?', [m[1]]); clienteId = p.length ? p[0].cliente_id : null; actor = 'cliente'; actorNombre = clienteId ? 'Cliente' : 'Enlace no válido'; }
+        else { actor = 'visitante'; actorNombre = 'Visitante de la web'; }
+      }
+      const detalle = { estado: est, ms: Date.now() - t0 };
+      const cuerpo = resumenCuerpo(req.body); if (Object.keys(cuerpo).length && metodo !== 'GET') detalle.datos = cuerpo;
+      if (tabla && est < 400) { const despues = metodo === 'DELETE' ? null : await filaReg(tabla, idObj); const d = diferenciasReg(antes, despues); if (d) detalle.cambios = Object.assign({ tabla }, d); if (!clienteId && (antes || despues)) clienteId = (antes || despues).cliente_id || (tabla === 'clientes' ? idObj : null); }
+      if (ajAntes && est < 400) { const [f] = await pool.query('SELECT clave, valor FROM ajustes'); const aD = Object.fromEntries(f.map(x => [x.clave, x.valor])); const ca = {}; new Set([...Object.keys(ajAntes), ...Object.keys(aD)]).forEach(k => { if (ajAntes[k] !== aD[k]) ca[k] = /^ntfy_/.test(k) ? { antes: ajAntes[k] ? '(canal)' : null, despues: aD[k] ? '(canal nuevo)' : null } : { antes: ajAntes[k] == null ? null : ajAntes[k], despues: aD[k] == null ? null : aD[k] }; }); if (Object.keys(ca).length) detalle.ajustes = ca; }
+      const ids = (req.path.replace(/[0-9a-f]{32}/g, '').match(/\/(\d+)/g) || []).map(x => Number(x.slice(1))).filter(n => n > 0 && n < 2147483647);   // sin los tokens de cliente
+      anotarRegistro({ actor_tipo: actor, actor_id: actorId, actor_nombre: actorNombre, tipo: tipoDe(actor, metodo, ruta), accion: accionDe(metodo, ruta, est), metodo, ruta, estado_http: est, objeto_id: idObj || (ids.length ? ids[0] : null), cliente_id: clienteId, detalle, ip: String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim().slice(0, 64) });
+    } catch (e) { console.error('Registro:', e.message); }
+  });
+  next();
+});
+
+
 // Bug real encontrado y corregido (08/09): con ORIGENES_PERMITIDOS=* el
 // .split(',') de antes convertía "*" en el ARRAY ['*'] — y el paquete
 // "cors" trata un array como una lista de orígenes exactos a comparar,
@@ -137,9 +261,11 @@ const r2 = new S3Client({
 const R2_BUCKET = process.env.R2_BUCKET;
 
 async function subirAR2(clave, buffer, tipoMime) {
+  if (!R2_BUCKET && process.env.ACROS_PRUEBAS === '1') { R2_MEMORIA.set(clave, { buffer, tipoMime }); return; }   // solo pruebas
   await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: clave, Body: buffer, ContentType: tipoMime }));
 }
 async function bajarDeR2(clave) {
+  if (!R2_BUCKET && process.env.ACROS_PRUEBAS === '1') { const g = R2_MEMORIA.get(clave); if (!g) throw new Error('No existe'); return { buffer: g.buffer, tipoMime: g.tipoMime }; }   // solo pruebas
   const resp = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: clave }));
   const trozos = [];
   for await (const trozo of resp.Body) trozos.push(trozo);
@@ -192,16 +318,21 @@ const DIAS_VIGENCIA_SESION_CLIENTE = 7;
 const MINUTOS_VIGENCIA_ACCESO = 15;
 const brevoActivo = () => !!(BREVO_API_KEY && BREVO_REMITENTE);
 
-async function enviarCorreo(destinatario, asunto, html, texto) {
+async function enviarCorreo(destinatario, asunto, html, texto, opciones = {}) {
+  [asunto, html, texto] = await ajustarGeneroCorreo(asunto, html, texto);   // 29/10: «tu asesora» si es ella; sin nombre, «tu equipo»
   const url = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
   const cuerpo = {
-    sender: { email: BREVO_REMITENTE, name: 'Acros' },
+    sender: { email: BREVO_REMITENTE, name: opciones.nombre || 'Acros' },
     to: [{ email: destinatario }],
     subject: asunto,
     htmlContent: html,
   };
   if (texto) cuerpo.textContent = texto; // versión en texto plano: mejor entrega y lectores sin HTML
+  if (opciones.responderA) cuerpo.replyTo = { email: opciones.responderA, name: opciones.nombre || 'Acros' };   // 30/10
+  if (opciones.copiaOculta && opciones.copiaOculta !== destinatario) cuerpo.bcc = [{ email: opciones.copiaOculta }];
+  if (opciones.cabeceras) cuerpo.headers = opciones.cabeceras;   // 30/10: In-Reply-To / References
   await axios.post(url, cuerpo, { headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' } });
+  anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: 'Correo enviado', detalle: { para: destinatario, asunto: String(asunto).slice(0, 150), de: opciones.nombre || 'Acros' } });   // 30/10
 }
 
 // ================================================================
@@ -215,16 +346,21 @@ async function enviarCorreo(destinatario, asunto, html, texto) {
 // ACROS y el botón siguen viéndose. Va con versión en texto plano.
 // ================================================================
 const ESC_HTML = t => String(t == null ? '' : t).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-function plantillaCorreo({ titulo, parrafos = [], boton, nota }) {
+function plantillaCorreo({ titulo, parrafos = [], boton, nota, hilo }) {
+  // 29/10 (Vikn): botón centrado y grande, aviso del enlace justificado, pie centrado con el texto de marca y, si hace falta, un hilo
+  // de mensajes (lo que pidió el cliente y lo que se le responde). Ancho máximo 600 px: en el móvil ocupa todo el ancho de la pantalla.
   const img = n => SITE_URL ? `${SITE_URL}/marca/${n}` : null;
   const fuenteTit = "Georgia, 'Times New Roman', serif";
   const fuente = 'Helvetica, Arial, sans-serif';
   const logo = img('correo-logo.png');
   const icono = img('correo-boton.png');
+  const web = SITE_URL || 'https://acrosfi.es';
+  const bloqueHilo = h => `<tr><td style="padding:14px 30px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${h.propio ? '#EEF4EF' : '#F6F2EA'}; border-left:4px solid ${h.propio ? '#2E7A4E' : '#C9BBA3'}; border-radius:8px;"><tr><td style="padding:12px 16px; font-family:${fuente};"><div style="font-size:11.5px; letter-spacing:.04em; text-transform:uppercase; color:#8A8378; padding-bottom:5px;">${ESC_HTML(h.quien)}${h.fecha ? ' · ' + ESC_HTML(h.fecha) : ''}</div><div style="font-size:15px; line-height:1.5; color:#423F3A;">${ESC_HTML(h.texto).replace(/\n/g, '<br>')}</div></td></tr></table></td></tr>`;
   const html = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${ESC_HTML(titulo)}</title></head>
 <body style="margin:0; padding:0; background:#FBF8F2;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBF8F2;"><tr><td align="center" style="padding:28px 14px;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px; background:#FFFFFF; border:1px solid #E6DCCD; border-top:4px solid #D2601F; border-radius:14px;">
+  <!--[if mso]><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0"><tr><td><![endif]-->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px; background:#FFFFFF; border:1px solid #E6DCCD; border-top:4px solid #D2601F; border-radius:14px;">
     <tr><td style="padding:24px 30px 6px;">
       <table role="presentation" cellpadding="0" cellspacing="0"><tr>
         ${logo ? `<td style="padding-right:10px; vertical-align:middle;"><img src="${logo}" width="30" height="24" alt="" style="display:block; border:0;"></td>` : ''}
@@ -233,19 +369,21 @@ function plantillaCorreo({ titulo, parrafos = [], boton, nota }) {
     </td></tr>
     <tr><td style="padding:18px 30px 0; font-family:${fuenteTit}; font-size:23px; line-height:1.25; color:#23402F;">${ESC_HTML(titulo)}</td></tr>
     ${parrafos.map(p => `<tr><td style="padding:12px 30px 0; font-family:${fuente}; font-size:15px; line-height:1.55; color:#423F3A;">${p}</td></tr>`).join('')}
-    ${boton ? `<tr><td style="padding:24px 30px 6px;">
-      <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="background:#B9541B; border-radius:10px;">
-        <a href="${ESC_HTML(boton.url)}" style="display:inline-block; padding:13px 22px; font-family:${fuente}; font-size:15px; font-weight:bold; color:#FFFFFF; text-decoration:none; border-radius:10px;">${icono ? `<img src="${icono}" width="18" height="18" alt="" style="vertical-align:-3px; margin-right:8px; border:0;">` : ''}${ESC_HTML(boton.texto)}</a>
+    ${(hilo || []).map(bloqueHilo).join('')}
+    ${boton ? `<tr><td align="center" style="padding:28px 30px 6px;">
+      <table role="presentation" align="center" width="100%" cellpadding="0" cellspacing="0" style="max-width:340px;"><tr><td align="center" style="background:#B9541B; border-radius:10px;">
+        <a href="${ESC_HTML(boton.url)}" style="display:block; padding:15px 24px; font-family:${fuente}; font-size:16px; font-weight:bold; color:#FFFFFF; text-decoration:none; border-radius:10px; text-align:center;">${icono ? `<img src="${icono}" width="18" height="18" alt="" style="vertical-align:-3px; margin-right:8px; border:0;">` : ''}${ESC_HTML(boton.texto)}</a>
       </td></tr></table>
     </td></tr>
-    <tr><td style="padding:10px 30px 0; font-family:${fuente}; font-size:12px; line-height:1.5; color:#8A8378;">¿El botón no funciona? Copia este enlace en tu navegador:<br><a href="${ESC_HTML(boton.url)}" style="color:#8A8378; word-break:break-all;">${ESC_HTML(boton.url)}</a></td></tr>` : ''}
+    <tr><td style="padding:16px 30px 0;"><div style="font-family:${fuente}; font-size:11.5px; line-height:1.55; color:#8A8378; text-align:justify;">¿El botón no funciona? Copia este enlace en tu navegador: <a href="${ESC_HTML(boton.url)}" style="color:#8A8378; word-break:break-all;">${ESC_HTML(boton.url)}</a></div></td></tr>` : ''}
     ${nota ? `<tr><td style="padding:18px 30px 0; font-family:${fuente}; font-size:13px; line-height:1.5; color:#6B655C;">${nota}</td></tr>` : ''}
-    <tr><td style="padding:24px 30px 24px;"><div style="border-top:1px solid #E6DCCD; padding-top:14px; font-family:${fuente}; font-size:11.5px; line-height:1.5; color:#8A8378;">Acros · Fiscal cripto · <a href="${SITE_URL || 'https://acrosfi.es'}" style="color:#8A8378;">acrosfi.es</a> · 668 170 020</div></td></tr>
+    <tr><td style="padding:24px 30px 24px;"><div style="border-top:1px solid #E6DCCD; padding-top:14px; text-align:center; font-family:${fuente}; font-size:12px; line-height:1.6; color:#8A8378;">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href="${web}" style="color:#8A8378;">acrosfi.es</a> / 668 170 020</div></td></tr>
   </table>
+  <!--[if mso]></td></tr></table><![endif]-->
 </td></tr></table>
 </body></html>`;
   const sinEtiquetas = t => String(t).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
-  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros · acrosfi.es · 668 170 020'].join('\n');
+  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), ...(hilo || []).flatMap(h => ['', '> ' + h.quien + (h.fecha ? ' · ' + h.fecha : '') + ':', ...String(h.texto).split('\n').map(l => '> ' + l)]), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros, tu asesoría fiscal de criptoactivos. Contacta en: acrosfi.es / 668 170 020'].join('\n');
   return { html, texto };
 }
 
@@ -262,6 +400,7 @@ const NTFY_TOPIC = (process.env.NTFY_TOPIC || '').trim();
 const NTFY_SERVER = (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '');
 function avisarEn(topic, titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } = {}) {
   if (!topic) return Promise.resolve(false);
+  anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: 'Aviso al móvil (ntfy)', detalle: { titulo: String(titulo || '').slice(0, 150) } });   // 30/10: sin el nombre del canal
   return axios.post(NTFY_SERVER + '/', { topic, title: titulo, message: mensaje || 'Ábrelo en el panel de Acros.', priority: prioridad, tags: [etiqueta] }, { timeout: 5000 })
     .then(() => true)
     .catch(err => { console.error('Aviso ntfy no enviado:', err.message); return false; });
@@ -956,6 +1095,21 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('diligencias', '`heredada_de`', 'INT NULL');   // 21/10: alta una vez por cliente
       await agregaColumnaSiFalta('solicitudes_llamada', '`motivo`', 'VARCHAR(500) NULL');
       await agregaColumnaSiFalta('entregas', '`conformidad_pedida_en`', 'DATETIME NULL');
+      await pool.execute('CREATE TABLE IF NOT EXISTS registro (id BIGINT AUTO_INCREMENT PRIMARY KEY, creado_en DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), actor_tipo VARCHAR(16) NOT NULL, actor_id INT NULL, actor_nombre VARCHAR(120) NULL, tipo VARCHAR(12) NOT NULL, accion VARCHAR(200) NOT NULL, metodo VARCHAR(8) NULL, ruta VARCHAR(200) NULL, estado_http SMALLINT NULL, objeto_id INT NULL, cliente_id INT NULL, detalle TEXT NULL, ip VARCHAR(64) NULL, INDEX idx_fecha (creado_en), INDEX idx_cliente (cliente_id), INDEX idx_actor (actor_tipo, actor_id), INDEX idx_tipo (tipo))');   // 30/10: registro maestro
+      await pool.execute('DELETE FROM registro WHERE creado_en < NOW() - INTERVAL 15 YEAR').catch(() => {});   // tope de conservación
+      await agregaColumnaSiFalta('personas', '`correo_clientes`', 'VARCHAR(190) NULL');   // 30/10: correos desde el panel
+      await pool.execute('CREATE TABLE IF NOT EXISTS correos_panel (id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, asesor_id INT NULL, persona_id INT NULL, para VARCHAR(190) NOT NULL, asunto VARCHAR(150) NOT NULL, cuerpo TEXT NOT NULL, presentacion VARCHAR(120) NULL, responder_a VARCHAR(190) NULL, copia VARCHAR(190) NULL, ok TINYINT(1) NOT NULL DEFAULT 1, error VARCHAR(300) NULL, enviado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_cliente (cliente_id))');
+      for (const [c, t] of [['direccion', "VARCHAR(10) NOT NULL DEFAULT 'saliente'"], ['de', 'VARCHAR(190) NULL'], ['en_respuesta_a', 'INT NULL'], ['mensaje_id', 'VARCHAR(255) NULL'], ['hilo_id', 'INT NULL'], ['respuesta_token', 'VARCHAR(32) NULL'], ['leido_en', 'DATETIME NULL'], ['adjuntos', 'TEXT NULL']]) await agregaColumnaSiFalta('correos_panel', '`' + c + '`', t);   // 30/10: respuestas por correo dentro del panel
+      // 30/10: las notas y marcas de cobertura de fichas ya fusionadas se quedaron en la ficha duplicada (inerte): se pasan a la que quedó
+      try { const [inertes] = await pool.query("SELECT id, correo FROM clientes WHERE estado = 'inerte' AND correo LIKE 'fusionado-%'"); for (const d of inertes) { const orig = String(d.correo).replace(/^fusionado-\d+-/, ''); const [pr] = await pool.query("SELECT id FROM clientes WHERE correo = ? AND (estado IS NULL OR estado <> 'inerte') ORDER BY id LIMIT 1", [orig]); if (!pr.length) continue; for (const t of ['notas_cliente', 'cobertura_marcas', 'recordatorios_cliente', 'ausencias_cliente']) await pool.execute('UPDATE `' + t + '` SET cliente_id = ? WHERE cliente_id = ?', [pr[0].id, d.id]).catch(() => {}); } } catch (e) { console.error('Recolocar notas de fichas fusionadas:', e.message); }
+      await agregaColumnaSiFalta('personas', '`horario`', 'TEXT NULL'); await agregaColumnaSiFalta('mensajes', '`ia_borrador`', 'TINYINT(1) NULL'); await agregaColumnaSiFalta('mensajes', '`ia_cambio_pct`', 'TINYINT NULL');   // 29/10: métricas del equipo
+      await pool.execute('CREATE TABLE IF NOT EXISTS ausencias (id INT AUTO_INCREMENT PRIMARY KEY, persona_id INT NOT NULL, desde DATE NOT NULL, hasta DATE NOT NULL, motivo VARCHAR(120) NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_persona (persona_id))');
+      await agregaColumnaSiFalta('asesores', '`pin_hash`', 'VARCHAR(100) NULL'); await agregaColumnaSiFalta('asesores', '`pin_intentos`', 'INT NOT NULL DEFAULT 0'); await agregaColumnaSiFalta('asesores', '`pin_pausa_hasta`', 'DATETIME NULL'); await agregaColumnaSiFalta('sesiones_asesor', '`desbloqueada_hasta`', 'DATETIME NULL');   // 29/10: PIN del panel
+      for (const [c, t] of [['archivo_clave', 'VARCHAR(255) NULL'], ['archivo_nombre', 'VARCHAR(255) NULL'], ['archivo_tipo', 'VARCHAR(100) NULL'], ['archivo_bytes', 'INT NULL']]) await agregaColumnaSiFalta('mensajes', '`' + c + '`', t);   // 29/10: archivos adjuntos en el chat
+      if (await agregaColumnaSiFalta('personas', '`genero`', 'VARCHAR(1) NULL')) { const [ps] = await pool.query('SELECT id, nombre FROM personas WHERE genero IS NULL'); for (const x of ps) await pool.execute('UPDATE personas SET genero = ? WHERE id = ?', [generoPorNombre(x.nombre), x.id]); }   // 29/10: «asesor» o «asesora» en los correos; se deduce del nombre una vez y se puede corregir en Equipo
+      await agregaColumnaSiFalta('cambios_asesor', '`texto_cliente`', 'VARCHAR(1000) NULL');   // 29/10: lo que escribió el cliente, para enseñárselo en la respuesta
+      await agregaColumnaSiFalta('propuestas', '`cobro`', "VARCHAR(10) NOT NULL DEFAULT 'antes'");   // 29/10: cobrar antes de empezar o pagar después
+      for (const t of ['solicitudes_presupuesto', 'solicitudes_llamada']) { await agregaColumnaSiFalta(t, '`atendida_motivo`', 'VARCHAR(500) NULL'); await agregaColumnaSiFalta(t, '`atendida_en`', 'DATETIME NULL'); await agregaColumnaSiFalta(t, '`atendida_por_asesor_id`', 'INT NULL'); }   // 28/10: por qué se atendió
       await pool.execute('CREATE TABLE IF NOT EXISTS notas_cliente (id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, asesor_id INT NULL, origen VARCHAR(20) NOT NULL DEFAULT \'ficha\', texto VARCHAR(4000) NOT NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_cliente (cliente_id))');   // 26/10: notas del cliente, como un blog   // 26/10: el visto bueno solo cuando el asesor lo pide   // 21/10: de qué quiere hablar (opcional, desde la web)
       await pool.execute('CREATE TABLE IF NOT EXISTS cobertura_marcas (id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, tipo VARCHAR(40) NOT NULL, ejercicio INT NOT NULL, estado VARCHAR(12) NOT NULL, nota VARCHAR(1000) NULL, asesor_id INT NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_cliente (cliente_id))');   // 26/10: cobertura por ejercicio (historial)
       await pool.execute('CREATE TABLE IF NOT EXISTS llamadas_notas (id INT AUTO_INCREMENT PRIMARY KEY, llamada_id INT NOT NULL, asesor_id INT NULL, texto VARCHAR(1000) NOT NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_llamada (llamada_id))');   // 20/10: quién en los avisos de ntfy (sin nombres)   // avisos de urgencia: lo existente se da por sabido
@@ -1374,8 +1528,9 @@ app.post('/api/admin/clientes/:id/fusionar', requiereSesionAsesor, requiereAdmin
     }
     await conn.beginTransaction();
     await moverServiciosDeCliente(conn, duplicado, principal);   // 20/10: con clave nueva si chocan
-    for (const t of ['propuestas', 'diligencias', 'documentos_fiscales', 'mensajes', 'entregas', 'valoraciones', 'cambios_asesor', 'sesiones_cliente', 'tokens_acceso', 'sugerencias', 'actividad']) {
-      await conn.execute(`UPDATE ${t} SET cliente_id = ? WHERE cliente_id = ?`, [principal, duplicado]).catch(() => {});
+    const [conCliente] = await conn.query("SELECT DISTINCT TABLE_NAME AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = 'cliente_id' AND TABLE_NAME NOT IN ('clientes', 'servicios_cliente')");
+    for (const t of [...new Set(['propuestas', 'diligencias', 'documentos_fiscales', 'mensajes', 'entregas', 'valoraciones', 'cambios_asesor', 'sesiones_cliente', 'tokens_acceso', 'sugerencias', 'actividad'].concat(conCliente.map(x => x.t)))]) {
+      await conn.execute('UPDATE `' + t + '` SET cliente_id = ? WHERE cliente_id = ?', [principal, duplicado]).catch(() => {});   // 30/10: todas, también notas y cobertura
     }
     const dup = a.find(x => x.id === duplicado), pri = a.find(x => x.id === principal);
     // 14/10: qué dato se queda de cada ficha. Por campo: 'principal',
@@ -1554,7 +1709,7 @@ app.get('/api/admin/llamadas', requiereSesionAsesor, requiereRol('jefe', 'encarg
   try {
     let filas;
     if (req.query.atendida === '0') [filas] = await conn.execute('SELECT * FROM solicitudes_llamada WHERE atendida = 0 ORDER BY creado_en');
-    else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT * FROM solicitudes_llamada WHERE atendida = 1 ORDER BY creado_en DESC');
+    else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT s.*, a.nombre AS atendida_por FROM solicitudes_llamada s LEFT JOIN asesores a ON a.id = s.atendida_por_asesor_id WHERE s.atendida = 1 ORDER BY s.creado_en DESC');
     else [filas] = await conn.execute('SELECT * FROM solicitudes_llamada ORDER BY creado_en DESC LIMIT 100');
     filas.__permitidos = await clientesPermitidos(req).catch(() => null);
     res.json(await enriquecerLlamadas(conn, filas));   // 21/10: contexto y notas
@@ -1565,8 +1720,11 @@ app.get('/api/admin/llamadas', requiereSesionAsesor, requiereRol('jefe', 'encarg
 app.post('/api/admin/llamadas/:id/atender', requiereSesionAsesor, requiereRol('jefe', 'encargado'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [r] = await conn.execute('UPDATE solicitudes_llamada SET atendida = 1 WHERE id = ?', [req.params.id]);
+    const motivo = String((req.body || {}).motivo || '').trim().slice(0, 500);
+    if (!motivo) return res.status(400).json({ error: 'Di en una línea qué se ha hecho con esta llamada' });
+    const [r] = await conn.execute('UPDATE solicitudes_llamada SET atendida = 1, atendida_motivo = ?, atendida_en = NOW(), atendida_por_asesor_id = ? WHERE id = ?', [motivo, req.asesor.id, req.params.id]);
     if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de llamada no encontrada' });
+    await conn.execute('INSERT INTO llamadas_notas (llamada_id, asesor_id, texto) VALUES (?, ?, ?)', [Number(req.params.id), req.asesor.id, 'Atendida: ' + motivo]);   // 28/10: queda en sus notas (y en las del cliente, si lo es)
     res.json({ ok: true });
   } finally {
     conn.release();
@@ -1590,7 +1748,7 @@ app.get('/api/admin/solicitudes-presupuesto', requiereSesionAsesor, requiereRol(
   try {
     let filas;
     if (req.query.atendida === '0') [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 0 ORDER BY creado_en');
-    else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 1 ORDER BY creado_en DESC');
+    else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT s.*, a.nombre AS atendida_por FROM solicitudes_presupuesto s LEFT JOIN asesores a ON a.id = s.atendida_por_asesor_id WHERE s.atendida = 1 ORDER BY s.creado_en DESC');
     else [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto ORDER BY creado_en DESC LIMIT 100');
     res.json(filas);
   } finally {
@@ -1600,8 +1758,13 @@ app.get('/api/admin/solicitudes-presupuesto', requiereSesionAsesor, requiereRol(
 app.post('/api/admin/solicitudes-presupuesto/:id/atender', requiereSesionAsesor, requiereRol('jefe', 'encargado'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 1 WHERE id = ?', [req.params.id]);
+    const motivo = String((req.body || {}).motivo || '').trim().slice(0, 500);
+    if (!motivo) return res.status(400).json({ error: 'Di en una línea qué se ha hecho con esta solicitud' });
+    const [r] = await conn.execute('UPDATE solicitudes_presupuesto SET atendida = 1, atendida_motivo = ?, atendida_en = NOW(), atendida_por_asesor_id = ? WHERE id = ?', [motivo, req.asesor.id, req.params.id]);
     if (!r.affectedRows) return res.status(404).json({ error: 'Solicitud de presupuesto no encontrada' });
+    // 28/10: si ya es cliente (por su correo), el motivo entra en su historial de notas
+    const [sol] = await conn.execute('SELECT correo FROM solicitudes_presupuesto WHERE id = ?', [req.params.id]);
+    if (sol.length && sol[0].correo) { const [c] = await conn.execute('SELECT id FROM clientes WHERE correo = ?', [sol[0].correo.trim().toLowerCase()]); if (c.length) await conn.execute("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, 'solicitud', ?)", [c[0].id, req.asesor.id, 'Solicitud de presupuesto atendida: ' + motivo]); }
     res.json({ ok: true });
   } finally {
     conn.release();
@@ -1751,7 +1914,7 @@ async function clientesPermitidosAntiguo(req) {
 }
 async function clienteDePropuestaId(id) { const [f] = await pool.execute('SELECT cliente_id FROM propuestas WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
 async function clienteDeObjeto(tabla, id) { const [f] = await pool.execute('SELECT cliente_id FROM ' + tabla + ' WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
-const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados|contrasena|mi-correo)/];
+const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados|contrasena|mi-correo|sesion|pin)/];
 async function permisoCliente(req, res, next) {
   try {
     // 15/10: un admin con «Ver: lo mío» (cabecera x-ambito: mio) ve las listas
@@ -1823,14 +1986,19 @@ async function requiereSesionAsesor(req, res, next) {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT s.id AS sesion_id, s.expira_en, a.id, a.nombre, a.correo, a.activo, a.es_admin, a.roles
+      `SELECT s.id AS sesion_id, s.expira_en, s.desbloqueada_hasta, a.id, a.nombre, a.correo, a.activo, a.es_admin, a.roles, a.pin_hash
        FROM sesiones_asesor s JOIN asesores a ON a.id = s.asesor_id WHERE s.token = ?`, [token]
     );
     if (!filas.length) return res.status(401).json({ error: 'Sesión no válida. Vuelve a iniciar sesión.' });
     const s = filas[0];
     if (new Date(s.expira_en) < ahora()) return res.status(401).json({ error: 'Tu sesión ha caducado. Vuelve a iniciar sesión.' });
     if (!s.activo) return res.status(403).json({ error: 'Esta cuenta está desactivada.' });
-    req.asesor = { id: s.id, nombre: s.nombre, correo: s.correo, esAdmin: !!s.es_admin, roles: rolesDeFila(s) };
+    req.asesor = { id: s.id, nombre: s.nombre, correo: s.correo, esAdmin: !!s.es_admin, roles: rolesDeFila(s), sesionId: s.sesion_id };
+    // 29/10: PIN del panel. Sin PIN, hay que crearlo; con la sesión bloqueada (10 min sin actividad), no hay datos hasta escribirlo
+    if (pinObligatorio() && !RUTAS_SIN_PIN.some(r => r.test(req.path))) {
+      if (!s.pin_hash) return res.status(423).json({ error: 'Crea tu PIN del panel para seguir', codigo: 'pin_crear' });
+      if (!s.desbloqueada_hasta || new Date(s.desbloqueada_hasta) <= ahora()) return res.status(423).json({ error: 'El panel está bloqueado: escribe tu PIN', codigo: 'pin' });
+    }
     // 13/10: registro de actividad (al terminar la respuesta) y permisos del modelo B
     res.on('finish', () => registrarActividad(req, res.statusCode));
     if ((!req.asesor.esAdmin || (['mio', 'equipo'].includes(req.get('x-ambito')) && req.method === 'GET')) && !RUTAS_LIBRES_ASESOR.some(r => r.test(req.path))) return permisoCliente(req, res, next);   // 15/10: también admin con «lo mío» / «mi equipo»
@@ -1954,7 +2122,7 @@ async function recordarDispositivo(conn, tipo, usuarioId) {
 async function crearSesionAsesor(conn, asesor) {
   const token = crypto.randomBytes(24).toString('hex');
   const expira = new Date(ahora().getTime() + DIAS_VIGENCIA_SESION_ASESOR * 24 * 60 * 60 * 1000);
-  await conn.execute('INSERT INTO sesiones_asesor (asesor_id, token, expira_en) VALUES (?,?,?)', [asesor.id, token, aSQLDatetime(expira)]);
+  await conn.execute('INSERT INTO sesiones_asesor (asesor_id, token, expira_en, desbloqueada_hasta) VALUES (?,?,?,?)', [asesor.id, token, aSQLDatetime(expira), hastaPin()]);   // 29/10: recién entrado con contraseña, desbloqueado
   const [k] = await conn.execute('SELECT llave_sal, llave_publica, llave_privada_cifrada, llave_iv, maestra_cifrada, maestra_iv FROM asesores WHERE id = ?', [asesor.id]);
   return { ok: true, token, nombre: asesor.nombre, correo: asesor.correo, es_admin: !!asesor.es_admin, roles: [...rolesDeFila(asesor)], expira_en: expira.toISOString(), llave: k[0] || null };
 }
@@ -2372,7 +2540,7 @@ app.put('/api/admin/activos/:simbolo', requiereSesionAsesor, requiereRol('encarg
   res.json({ ok: true });
 });
 // Cliente: su cartera (si su asesor la ha publicado)
-app.get('/api/propuestas/:token/cartera', async (req, res) => {
+app.get('/api/propuestas/:token/cartera', exigirAlgunPagoConfirmado, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const p = await propuestaVigente(conn, req.params.token);
@@ -3054,6 +3222,7 @@ function normalizarServiciosPropuesta(servicios, importeCentimosBody) {
 
 app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
   const { correo, telefono, servicios, importe_centimos } = req.body;
+  const cobro = (req.body && req.body.cobro === 'despues') ? 'despues' : 'antes';   // 29/10: cobrar antes de empezar o pagar después
   const normalizado = correo ? normalizarServiciosPropuesta(servicios, importe_centimos) : null;
   if (!correo || !normalizado) {
     return res.status(400).json({ error: 'Faltan datos: correo, y servicios — o bien un array de ids + importe_centimos, o bien un array de {id, precio_centimos} con el desglose' });
@@ -3077,8 +3246,8 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     const token = generarToken();
     const expira = finValidezPropuesta();
     const [r] = await conn.execute(
-      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id, servicios_detalle) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id, ejerciciosN.detalle ? JSON.stringify(ejerciciosN.detalle) : null]
+      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id, servicios_detalle, cobro) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id, ejerciciosN.detalle ? JSON.stringify(ejerciciosN.detalle) : null, cobro]
     );
     const retirar = (Array.isArray(req.body.retirar) ? req.body.retirar : []).map(Number).filter(n => Number.isInteger(n) && n > 0 && n !== r.insertId);   // 21/10
     if (retirar.length) await conn.query("UPDATE propuestas SET estado = 'caducada', token_expira_en = NOW() WHERE id IN (?) AND cliente_id = ? AND estado = 'enviada'", [retirar, cliente.id]);
@@ -3175,19 +3344,21 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       'WHERE e.`cliente_id` = ? AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`) ' +
       'ORDER BY e.`subido_en` DESC', [p.cliente_id]);
     const asesorCli = await personaDeCliente(p.cliente_id, conn).catch(() => null);
-    const [dispo] = await conn.query('SELECT * FROM personas WHERE `activa` = 1 AND `atiende_clientes` = 1 ORDER BY `orden`, `id`');
+    const [dispoTodas] = await conn.query('SELECT * FROM personas WHERE `activa` = 1 AND `atiende_clientes` = 1 ORDER BY `orden`, `id`');
     const [camb] = await conn.execute("SELECT `a_persona_id`, `creado_en` FROM cambios_asesor WHERE `cliente_id` = ? AND `estado` = 'pendiente' ORDER BY `id` DESC LIMIT 1", [p.cliente_id]);
     const personaPublica = q => { if (!q) return null; let esp = []; try { esp = JSON.parse(q.especialidades || '[]'); } catch (e) {} return { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' }, foto: q.foto, especialidades: Array.isArray(esp) ? esp : [] }; };
     const [valor] = await conn.execute('SELECT `estado` FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
     res.json({
       asesor: personaPublica(asesorCli),
-      asesores_disponibles: dispo.map(personaPublica),
+      asesores_disponibles: dispoTodas.filter(x => !asesorCli || !asesorCli.equipo_id || x.equipo_id === asesorCli.equipo_id || x.id === asesorCli.id || (camb[0] && camb[0].a_persona_id === x.id)).map(personaPublica),   // 29/10: los de su equipo
       cambio_asesor_pendiente: camb[0] || null,
       valoracion: valor[0] ? valor[0].estado : null,
       dos_pasos_activo: !!(await conn.execute('SELECT totp_activo FROM clientes WHERE id = ?', [p.cliente_id]))[0][0].totp_activo,
       colaboradores: (await conn.execute("SELECT q.nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id WHERE co.propuesta_id = ? AND co.estado = 'confirmada' ORDER BY co.id", [p.id]))[0].map(x => x.nombre),
-      entregas: entregasCli.filter(e => e.propuesta_id === p.id),
+      entregas: pagos.some(g => g.estado === 'confirmado') ? entregasCli.filter(e => e.propuesta_id === p.id) : [],
+      informes_bloqueados: pagos.some(g => g.estado === 'confirmado') ? 0 : entregasCli.filter(e => e.propuesta_id === p.id).length,
       entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
+      cobro: p.cobro || 'antes', pago_confirmado: pagos.some(g => g.estado === 'confirmado'), plazo_pago: plazoPagoDe(p),
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en, inicio_inmediato_en: p.inicio_inmediato_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
@@ -3622,6 +3793,9 @@ app.get('/api/admin/diligencias/:id/documento', requiereSesionAsesor, async (req
 // vez en cuando y guardarlo aparte (protección contra perder Railway/R2
 // Y contra perder el propio ordenador, no solo uno de los dos).
 const archiver = require('archiver');
+app.get('/api/admin/sesion', requiereSesionAsesor, (req, res) => {   // 29/10: lo que dice la base de datos ahora, no lo de cuando entró
+  res.json({ es_admin: !!req.asesor.esAdmin, roles: [...req.asesor.roles] });
+});
 app.get('/api/admin/documentos/backup', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {   // 14/10: solo admin (con el modelo B un asesor no puede bajarse lo de todos)
   const conn = await pool.getConnection();
   try {
@@ -3706,7 +3880,7 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [pagos] = await conn.execute('SELECT * FROM pagos WHERE propuesta_id = ?', [p.id]);
-    if (!pagos.length) return res.status(409).json({ error: 'No hay ningún pago registrado para esta propuesta todavía' });
+    if (!pagos.length && p.cobro !== 'despues') return res.status(409).json({ error: 'No hay ningún pago registrado para esta propuesta todavía' });   // 29/10: con «pagar después», el alta va antes del pago
 
     const [existentes] = await conn.execute('SELECT id FROM diligencias WHERE propuesta_id = ?', [p.id]);
     if (existentes.length) return res.status(409).json({ error: 'Ya se envió un cuestionario de diligencia para esta propuesta' });
@@ -3857,6 +4031,20 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
       });
     }
     filas.forEach(f => { f.es_mio = f.asesor_cuenta_id === req.asesor.id; });
+    // 30/10 (Vikn): el mismo progreso que la ficha y el Área
+    const idsP = filas.map(f => f.propuesta_id);
+    if (idsP.length) {
+      const [svF] = await conn.query(SQL_SERVICIOS + ' WHERE s.propuesta_id IN (?) AND s.confirmado IN (0, 1)', [idsP]);   // con los recuentos de documentos, como la ficha
+      const vs = await vistasDeFilas(conn, svF), enc = await estadoEncargos(conn, idsP);
+      const media = l => l.length ? Math.round(l.reduce((a, v) => a + v.progreso, 0) / l.length) : null;
+      const porCli = {};
+      filas.forEach(f => {
+        const suyos = vs.filter(v => v.propuesta_id === f.propuesta_id), enCurso = suyos.filter(v => v.en_curso);
+        f.progreso = suyos.length ? media(enCurso.length ? enCurso : suyos) : progresoServicio({ en_curso: true }, enc[f.propuesta_id], 0);
+        (porCli[f.cliente_id] = porCli[f.cliente_id] || []).push(...enCurso);
+      });
+      filas.forEach(f => { const l = porCli[f.cliente_id] || []; f.progreso_cliente = l.length ? media(l) : null; });
+    }
     res.json(filas);
   } catch (err) {
     console.error('Error al listar los encargos:', err);
@@ -3882,7 +4070,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
-      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en
+      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en, cobro
        FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC`, [id]);
     const ids = propuestas.map(p => p.id);
     let pagos = [], diligencias = [], documentos = [], entregasF = [];
@@ -3890,7 +4078,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
       [pagos] = await conn.query('SELECT id, propuesta_id, metodo, estado, creado_en FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [diligencias] = await conn.query('SELECT id, propuesta_id, estado, coherencia, nota_asesor, resuelto_en, creado_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [documentos] = await conn.query(
-        `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en, nombre_original,
+        `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en, nombre_original, (documento_ref IS NOT NULL) AS tiene_archivo,
            (SELECT COUNT(*) FROM llaves_documento l WHERE l.tipo = 'fiscal' AND l.objeto_id = documentos_fiscales.id AND l.asesor_id = ?) AS mi_llave
          FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en`, [req.asesor.id, ids]);
       [entregasF] = await conn.query('SELECT `id`, `propuesta_id`, `servicio`, `version`, `nombre_archivo`, `bytes`, `subido_en`, `estado`, `comentario`, `respondido_en` FROM entregas WHERE `propuesta_id` IN (?) ORDER BY `servicio`, `version` DESC', [ids]);
@@ -3928,7 +4116,7 @@ app.get('/api/admin/clientes-activos', requiereSesionAsesor, async (req, res) =>
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT c.id AS cliente_id, c.correo, c.nombre, c.apellidos, d.propuesta_id, (SELECT pr.servicios FROM propuestas pr WHERE pr.id = d.propuesta_id) AS servicios
+      `SELECT c.id AS cliente_id, c.correo, c.nombre, c.apellidos, d.propuesta_id, (SELECT pr.servicios FROM propuestas pr WHERE pr.id = d.propuesta_id) AS servicios, (SELECT pr.creado_en FROM propuestas pr WHERE pr.id = d.propuesta_id) AS propuesta_creado_en
        FROM diligencias d JOIN clientes c ON c.id = d.cliente_id
        WHERE d.estado = 'aprobado' ORDER BY d.resuelto_en DESC`
     );
@@ -4773,7 +4961,7 @@ app.get('/api/propuestas/:token/mensajes', async (req, res) => {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [filas] = await conn.execute(
-      `SELECT m.id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor
+      `SELECT m.id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor, m.archivo_nombre, m.archivo_tipo, m.archivo_bytes
        FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
        WHERE m.propuesta_id = ? AND m.oculto_cliente_en IS NULL AND m.retirado_en IS NULL ORDER BY m.creado_en, m.id`, [p.id]);
     // Al abrir el chat, lo que escribió el asesor queda leído
@@ -4840,7 +5028,7 @@ app.get('/api/admin/clientes/:id/mensajes', requiereSesionAsesor, async (req, re
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute(
-      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, m.asesor_id, a.nombre AS asesor,
+      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, m.asesor_id, a.nombre AS asesor, m.archivo_nombre, m.archivo_tipo, m.archivo_bytes,
               m.oculto_cliente_en, m.retirado_en, ar.nombre AS retirado_por_nombre
        FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id LEFT JOIN asesores ar ON ar.id = m.retirado_por
        WHERE m.cliente_id = ? ORDER BY m.creado_en, m.id`, [Number(req.params.id)]);
@@ -4862,8 +5050,11 @@ app.post('/api/admin/propuestas/:id/mensajes/leidos', requiereSesionAsesor, asyn
   }
 });
 app.post('/api/admin/propuestas/:id/mensajes', requiereSesionAsesor, async (req, res) => {
-  const texto = textoMensaje(req.body && req.body.texto);
-  if (!texto) return res.status(400).json({ error: 'El mensaje está vacío' });
+  const texto = textoMensaje(req.body && req.body.texto) || '';
+  const adj = req.body && req.body.archivo;
+  if (!texto && !adj) return res.status(400).json({ error: 'El mensaje está vacío' });
+  const archivo = adj ? validarAdjuntoChat(adj) : null;   // 29/10: archivo adjunto
+  if (archivo && archivo.error) return res.status(archivo.error[0]).json({ error: archivo.error[1] });
   const conn = await pool.getConnection();
   try {
     const [ps] = await conn.execute('SELECT p.*, c.correo FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?', [Number(req.params.id)]);
@@ -4873,6 +5064,12 @@ app.post('/api/admin/propuestas/:id/mensajes', requiereSesionAsesor, async (req,
     const [r] = await conn.execute(
       "INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, asesor_id, texto) VALUES (?, ?, ?, 'asesor', ?, ?)",
       [p.id, p.cliente_id, servicio, req.asesor.id, texto]);
+    if (archivo) {
+      const clave = `entregas/chat/${p.id}/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${archivo.ext}`;
+      await subirAR2(clave, archivo.buffer, archivo.tipo);
+      await conn.execute('UPDATE mensajes SET archivo_clave = ?, archivo_nombre = ?, archivo_tipo = ?, archivo_bytes = ? WHERE id = ?', [clave, archivo.nombre, archivo.tipo, archivo.buffer.length, r.insertId]);
+    }
+    if (req.body && req.body.ia && req.body.ia.borrador) await conn.execute('UPDATE mensajes SET ia_borrador = 1, ia_cambio_pct = ? WHERE id = ?', [Math.max(0, Math.min(100, Math.round(Number(req.body.ia.cambio_pct) || 0))), r.insertId]);   // 29/10
     // Contestar implica haber leído lo del cliente en ese hilo
     await conn.execute("UPDATE mensajes SET leido_en = NOW() WHERE propuesta_id = ? AND servicio = ? AND autor = 'cliente' AND leido_en IS NULL", [p.id, servicio]);
     // El correo de aviso ya no sale al momento (06/10): lo envía la tarea
@@ -5202,7 +5399,7 @@ app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
   const llamar = async conWeb => {
     const sistema = iaSistemaCon(base + (conWeb ? IA_ASISTENTE_CON_WEB : IA_ASISTENTE_SIN_WEB) + (conPanel ? '\n' + IA_ASISTENTE_CON_PANEL : ''), a.conocimiento);
     let conv = mensajes, textos = [], fuentes = [], busquedas = 0, consultas = [];
-    const herramientas = (conWeb ? [IA_HERRAMIENTA_WEB] : []).concat(conPanel ? IA_HERRAMIENTAS_PANEL : []);
+    const herramientas = (conWeb ? [IA_HERRAMIENTA_WEB] : []).concat(conPanel ? IA_HERRAMIENTAS_PANEL.filter(h => h.name !== 'registro' || (req && req.asesor && req.asesor.esAdmin)) : []);   // 30/10: el registro, solo para administradores
     // Vueltas: «pause_turn» (búsquedas largas) o «tool_use» (consultas al panel). Máx. 8.
     for (let vuelta = 0; vuelta < 8; vuelta++) {
       const r = await iaLlamar({ funcion: 'asistente', modelo: IA_MODELO_ASISTENTE, sistema, mensajes: conv, maxTokens: 1500, personaId: yo, clienteId: null, herramientas: herramientas.length ? herramientas : null, completo: true });
@@ -5343,7 +5540,7 @@ app.get('/api/admin/personas', requiereSesionAsesor, async (req, res) => {
   const [filas] = await pool.query('SELECT p.*, a.`nombre` AS asesor_nombre, a.`correo` AS asesor_correo FROM personas p LEFT JOIN asesores a ON a.`id` = p.`asesor_id` ORDER BY p.`activa` DESC, p.`orden`, p.`id`');
   const mi = await mapaIniciales().catch(() => ({ porPersona: new Map() }));
   const veCanales = req.asesor.roles.has('admin');   // 21/10: el canal propio solo lo ven esa persona y los administradores
-  res.json(filas.map(f => Object.assign(personaParaPanel(f), { iniciales: f.iniciales || '', iniciales_avisos: mi.porPersona.get(f.id) || '' }, (veCanales || f.asesor_id === req.asesor.id) ? {} : { ntfy_topic: '', ntfy_oculto: true })));
+  res.json(filas.map(f => Object.assign(personaParaPanel(f), { iniciales: f.iniciales || '', genero: f.genero || null, correo_clientes: f.correo_clientes || null, horario: (() => { try { return f.horario ? JSON.parse(f.horario) : null; } catch (e) { return null; } })(), iniciales_avisos: mi.porPersona.get(f.id) || '' }, (veCanales || f.asesor_id === req.asesor.id) ? {} : { ntfy_topic: '', ntfy_oculto: true })));
 });
 async function guardarPersona(req, res, id) {
   const b = req.body || {};
@@ -5379,10 +5576,14 @@ async function guardarPersona(req, res, id) {
       const [r] = await conn.execute('UPDATE personas SET `nombre`=?, `puesto_es`=?, `puesto_en`=?, `bio_es`=?, `bio_en`=?, `foto`=?, `especialidades`=?, `atiende_clientes`=?, `asesor_id`=?, `ntfy_topic`=?, `activa`=?, `orden`=? WHERE `id`=?', [...valores, id]);
       if (!r.affectedRows) return res.status(404).json({ error: 'Persona no encontrada' });
       await conn.execute('UPDATE personas SET iniciales = ? WHERE id = ?', [iniciales || null, id]);
+      if (['m', 'f'].includes(b.genero)) { await conn.execute('UPDATE personas SET genero = ? WHERE id = ?', [b.genero, id]); CACHE_GENERO.hasta = 0; }
+      if (b.correo_clientes !== undefined) { const cc = String(b.correo_clientes || '').trim().toLowerCase(); if (cc && !correoValido(cc)) return res.status(400).json({ error: 'El «Correo para clientes» no es válido' }); await conn.execute('UPDATE personas SET correo_clientes = ? WHERE id = ?', [cc || null, id]); }   // 30/10
       return res.json({ ok: true, id });
     }
     const [r] = await conn.execute('INSERT INTO personas (`nombre`, `puesto_es`, `puesto_en`, `bio_es`, `bio_en`, `foto`, `especialidades`, `atiende_clientes`, `asesor_id`, `ntfy_topic`, `activa`, `orden`, `por_defecto`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', [...valores, porDefecto]);
     await conn.execute('UPDATE personas SET iniciales = ? WHERE id = ?', [iniciales || null, r.insertId]);
+    await conn.execute('UPDATE personas SET genero = ? WHERE id = ?', [['m', 'f'].includes(b.genero) ? b.genero : generoPorNombre(nombre), r.insertId]); CACHE_GENERO.hasta = 0;
+    if (correoValido(b.correo_clientes)) await conn.execute('UPDATE personas SET correo_clientes = ? WHERE id = ?', [String(b.correo_clientes).trim().toLowerCase(), r.insertId]);   // 30/10
     res.status(201).json({ ok: true, id: r.insertId });
   } finally { conn.release(); }
 }
@@ -5404,15 +5605,26 @@ app.post('/api/propuestas/:token/cambio-asesor', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const destino = await personaAtiende(conn, req.body && req.body.persona_id);
-    if (!destino) return res.status(400).json({ error: 'Esa persona no está disponible' });
     const actual = await personaDeCliente(p.cliente_id, conn);
-    if (actual && actual.id === destino.id) return res.status(400).json({ error: 'Ya es tu asesor' });
+    const candidatas = await candidatasCambioAsesor(conn, actual);
+    const azar = String(req.body && req.body.persona_id) === 'azar';   // 29/10: «que lo elija Acros, dentro de mi equipo»
+    let destino;
+    if (azar) {
+      if (!candidatas.length) return res.status(400).json({ error: 'Ahora mismo no hay nadie más disponible en tu equipo' });
+      destino = candidatas[Math.floor(Math.random() * candidatas.length)];
+    } else {
+      destino = await personaAtiende(conn, req.body && req.body.persona_id);
+      if (!destino) return res.status(400).json({ error: 'Esa persona no está disponible' });
+      if (actual && actual.id === destino.id) return res.status(400).json({ error: 'Ya es tu asesor' });
+      if (!candidatas.some(x => x.id === destino.id)) return res.status(400).json({ error: 'Esa persona no está disponible' });
+    }
     const [pend] = await conn.execute("SELECT id FROM cambios_asesor WHERE cliente_id = ? AND estado = 'pendiente'", [p.cliente_id]);
     if (pend.length) return res.status(409).json({ error: 'Ya tienes un cambio pendiente de confirmar' });
-    const motivo = textoMensaje(req.body.motivo || '').slice(0, 1000) || null;
-    await conn.execute('INSERT INTO cambios_asesor (cliente_id, desde_persona_id, a_persona_id, motivo) VALUES (?, ?, ?, ?)', [p.cliente_id, actual ? actual.id : null, destino.id, motivo]);
+    const motivoCliente = textoMensaje(req.body.motivo || '').slice(0, 1000);   // lo que escribió el cliente, tal cual (para enseñárselo en la respuesta)
+    const motivo = ((azar ? 'Ha pedido que se elija al azar dentro de su equipo. ' : '') + motivoCliente).trim() || null;
+    await conn.execute('INSERT INTO cambios_asesor (cliente_id, desde_persona_id, a_persona_id, motivo, texto_cliente) VALUES (?, ?, ?, ?, ?)', [p.cliente_id, actual ? actual.id : null, destino.id, motivo, motivoCliente || null]);
     avisarAdminClientes('🔁 Un cliente pide cambiar de asesor', (actual ? 'De ' + quienIni(await inicialesDePersona(actual.id)) + ' a ' : 'A ') + quienIni(await inicialesDePersona(destino.id)) + '. Confírmalo en «Cambios de asesor pendientes».', { prioridad: 4, etiqueta: 'arrows_counterclockwise' });
+    correoCambioAsesor(conn, p.cliente_id, actual, destino, motivo, azar).catch(err => console.error('Correo de cambio de asesor:', err.message));   // 29/10: también por correo a los administradores
     res.status(201).json({ ok: true });
   } finally { conn.release(); }
 });
@@ -5451,11 +5663,14 @@ app.post('/api/admin/cambios-asesor/:id/resolver', requiereSesionAsesor, requier
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
       const c = plantillaCorreo(accion === 'aceptar' ? {
         titulo: `${destino.nombre} es tu nuevo asesor`,
-        parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Hemos atendido tu petición: a partir de ahora te atenderá <strong>${ESC_HTML(destino.nombre)}</strong>. Tu documentación, tus mensajes y tus informes siguen donde estaban.`].concat(respuesta ? ['«' + ESC_HTML(respuesta) + '»'] : []),
+        parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Hemos atendido tu petición: a partir de ahora te atenderá <strong>${ESC_HTML(destino.nombre)}</strong>. Tu documentación, tus mensajes y tus informes siguen donde estaban.`],
+        hilo: hiloCambioAsesor(cambio, destino, respuesta),
         boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
       } : {
         titulo: 'Sobre tu cambio de asesor',
-        parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Por ahora no hemos podido hacer el cambio que pediste${actual ? ` y seguirá atendiéndote <strong>${ESC_HTML(actual.nombre)}</strong>` : ''}.`].concat(respuesta ? ['«' + ESC_HTML(respuesta) + '»'] : []).concat(['Si quieres comentarlo, escríbenos desde tu área o llámanos al 668 170 020.']),
+        parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Por ahora no hemos podido hacer el cambio que pediste${actual ? ` y seguirá atendiéndote <strong>${ESC_HTML(actual.nombre)}</strong>` : ''}.`],
+        hilo: hiloCambioAsesor(cambio, destino, respuesta),
+        nota: 'Si quieres comentarlo, escríbenos desde tu área o llámanos al 668 170 020.',
         boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
       });
       enviarCorreo(cambio.correo, accion === 'aceptar' ? `${destino.nombre} es tu nuevo asesor de Acros` : 'Sobre tu cambio de asesor en Acros', c.html, c.texto).catch(err => console.error('Correo de cambio de asesor no enviado:', err.message));
@@ -5575,9 +5790,9 @@ app.get('/api/admin/rendimiento', requiereSesionAsesor, requiereRol('encargado')
   const rango = [sqlFecha(ini), sqlFecha(fin)];
   const conn = await pool.getConnection();
   try {
-    const [personas] = await conn.query('SELECT id, nombre, asesor_id, activa, atiende_clientes FROM personas ORDER BY orden, id');
+    const [personas] = await conn.query('SELECT id, nombre, asesor_id, activa, atiende_clientes, equipo_id FROM personas ORDER BY orden, id');
     const porAsesor = {}; personas.forEach(q => { if (q.asesor_id) porAsesor[q.asesor_id] = q.id; });
-    const filas = {}; personas.forEach(q => { filas[q.id] = { persona_id: q.id, nombre: q.nombre, activa: !!q.activa, atiende_clientes: !!q.atiende_clientes,
+    const filas = {}; personas.forEach(q => { filas[q.id] = { persona_id: q.id, nombre: q.nombre, activa: !!q.activa, atiende_clientes: !!q.atiende_clientes, equipo_id: q.equipo_id || null,
       informes: 0, terminados: 0, valoraciones: 0, atencion: null, calidad: null, rapidez: null, calidad_ponderada: null,
       colab_hechas: 0, colab_recibidas: 0, respuesta_horas: null, dias_entrega: null, cambios: 0, piden_cambio: 0, _resp: [], _dias: [], _cal: [] }; });
     // Informes entregados (v1) y días pago → entrega
@@ -5615,6 +5830,7 @@ app.get('/api/admin/rendimiento', requiereSesionAsesor, requiereRol('encargado')
       if (x.autor === 'cliente') { if (!pendiente && new Date(x.creado_en) < fin) pendiente = { hilo, t: new Date(x.creado_en) }; }
       else if (pendiente) { const f = filas[porAsesor[x.asesor_id]]; if (f) f._resp.push((new Date(x.creado_en) - pendiente.t) / 3600000); pendiente = null; }
     });
+    const extra = await ampliarRendimiento(conn, filas, porAsesor, ini, fin);   // 29/10: métricas del equipo
     const salida = Object.values(filas).map(f => {
       const pesos = f._cal.reduce((x, c) => x + c[1], 0);
       f.calidad_ponderada = pesos ? Math.round(f._cal.reduce((x, c) => x + c[0] * c[1], 0) / pesos * 10) / 10 : null;
@@ -5623,7 +5839,7 @@ app.get('/api/admin/rendimiento', requiereSesionAsesor, requiereRol('encargado')
       delete f._resp; delete f._dias; delete f._cal;
       return f;
     }).filter(f => f.activa || f.informes || f.valoraciones || f.colab_hechas || f.piden_cambio);
-    res.json({ mes, personas: salida });
+    res.json(Object.assign({ mes, personas: salida }, extra));
   } finally { conn.release(); }
 });
 
@@ -5654,7 +5870,7 @@ async function encargoTerminado(conn, p) {
   const [cerr] = await conn.execute("SELECT `servicio` FROM servicios_cliente WHERE `propuesta_id` = ? AND `estado` = 'terminado'", [p.id]);
   return servicios.every(sv => ult.some(u => u.servicio === sv && u.estado === 'conforme') || cerr.some(c => c.servicio === sv));
 }
-app.post('/api/propuestas/:token/valoracion', async (req, res) => {
+app.post('/api/propuestas/:token/valoracion', exigirPagoConfirmado, async (req, res) => {
   const b = req.body || {};
   const conn = await pool.getConnection();
   try {
@@ -5811,7 +6027,7 @@ app.get('/api/admin/entregas/:id/descargar', requiereSesionAsesor, async (req, r
   } finally { conn.release(); }
 });
 // Cliente: descargar cualquiera de SUS informes (de este encargo o de anteriores)
-app.get('/api/propuestas/:token/entregas/:id/descargar', async (req, res) => {
+app.get('/api/propuestas/:token/entregas/:id/descargar', exigirPagoConfirmado, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const p = await propuestaVigente(conn, req.params.token);
@@ -5831,7 +6047,7 @@ async function entregaDelCliente(conn, token, id) {
   if (f[0].estado !== 'entregado') return { error: [409, 'Ya respondiste a este informe'] };
   return { p, e: f[0] };
 }
-app.post('/api/propuestas/:token/entregas/:id/conformidad', async (req, res) => {
+app.post('/api/propuestas/:token/entregas/:id/conformidad', exigirPagoConfirmado, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
@@ -5843,7 +6059,7 @@ app.post('/api/propuestas/:token/entregas/:id/conformidad', async (req, res) => 
     res.json({ ok: true, estado: 'conforme' });
   } finally { conn.release(); }
 });
-app.post('/api/propuestas/:token/entregas/:id/cambios', async (req, res) => {
+app.post('/api/propuestas/:token/entregas/:id/cambios', exigirPagoConfirmado, async (req, res) => {
   const comentario = textoMensaje(req.body && req.body.comentario);
   if (!comentario) return res.status(400).json({ error: 'Cuéntanos qué quieres cambiar' });
   const conn = await pool.getConnection();
@@ -6129,6 +6345,7 @@ async function hacerCopiaBaseDeDatos({ manual = false } = {}) {
     }
     await conn.execute("DELETE FROM copias_bd WHERE `estado` = 'error' AND `creado_en` < NOW() - INTERVAL 60 DAY");
     console.log(`Copia de la base de datos hecha: ${clave} (${exp.tablas} tablas, ${exp.filas} filas, ${cifrado.length} bytes)`);
+    anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: manual ? 'Copia de seguridad (a mano)' : 'Copia de seguridad nocturna', detalle: { tablas: exp.tablas, filas: exp.filas, bytes: cifrado.length } });   // 30/10
     return { id: r.insertId, clave, bytes: cifrado.length, tablas: exp.tablas, filas: exp.filas };
   } catch (err) {
     console.error('COPIA BD: ha fallado:', err.message);
@@ -6465,7 +6682,7 @@ function vistaServicio(f, cfg, hoyISO, duplicado) {
   };
 }
 const CAMPOS_CLIENTE_SERVICIO = ['sin_confirmar', 'id', 'propuesta_id', 'servicio', 'tipo', 'clave', 'ejercicio_desde', 'ejercicio_hasta', 'ejercicio', 'es_rango', 'nombre_es', 'nombre_en', 'estado', 'en_curso',
-  'plazo', 'ventana_dias', 'plazo_estado', 'dias_restantes', 'presentado_en', 'propuesto_en', 'cerrado_en', 'cierre_via', 'docs_pendientes', 'entrega_estado', 'necesita_atencion', 'motivos_atencion'];
+  'plazo', 'ventana_dias', 'plazo_estado', 'dias_restantes', 'presentado_en', 'propuesto_en', 'cerrado_en', 'cierre_via', 'docs_pendientes', 'entrega_estado', 'necesita_atencion', 'motivos_atencion', 'progreso'];
 const paraCliente = v => Object.fromEntries(CAMPOS_CLIENTE_SERVICIO.map(k => [k, v[k]]));
 // Dos servicios del mismo tipo en un cliente se distinguen por el año en el nombre; se mira en TODA su
 // lista (no solo en las filas devueltas), para que el nombre no cambie según el filtro
@@ -6473,7 +6690,48 @@ async function vistasDeFilas(conn, filas) {
   const [dup] = await conn.query('SELECT cliente_id, tipo FROM servicios_cliente GROUP BY cliente_id, tipo HAVING COUNT(*) > 1');
   const dups = new Set(dup.map(x => x.cliente_id + '|' + x.tipo));
   const cfg = await plazosConfigurados(conn), hoy = hoyMadridISO();
-  return filas.map(f => vistaServicio(f, cfg, hoy, dups.has(f.cliente_id + '|' + f.tipo)));
+  const vistas = filas.map(f => vistaServicio(f, cfg, hoy, dups.has(f.cliente_id + '|' + f.tipo)));
+  await ponerProgreso(conn, vistas);   // 30/10: un solo cálculo del progreso para el panel, la ficha y el Área
+  return vistas;
+}
+// ---- 30/10 (Vikn): progreso de un servicio, el mismo en todas partes ----
+// Encargo: propuesta enviada 10 · aceptada sin pagar 20 · pago por confirmar 30 · alta pendiente 45 (con «pagar después», el pago no frena).
+// Servicio: pagado o en marcha 50 · faltan documentos 60 (manda lo que falta) · documentos por revisar 70 · documentación completa 80 ·
+// el cliente pide cambios 85 · informe entregado 90 · terminado, falta que confirme 95 · terminado 100.
+function progresoServicio(v, e, validos) {
+  if (e) {
+    if (e.estado === 'rechazada' || e.estado === 'caducada') return 0;
+    if (e.estado === 'enviada') return 10;
+    if (e.cobro !== 'despues') { if (!e.pago) return 20; if (e.pago !== 'confirmado') return 30; }
+    if (e.alta === 'rechazado') return 0;
+    if (e.alta !== 'aprobado') return 45;
+  }
+  if (!v.en_curso) return 100;
+  if (v.estado === 'por_confirmar') return 95;
+  if (v.entrega_estado === 'entregado') return 90;
+  if (v.entrega_estado === 'cambios') return 85;
+  if (Number(v.docs_pendientes) > 0) return 60;
+  if (Number(v.docs_por_revisar) > 0) return 70;
+  return validos > 0 ? 80 : 50;
+}
+async function estadoEncargos(conn, ids) {
+  const enc = {}; if (!ids.length) return enc;
+  const [ps] = await conn.query('SELECT id, estado, cobro FROM propuestas WHERE id IN (?)', [ids]);
+  const [pg] = await conn.query('SELECT propuesta_id, estado FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+  const [dl] = await conn.query('SELECT propuesta_id, estado FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+  ps.forEach(p => { enc[p.id] = { estado: p.estado, cobro: p.cobro || 'antes', pago: null, alta: null }; });
+  pg.forEach(g => { const e = enc[g.propuesta_id]; if (e && e.pago !== 'confirmado') e.pago = g.estado; });
+  dl.forEach(d => { const e = enc[d.propuesta_id]; if (e) e.alta = d.estado; });
+  return enc;
+}
+async function ponerProgreso(conn, vistas) {
+  const ids = [...new Set(vistas.map(v => v.propuesta_id).filter(Boolean))];
+  if (!ids.length) return vistas;
+  const enc = await estadoEncargos(conn, ids);
+  const [dv] = await conn.query("SELECT propuesta_id, servicio, SUM(estado = 'valido') AS v FROM documentos_fiscales WHERE propuesta_id IN (?) GROUP BY propuesta_id, servicio", [ids]);
+  const val = {}; dv.forEach(x => { val[x.propuesta_id + '|' + x.servicio] = Number(x.v) || 0; });
+  vistas.forEach(v => { v.progreso = progresoServicio(v, enc[v.propuesta_id], val[v.propuesta_id + '|' + v.servicio] || 0); });
+  return vistas;
 }
 async function listarServiciosCliente(conn, clienteId, { soloConfirmados = false } = {}) {
   const [filas] = await conn.query(SQL_SERVICIOS + ' WHERE s.cliente_id = ?' + (soloConfirmados ? ' AND s.confirmado = 1' : ' AND s.confirmado IN (0, 1)') + ' ORDER BY s.ejercicio_hasta DESC, s.id', [clienteId]);   // 20/10: sin los fusionados (duplicados)
@@ -6770,7 +7028,7 @@ async function servicioDelCliente(conn, token, id) {
   if (!f || f.cliente_id !== p.cliente_id || (f.confirmado !== 0 && f.confirmado !== 1)) return { error: [404, 'Servicio no encontrado'] };   // 21/10: también los de año sin confirmar (no los fusionados)
   return { p, f };
 }
-app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', async (req, res) => {
+app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', exigirPagoConfirmado, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const r = await servicioDelCliente(conn, req.params.token, req.params.id);
@@ -6782,7 +7040,7 @@ app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', async (req, res
     res.json({ ok: true, estado: 'terminado' });
   } finally { conn.release(); }
 });
-app.post('/api/propuestas/:token/servicios/:id(\\d+)/pendiente', async (req, res) => {
+app.post('/api/propuestas/:token/servicios/:id(\\d+)/pendiente', exigirPagoConfirmado, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const r = await servicioDelCliente(conn, req.params.token, req.params.id);
@@ -6924,7 +7182,7 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [props] = await conn.execute("SELECT id, token, estado, servicios, creado_en, inicio_inmediato_en, token_expira_en FROM propuestas WHERE cliente_id = ? AND (estado = 'aceptada' OR (estado = 'enviada' AND token_expira_en > NOW())) ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
+    const [props] = await conn.execute("SELECT id, token, estado, servicios, creado_en, inicio_inmediato_en, token_expira_en, cobro FROM propuestas WHERE cliente_id = ? AND (estado = 'aceptada' OR (estado = 'enviada' AND token_expira_en > NOW())) ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
     const ids = props.map(x => x.id);
     const vacio = { encargos: [], documentos: [], entregas: [], mensajes: [], historial: [], subidas_hoy: 0, limite_subidas: LIMITE_SUBIDAS_DIA };
     if (!ids.length) return res.json(vacio);
@@ -6936,7 +7194,7 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
     const [docs] = aprobadas.size ? await conn.query('SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en, id', [[...aprobadas]]) : [[]];
     const [ents] = await conn.execute('SELECT id, propuesta_id, servicio, version, nombre_archivo, bytes, subido_en, estado, comentario, respondido_en, conformidad_pedida_en FROM entregas WHERE cliente_id = ? ORDER BY id', [p.cliente_id]);
     const [msgs] = await conn.query(
-      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor
+      `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor, m.archivo_nombre, m.archivo_tipo, m.archivo_bytes
        FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
        WHERE m.propuesta_id IN (?) AND m.oculto_cliente_en IS NULL AND m.retirado_en IS NULL ORDER BY m.creado_en, m.id`, [ids]);
     const [pagos] = await conn.query('SELECT propuesta_id, metodo, estado, creado_en, confirmado_en FROM pagos WHERE propuesta_id IN (?)', [ids]);
@@ -6954,8 +7212,8 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
     res.json({
       encargos: props.map(x => ({ id: x.id, token: x.token, estado: x.estado, creado_en: x.creado_en, alta_aprobada: aprobadas.has(x.id),
         pago_recordado_en: ((recPago.find(r => r.objeto_id === x.id)) || {}).ultimo || null,
-        pago: pagos.some(g => g.propuesta_id === x.id), alta: ((dils.filter(g => g.propuesta_id === x.id).slice(-1)[0]) || {}).estado || null, servicios_nombres: x.estado === 'aceptada' ? serviciosDePropuesta(x).map(id => { const t = TIPOS_SERVICIO[tipoDeServicio(id)]; return t && t.generico ? t.generico : { es: id, en: id }; }) : undefined, expira_en: x.estado === 'enviada' ? x.token_expira_en : null, servicios: x.estado === 'enviada' ? serviciosDePropuesta(x) : undefined })),
-      documentos: docs, entregas: ents,
+        pago: pagos.some(g => g.propuesta_id === x.id), pago_confirmado: pagos.some(g => g.propuesta_id === x.id && g.estado === 'confirmado'), cobro: x.cobro || 'antes', plazo_pago: plazoPagoDe(x), informes_bloqueados: pagos.some(g => g.propuesta_id === x.id && g.estado === 'confirmado') ? 0 : ents.filter(e => e.propuesta_id === x.id && e.estado === 'entregado').length, alta: ((dils.filter(g => g.propuesta_id === x.id).slice(-1)[0]) || {}).estado || null, servicios_nombres: x.estado === 'aceptada' ? serviciosDePropuesta(x).map(id => { const t = TIPOS_SERVICIO[tipoDeServicio(id)]; return t && t.generico ? t.generico : { es: id, en: id }; }) : undefined, expira_en: x.estado === 'enviada' ? x.token_expira_en : null, servicios: x.estado === 'enviada' ? serviciosDePropuesta(x) : undefined })),
+      documentos: docs, entregas: ents.filter(e => pagos.some(g => g.propuesta_id === e.propuesta_id && g.estado === 'confirmado')),   // 29/10: los informes solo con el pago confirmado
       mensajes: msgs.map(m => Object.assign(m, { servicio_id: sidDe(m.propuesta_id, m.servicio) })),
       historial: h, subidas_hoy: await subidasDeHoy(conn, p.cliente_id), limite_subidas: LIMITE_SUBIDAS_DIA,
     });
@@ -7254,7 +7512,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-10-27.1';
+const VERSION_ACROS = '2026-10-30.1';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -7464,8 +7722,11 @@ const iaHerramientasExtra = {
 const iaEjecutarHerramientaBase = iaEjecutarHerramienta;
 iaEjecutarHerramienta = async function (nombre, entrada, req, usados) {
   if (iaHerramientasExtra[nombre]) return iaHerramientasExtra[nombre](entrada || {}, await iaAlcance(req), usados);
+  if (nombre === 'registro') return iaRegistro(entrada || {}, req, usados);   // 30/10: solo administradores
   return iaEjecutarHerramientaBase(nombre, entrada, req, usados);
 };
+IA_HERRAMIENTAS_PANEL.push({ name: 'registro', description: 'Registro maestro de actividad (solo para administradores): quién hizo qué y cuándo en el panel y en el Área (entradas, PIN, cambios de roles y permisos con el antes y el después, fichas y documentos abiertos, acciones de los clientes, correos y avisos enviados). Úsalo para preguntas como «¿alguien ha cambiado roles?» o «¿quién abrió la ficha de C12?». Responde con fecha, quién y qué.',
+  input_schema: { type: 'object', properties: { desde: { type: 'string', description: 'AAAA-MM-DD' }, hasta: { type: 'string', description: 'AAAA-MM-DD' }, tipo: { type: 'string', enum: ['acceso', 'lectura', 'cambio', 'cliente', 'sistema'] }, persona: { type: 'string', description: 'Nombre (o parte) de quien lo hizo' }, texto: { type: 'string', description: 'Palabra a buscar en la acción o el detalle, p. ej. «roles», «PIN», «fusiona»' } } } });
 
 // Solo en las baterías de pruebas (ACROS_PRUEBAS=1; en Railway no existe): ejecutar una herramienta como lo haría el asistente
 if (process.env.ACROS_PRUEBAS === '1') app.post('/api/admin/ia/herramienta-prueba', requiereSesionAsesor, async (req, res) => {
@@ -7643,11 +7904,705 @@ app.post('/api/admin/clientes/:id(\\d+)/cobertura', requiereSesionAsesor, async 
   res.status(201).json({ ok: true });
 });
 
+// ================================================================
+// COBRO «ANTES» O «DESPUÉS» (29/10, Vikn)
+// Cada propuesta lleva `cobro`: 'antes' (como siempre: aceptar → pagar → alta)
+// o 'despues' (aceptar → alta → trabajo → pagar, con 30 días de plazo para el
+// pago). En los dos casos, hasta que un administrador CONFIRMA el pago, el
+// cliente no puede: ver ni descargar informes, dar el visto bueno ni pedir
+// cambios, ver la cartera publicada ni el simulador, cerrar un servicio por
+// su parte ni valorar. El asesor sí puede subir informes: quedan preparados.
+// ================================================================
+const DIAS_PLAZO_PAGO = 30;
+async function pagoConfirmadoDe(conn, propuestaId) {
+  const [r] = await conn.execute("SELECT 1 FROM pagos WHERE propuesta_id = ? AND estado = 'confirmado' LIMIT 1", [propuestaId]);
+  return r.length > 0;
+}
+async function clienteConPagoConfirmado(conn, clienteId) {
+  const [r] = await conn.execute("SELECT 1 FROM pagos g JOIN propuestas p ON p.id = g.propuesta_id WHERE p.cliente_id = ? AND g.estado = 'confirmado' LIMIT 1", [clienteId]);
+  return r.length > 0;
+}
+function plazoPagoDe(p) {
+  if (p.cobro !== 'despues' || p.estado !== 'aceptada') return null;
+  const d = new Date(p.inicio_inmediato_en || p.creado_en); d.setDate(d.getDate() + DIAS_PLAZO_PAGO);
+  return d;
+}
+const SIN_PAGO = { error: 'Esta parte se desbloquea cuando Acros confirme tu pago.', codigo: 'pago_pendiente' };
+// Un «portero» para las rutas del cliente que exigen pago confirmado (por encargo)
+async function exigirPagoConfirmado(req, res, next) {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (!(await pagoConfirmadoDe(conn, p.id))) return res.status(402).json(SIN_PAGO);
+    next();
+  } finally { conn.release(); }
+}
+// Y otro por cliente (cartera y simulador): basta con que tenga algún encargo pagado
+async function exigirAlgunPagoConfirmado(req, res, next) {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (!(await clienteConPagoConfirmado(conn, p.cliente_id))) return res.status(402).json(SIN_PAGO);
+    next();
+  } finally { conn.release(); }
+}
+
+// ================================================================
+// CAMBIO DE ASESOR (29/10, Vikn): solo se ofrecen los del mismo equipo, con una
+// opción «al azar» dentro del equipo; y el aviso llega también por correo a los
+// administradores (antes solo salía por ntfy).
+// ================================================================
+async function candidatasCambioAsesor(conn, actual) {
+  const [todas] = await conn.query('SELECT * FROM personas WHERE `activa` = 1 AND `atiende_clientes` = 1 ORDER BY `orden`, `id`');
+  const eq = actual && actual.equipo_id;
+  return todas.filter(x => (!actual || x.id !== actual.id) && (!eq || x.equipo_id === eq));
+}
+async function correoCambioAsesor(_conn, clienteId, actual, destino, motivo, azar) {
+  if (!brevoActivo()) return;
+  const [cl] = await pool.execute('SELECT nombre, apellidos, correo FROM clientes WHERE id = ?', [clienteId]);
+  if (!cl.length) return;
+  const nombre = [cl[0].nombre, cl[0].apellidos].filter(Boolean).join(' ') || cl[0].correo;
+  const c = plantillaCorreo({ titulo: 'Un cliente pide cambiar de asesor', parrafos: [
+    ESC_HTML(nombre) + ' (' + ESC_HTML(cl[0].correo) + ') pide pasar ' + (actual ? 'de <strong>' + ESC_HTML(actual.nombre) + '</strong> ' : '') + 'a <strong>' + ESC_HTML(destino.nombre) + '</strong>' + (azar ? ' (ha dejado que se elija al azar dentro de su equipo)' : '') + '.',
+    motivo ? 'Motivo: «' + ESC_HTML(motivo) + '»' : 'No ha dado motivo.',
+    'Confírmalo en «Cambios de asesor pendientes»: panel.acrosfi.es' ] });
+  const [admins] = await pool.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
+  for (const a of admins) {
+    try { await enviarCorreo(a.correo, 'Cambio de asesor pedido · ' + nombre, c.html, c.texto); }
+    catch (err) { console.error('Aviso de cambio de asesor no enviado a ' + a.correo + ':', err.message); }
+  }
+}
+// El correo de respuesta al cliente como un hilo: lo que pidió y lo que se le contesta
+function hiloCambioAsesor(cambio, destino, respuesta) {
+  const fmt = f => { const d = new Date(f); return String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear(); };
+  const azar = /^Ha pedido que se elija al azar/.test(cambio.motivo || '');
+  let texto = String(cambio.texto_cliente || '').trim();
+  if (!texto && cambio.motivo) texto = String(cambio.motivo).replace(/^Ha pedido que se elija al azar dentro de su equipo\.\s*/, '').trim();
+  if (!texto) texto = azar ? 'Cambio de asesor, sin preferencias.' : 'Cambio de asesor a ' + (destino ? destino.nombre : 'otra persona') + '.';
+  const h = [{ quien: 'Tu solicitud', fecha: fmt(cambio.creado_en), texto }];
+  if (respuesta) h.push({ quien: 'Respuesta de Acros', propio: true, texto: respuesta });
+  return h;
+}
+
+// ---- Género del asesor en los correos (29/10, Vikn): «Marta, tu asesora de Acros» / «Felipe, tu asesor de Acros» ----
+const NOMBRES_FEM_EXC = new Set(['borja', 'luca', 'joshua', 'jose maria', 'josé maría', 'costa', 'garcia']);   // acaban en -a y son de hombre
+const NOMBRES_MASC_EXC = new Set(['carmen', 'pilar', 'beatriz', 'mar', 'inés', 'ines', 'raquel', 'isabel', 'consuelo', 'rocío', 'rocio', 'dolores', 'mercedes', 'esther', 'ester', 'noelia', 'lourdes', 'montserrat']);   // no acaban en -a y son de mujer
+function generoPorNombre(nombre) {
+  const n = String(nombre || '').trim().toLowerCase().split(/\s+/)[0] || '';
+  if (NOMBRES_MASC_EXC.has(n)) return 'f';
+  if (NOMBRES_FEM_EXC.has(n)) return 'm';
+  return /a$/.test(n) ? 'f' : 'm';
+}
+let CACHE_GENERO = { hasta: 0, mujeres: [] };
+async function mujeresDelEquipo() {
+  if (Date.now() < CACHE_GENERO.hasta) return CACHE_GENERO.mujeres;
+  try { const [f] = await pool.query("SELECT nombre FROM personas WHERE genero = 'f'"); CACHE_GENERO = { hasta: Date.now() + 60000, mujeres: f.map(x => x.nombre) }; } catch (e) { /* aún sin columna */ }
+  return CACHE_GENERO.mujeres;
+}
+// Ajusta «tu asesor» al género de la persona nombrada justo delante; sin nombre, no se presupone género: «Tu equipo de Acros»
+async function ajustarGeneroCorreo(...textos) {
+  const mujeres = await mujeresDelEquipo();
+  return textos.map(t => {
+    if (!t) return t;
+    let r = String(t);
+    for (const n of mujeres) {
+      const variantes = [n, ESC_HTML(n)].filter((v, i, a) => a.indexOf(v) === i);
+      for (const v of variantes) r = r.split(v + ', tu asesor').join(v + ', tu asesora');
+    }
+    return r.replace(/(^|[>.!?]\s*|\n)Tu asesor de Acros/g, '$1Tu equipo de Acros');
+  });
+}
+
+// ================================================================
+// PANTALLAS DE ERROR BONITAS (29/10, Vikn) — generado por generar_errores.py
+// A quien llega con un navegador a una dirección que no existe o que falla se le enseña una página de Acros; a los programas, el JSON de siempre.
+// ================================================================
+const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 170 020</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 170 020</div></main></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 170 020</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 170 020</div></main></body></html>"}};
+function pideHTML(req) { const a = String(req.headers.accept || ''); return a.includes('text/html') && !a.includes('application/json'); }
+function paginaError(req, codigo) { const i = /^en\b/i.test(String(req.headers['accept-language'] || '')) ? 'en' : 'es'; return PAGINAS_ERROR[i][codigo]; }
+
+// ================================================================
+// ARCHIVOS EN EL CHAT (29/10, Vikn)
+// El asesor puede adjuntar un archivo (PDF, imagen, Excel, Word, CSV o ZIP, hasta 10 MB) a un mensaje; el cliente lo descarga desde su
+// burbuja. No exige pago confirmado (pedir una copia de sus propios datos es un derecho del cliente) ni pide visto bueno. Se guarda en R2
+// bajo entregas/chat/, así que el kit del SSD lo recoge sin cambios. Como los informes, no va cifrado por Acros.
+// ================================================================
+const R2_MEMORIA = new Map();   // solo para las pruebas (ACROS_PRUEBAS=1 y sin R2)
+const almacenamientoListo = () => !!R2_BUCKET || process.env.ACROS_PRUEBAS === '1';
+function tiposChat() { return Object.assign({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }, TIPOS_ENTREGA); }
+function validarAdjuntoChat(a) {
+  const tipo = String((a && a.tipo) || ''), ext = tiposChat()[tipo];
+  if (!ext) return { error: [400, 'Formato no admitido (PDF, imagen, Excel, Word, CSV o ZIP)'] };
+  const buffer = Buffer.from(String((a && a.datos_base64) || ''), 'base64');
+  if (!buffer.length) return { error: [400, 'El archivo está vacío'] };
+  if (buffer.length > MAX_BYTES_ENTREGA) return { error: [413, 'El archivo supera los 10 MB'] };
+  if (!almacenamientoListo()) return { error: [500, 'El almacenamiento (R2) no está configurado'] };
+  return { buffer, tipo, ext, nombre: nombreSeguro((a && a.nombre) || ('archivo.' + ext)) };
+}
+async function enviarArchivoMensaje(res, m) {
+  const { buffer, tipoMime } = await bajarDeR2(m.archivo_clave);
+  res.set('Content-Type', tipoMime || m.archivo_tipo || 'application/octet-stream');
+  res.set('Content-Disposition', 'attachment; filename*=UTF-8\'\'' + encodeURIComponent(m.archivo_nombre || 'archivo'));
+  res.send(buffer);
+}
+app.get('/api/propuestas/:token/mensajes/:id(\\d+)/archivo', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [f] = await conn.execute('SELECT * FROM mensajes WHERE id = ? AND cliente_id = ? AND archivo_clave IS NOT NULL AND oculto_cliente_en IS NULL AND retirado_en IS NULL', [Number(req.params.id), p.cliente_id]);
+    if (!f.length) return res.status(404).json({ error: 'No encontrado' });
+    await enviarArchivoMensaje(res, f[0]);
+  } finally { conn.release(); }
+});
+app.get('/api/admin/mensajes/:id(\\d+)/archivo', requiereSesionAsesor, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT * FROM mensajes WHERE id = ? AND archivo_clave IS NOT NULL', [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'No encontrado' });
+    const permitidos = await clientesPermitidos(req).catch(() => null);
+    if (permitidos && !permitidos.has(f[0].cliente_id)) return res.status(403).json({ error: 'No tienes acceso a este cliente' });
+    await enviarArchivoMensaje(res, f[0]);
+  } finally { conn.release(); }
+});
+
+// ================================================================
+// PIN DEL PANEL (29/10, Vikn)
+// Cada persona tiene un PIN de 6 cifras. El panel se bloquea tras 10 minutos sin actividad y el SERVIDOR deja de dar datos de clientes
+// a esa sesión hasta que se escriba el PIN (no basta con tapar la pantalla). Si se olvida, se restablece con la contraseña (y el código
+// de dos pasos si lo tiene). Al cambiarlo o restablecerlo se avisa a la persona y a los administradores. Un administrador puede
+// reiniciar el de cualquiera (la persona elige otro; el administrador no lo ve).
+// ================================================================
+const PIN_MINUTOS = 10;
+const pinObligatorio = () => !(process.env.ACROS_PRUEBAS === '1' && process.env.ACROS_PIN !== '1');   // en las pruebas generales va apagado
+const RUTAS_SIN_PIN = [/^\/api\/admin\/pin\//, /^\/api\/admin\/sesion$/, /^\/api\/admin\/logout$/, /^\/api\/admin\/version/];
+function pinNuevoNoValido(pin) {
+  pin = String(pin || '');
+  if (!/^\d{6}$/.test(pin)) return 'El PIN son 6 cifras';
+  if (/^(\d)\1{5}$/.test(pin) || '01234567890'.includes(pin) || '09876543210'.includes(pin)) return 'Ese PIN es demasiado fácil de adivinar: elige otro';
+  return null;
+}
+const hastaPin = () => aSQLDatetime(new Date(Date.now() + PIN_MINUTOS * 60000));
+async function avisarCambioPin(asesorId, tipo, actor) {
+  try {
+    const [f] = await pool.execute('SELECT a.nombre, a.correo, p.id AS persona_id FROM asesores a LEFT JOIN personas p ON p.asesor_id = a.id WHERE a.id = ?', [asesorId]);
+    if (!f.length) return;
+    const quien = f[0], cuando = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
+    const QUE = { cambio: 'ha cambiado su PIN del panel', restablecido: 'ha restablecido su PIN del panel con su contraseña', reiniciado: 'tiene el PIN del panel reiniciado por ' + (actor ? actor.nombre : 'un administrador') };
+    if (brevoActivo()) {
+      const c = plantillaCorreo({ titulo: 'Tu PIN del panel ha cambiado', parrafos: ['Hola, ' + ESC_HTML(quien.nombre) + ':', tipo === 'reiniciado' ? 'Un administrador (' + ESC_HTML(actor ? actor.nombre : '') + ') ha reiniciado tu PIN del panel. La próxima vez que entres te pedirá que elijas uno nuevo.' : 'Tu PIN del panel se ha ' + (tipo === 'cambio' ? 'cambiado' : 'restablecido con tu contraseña') + ' el ' + ESC_HTML(cuando) + '.', 'Si no has sido tú, avisa cuanto antes a un administrador.'] });
+      try { await enviarCorreo(quien.correo, 'Tu PIN del panel de Acros ha cambiado', c.html, c.texto); } catch (e) { console.error('Aviso de PIN no enviado:', e.message); }
+      const [admins] = await pool.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1 AND id <> ? AND id <> ?', [asesorId, actor ? actor.id : 0]);
+      const ca = plantillaCorreo({ titulo: 'Cambio de PIN en el panel', parrafos: [ESC_HTML(quien.nombre) + ' ' + ESC_HTML(QUE[tipo]) + ' (' + ESC_HTML(cuando) + ').', 'Queda en el registro de actividad. Si no te cuadra, revísalo en Equipo.'] });
+      for (const a of admins) { try { await enviarCorreo(a.correo, 'Cambio de PIN en el panel · ' + quien.nombre, ca.html, ca.texto); } catch (e) { console.error('Aviso de PIN a administrador no enviado:', e.message); } }
+    }
+    const ini = quien.persona_id ? quienIni(await inicialesDePersona(quien.persona_id)) : '';
+    avisarEn(canalDe('equipo'), 'PIN del panel cambiado' + (ini ? ': ' + ini : ''), 'Detalle en el correo de los administradores y en el registro de actividad.');
+  } catch (e) { console.error('Aviso de PIN:', e.message); }
+}
+app.get('/api/admin/pin/estado', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT a.pin_hash, a.pin_pausa_hasta, a.totp_activo, a.auth_v2, s.desbloqueada_hasta FROM asesores a JOIN sesiones_asesor s ON s.asesor_id = a.id WHERE a.id = ? AND s.id = ?', [req.asesor.id, req.asesor.sesionId]);
+  const x = f[0] || {};
+  res.json({ obligatorio: pinObligatorio(), tiene_pin: !!x.pin_hash, desbloqueado: !!x.pin_hash && !!x.desbloqueada_hasta && new Date(x.desbloqueada_hasta) > ahora(), minutos: PIN_MINUTOS, pausa_hasta: x.pin_pausa_hasta && new Date(x.pin_pausa_hasta) > ahora() ? x.pin_pausa_hasta : null, tiene_2fa: !!x.totp_activo, auth_v2: !!x.auth_v2 });
+});
+app.post('/api/admin/pin/crear', requiereSesionAsesor, async (req, res) => {
+  const pin = String((req.body || {}).pin || ''), mal = pinNuevoNoValido(pin);
+  if (mal) return res.status(400).json({ error: mal });
+  const [f] = await pool.execute('SELECT pin_hash FROM asesores WHERE id = ?', [req.asesor.id]);
+  if (f[0].pin_hash) return res.status(409).json({ error: 'Ya tienes un PIN: cámbialo desde tus ajustes' });
+  await pool.execute('UPDATE asesores SET pin_hash = ?, pin_intentos = 0, pin_pausa_hasta = NULL WHERE id = ?', [await bcrypt.hash(pin, 10), req.asesor.id]);
+  await pool.execute('UPDATE sesiones_asesor SET desbloqueada_hasta = ? WHERE id = ?', [hastaPin(), req.asesor.sesionId]);
+  res.status(201).json({ ok: true });
+});
+app.post('/api/admin/pin/desbloquear', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT pin_hash, pin_intentos, pin_pausa_hasta FROM asesores WHERE id = ?', [req.asesor.id]);
+  const a = f[0];
+  if (!a.pin_hash) return res.status(409).json({ error: 'Todavía no tienes PIN: créalo', codigo: 'pin_crear' });
+  if (a.pin_pausa_hasta && new Date(a.pin_pausa_hasta) > ahora()) return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos y vuelve a probar.' });
+  if (await bcrypt.compare(String((req.body || {}).pin || ''), a.pin_hash)) {
+    await pool.execute('UPDATE asesores SET pin_intentos = 0, pin_pausa_hasta = NULL WHERE id = ?', [req.asesor.id]);
+    await pool.execute('UPDATE sesiones_asesor SET desbloqueada_hasta = ? WHERE id = ?', [hastaPin(), req.asesor.sesionId]);
+    return res.json({ ok: true });
+  }
+  const n = (a.pin_intentos || 0) + 1;
+  if (n >= 5) {   // al quinto fallo, fuera: hay que volver a entrar con contraseña (y dos pasos)
+    await pool.execute('UPDATE asesores SET pin_intentos = 0, pin_pausa_hasta = NULL WHERE id = ?', [req.asesor.id]);
+    await pool.execute('DELETE FROM sesiones_asesor WHERE id = ?', [req.asesor.sesionId]);
+    return res.status(401).json({ error: 'Demasiados intentos: vuelve a iniciar sesión con tu contraseña.' });
+  }
+  await pool.execute('UPDATE asesores SET pin_intentos = ?, pin_pausa_hasta = ? WHERE id = ?', [n, n === 3 ? aSQLDatetime(new Date(Date.now() + 5 * 60000)) : null, req.asesor.id]);
+  if (n === 3) return res.status(429).json({ error: 'PIN incorrecto. Tres fallos seguidos: espera 5 minutos.' });
+  res.status(403).json({ error: 'PIN incorrecto. Te quedan ' + (5 - n) + ' intentos antes de cerrar la sesión.' });
+});
+app.post('/api/admin/pin/latido', requiereSesionAsesor, async (req, res) => {   // el panel lo manda solo si ha habido actividad de verdad
+  const [r] = await pool.execute('UPDATE sesiones_asesor SET desbloqueada_hasta = ? WHERE id = ? AND desbloqueada_hasta > NOW()', [hastaPin(), req.asesor.sesionId]);
+  res.json({ ok: true, desbloqueado: r.affectedRows > 0 });
+});
+app.post('/api/admin/pin/bloquear', requiereSesionAsesor, async (req, res) => {
+  await pool.execute('UPDATE sesiones_asesor SET desbloqueada_hasta = NULL WHERE id = ?', [req.asesor.sesionId]);
+  res.json({ ok: true });
+});
+app.post('/api/admin/pin/cambiar', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, mal = pinNuevoNoValido(b.nuevo);
+  if (mal) return res.status(400).json({ error: mal });
+  const [f] = await pool.execute('SELECT a.pin_hash, s.desbloqueada_hasta FROM asesores a JOIN sesiones_asesor s ON s.asesor_id = a.id WHERE a.id = ? AND s.id = ?', [req.asesor.id, req.asesor.sesionId]);
+  if (!f[0].desbloqueada_hasta || new Date(f[0].desbloqueada_hasta) <= ahora()) return res.status(423).json({ error: 'El panel está bloqueado: escribe tu PIN', codigo: 'pin' });
+  if (!f[0].pin_hash || !(await bcrypt.compare(String(b.actual || ''), f[0].pin_hash))) return res.status(403).json({ error: 'Tu PIN actual no es correcto' });
+  await pool.execute('UPDATE asesores SET pin_hash = ?, pin_intentos = 0, pin_pausa_hasta = NULL WHERE id = ?', [await bcrypt.hash(String(b.nuevo), 10), req.asesor.id]);
+  avisarCambioPin(req.asesor.id, 'cambio', req.asesor);
+  res.json({ ok: true });
+});
+app.post('/api/admin/pin/olvidado', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, mal = pinNuevoNoValido(b.nuevo);
+  if (mal) return res.status(400).json({ error: mal });
+  const [f] = await pool.execute('SELECT contrasena_hash, totp_secreto, totp_activo, auth_v2 FROM asesores WHERE id = ?', [req.asesor.id]);
+  const prueba = f[0].auth_v2 ? String(b.clave_auth || '') : String(b.contrasena || '');
+  if (!prueba || !(await bcrypt.compare(prueba, f[0].contrasena_hash))) return res.status(403).json({ error: 'Tu contraseña no es correcta' });
+  if (f[0].totp_activo && !totpValido(f[0].totp_secreto, b.codigo)) return res.status(403).json({ error: 'El código de tu app no es correcto' });
+  await pool.execute('UPDATE asesores SET pin_hash = ?, pin_intentos = 0, pin_pausa_hasta = NULL WHERE id = ?', [await bcrypt.hash(String(b.nuevo), 10), req.asesor.id]);
+  await pool.execute('UPDATE sesiones_asesor SET desbloqueada_hasta = ? WHERE id = ?', [hastaPin(), req.asesor.sesionId]);
+  avisarCambioPin(req.asesor.id, 'restablecido', req.asesor);
+  res.json({ ok: true });
+});
+app.post('/api/admin/asesores/:id(\\d+)/pin/reiniciar', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {   // el PIN del propio admin tiene que estar desbloqueado (lo exige requiereSesionAsesor)
+  const id = Number(req.params.id);
+  const [r] = await pool.execute('UPDATE asesores SET pin_hash = NULL, pin_intentos = 0, pin_pausa_hasta = NULL WHERE id = ?', [id]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Asesor no encontrado' });
+  await pool.execute('UPDATE sesiones_asesor SET desbloqueada_hasta = NULL WHERE asesor_id = ?', [id]);
+  avisarCambioPin(id, 'reiniciado', req.asesor);
+  res.json({ ok: true });
+});
+
+// ================================================================
+// MÉTRICAS DEL EQUIPO (29/10, Vikn)
+// Amplían «Rendimiento»: tiempos del chat (mediana, percentil 90, en horario, hasta leer, porcentaje en objetivo, sin contestar),
+// el proceso por etapas separando el tiempo «nuestro» del «del cliente» (la pasividad del cliente, comparada con el equipo),
+// el perfil de los mensajes de cada asesor (sin IA: medidas objetivas y una puntuación de cercanía; y cuánto usa los borradores de IA),
+// y, con los horarios de cada persona (o «No tiene horario»), festivos y ausencias: horas laborables, carga, capacidad y cobertura.
+// Se trabaja por objetivos: lo de fuera de horario es solo un dato de carga, nunca un reproche.
+// ================================================================
+const FMT_MADRID = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+function msMadrid(d) { const p = Object.fromEntries(FMT_MADRID.formatToParts(new Date(d)).map(x => [x.type, x.value])); return Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second); }   // hora de Madrid como si fuera UTC
+const aMin = t => { const [h, m] = String(t).split(':').map(Number); return h * 60 + m; };
+function horarioDe(texto) { try { const h = texto ? JSON.parse(texto) : null; return h && !h.sin_horario && h.dias && Object.values(h.dias).some(f => f && f.length) ? h : null; } catch (e) { return null; } }
+function franjasDelDia(h, dia0) {   // dia0: ms de la medianoche (Madrid «como UTC»)
+  const dow = ((new Date(dia0).getUTCDay() + 6) % 7) + 1;
+  return (h.dias[dow] || h.dias[String(dow)] || []).map(([i, f]) => [dia0 + aMin(i) * 60000, dia0 + aMin(f) * 60000]);
+}
+const fechaDe = ms => new Date(ms).toISOString().slice(0, 10);
+const diaLibre = (ms, festivos, ausencias) => { const f = fechaDe(ms); return festivos.has(f) || ausencias.some(([d, h]) => f >= d && f <= h); };
+function horasEntre(h, a, b, festivos, ausencias) {   // horas laborables entre dos instantes; sin horario, horas corridas
+  if (!(b > a)) return 0;
+  if (!h) return (new Date(b) - new Date(a)) / 3600000;
+  const A = msMadrid(a), B = msMadrid(b); let tot = 0;
+  for (let d = Date.UTC(new Date(A).getUTCFullYear(), new Date(A).getUTCMonth(), new Date(A).getUTCDate()), n = 0; d < B && n < 200; d += 86400000, n++) {
+    if (diaLibre(d, festivos, ausencias)) continue;
+    for (const [i, f] of franjasDelDia(h, d)) tot += Math.max(0, Math.min(f, B) - Math.max(i, A));
+  }
+  return tot / 3600000;
+}
+function enHorario(h, t, festivos, ausencias) {
+  if (!h) return true;
+  const T = msMadrid(t), d = T - (T % 86400000);
+  if (diaLibre(d, festivos, ausencias)) return false;
+  return franjasDelDia(h, d).some(([i, f]) => T >= i && T < f);
+}
+const mediana = v => { const x = v.filter(n => n != null && isFinite(n)).sort((p, q) => p - q); if (!x.length) return null; const m = Math.floor(x.length / 2); return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2; };
+const percentil = (v, p) => { const x = v.filter(n => n != null && isFinite(n)).sort((a, b) => a - b); return x.length ? x[Math.min(x.length - 1, Math.ceil(p / 100 * x.length) - 1)] : null; };
+const r1 = n => n == null ? null : Math.round(n * 10) / 10;
+const pct = (a, b) => b ? Math.round(a / b * 100) : null;
+const SALUDO = /^\s*(hola|buen[oa]s|buenos d[ií]as|buenas tardes|buenas noches|hey|qu[eé] tal)\b/i;
+const DESPEDIDA = /(un saludo|saludos|un abrazo|gracias|quedo a tu disposici[oó]n|cualquier cosa me dices|hablamos|feliz d[ií]a|que vaya bien)/i;
+const CERCANO = /(!|gracias|genial|perfecto|encantad|tranquil|un abrazo|[\u{1F300}-\u{1FAFF}\u2600-\u27BF])/iu;
+async function ampliarRendimiento(conn, filas, porAsesor, ini, fin) {
+  const [pers] = await conn.query('SELECT id, horario, activa, atiende_clientes FROM personas');
+  const H = {}; pers.forEach(p => { H[p.id] = horarioDe(p.horario); });
+  const [aj] = await conn.query("SELECT clave, valor FROM ajustes WHERE clave IN ('festivos', 'objetivo_respuesta_h')");
+  const ajuste = k => (aj.find(x => x.clave === k) || {}).valor;
+  const festivos = new Set(String(ajuste('festivos') || '').split(/[\s,;]+/).filter(x => /^\d{4}-\d{2}-\d{2}$/.test(x)));
+  const objetivo = Number(ajuste('objetivo_respuesta_h')) || 24;
+  const [aus] = await conn.query("SELECT persona_id, DATE_FORMAT(desde, '%Y-%m-%d') AS d, DATE_FORMAT(hasta, '%Y-%m-%d') AS h FROM ausencias");
+  const AUS = {}; aus.forEach(x => { (AUS[x.persona_id] = AUS[x.persona_id] || []).push([x.d, x.h]); });
+  const hor = (pid, a, b) => horasEntre(H[pid] || null, a, b, festivos, AUS[pid] || []);
+  const [cl] = await conn.query('SELECT id, asesor_persona_id, nombre FROM clientes');
+  const deCli = {}, nombreCli = {}; cl.forEach(c => { deCli[c.id] = c.asesor_persona_id; nombreCli[c.id] = String(c.nombre || '').trim().split(/\s+/)[0]; });
+  const T = k => Object.values(filas).forEach(f => { f[k] = []; });
+  ['_r', '_rl', '_j', '_leer', '_aln', '_dabrir', '_drev', '_inf', '_vbp', '_cacep', '_cdoc', '_crec', '_cvb', '_msgs'].forEach(T);
+  Object.values(filas).forEach(f => { f._obj = [0, 0]; f._fuera = [0, 0]; f._cli_msgs = 0; });
+  const fila = pid => pid ? filas[pid] : null;
+  const enMes = t => t && new Date(t) >= ini && new Date(t) < fin;
+  // ---- Chat: tiempos de respuesta (quien responde) y de lectura (asesor del cliente) ----
+  const [msgs] = await conn.execute('SELECT id, propuesta_id, servicio, autor, asesor_id, cliente_id, texto, creado_en, leido_en, ia_borrador, ia_cambio_pct, retirado_en FROM mensajes WHERE creado_en >= ? - INTERVAL 1 DAY AND creado_en < ? + INTERVAL 7 DAY ORDER BY propuesta_id, servicio, creado_en, id', [sqlFecha(ini), sqlFecha(fin)]);
+  let pend = null;
+  msgs.forEach(x => {
+    const hilo = x.propuesta_id + '|' + x.servicio;
+    if (pend && pend.hilo !== hilo) pend = null;
+    if (x.autor === 'cliente') {
+      if (enMes(x.creado_en)) { const fc = fila(deCli[x.cliente_id]); if (fc) { fc._cli_msgs++; if (x.leido_en) fc._leer.push((new Date(x.leido_en) - new Date(x.creado_en)) / 3600000); } }
+      if (!pend && enMes(x.creado_en)) pend = { hilo, t: x.creado_en };
+    } else {
+      const pid = porAsesor[x.asesor_id], f = fila(pid);
+      if (f && enMes(x.creado_en) && !x.retirado_en) { f._msgs.push(x); if (H[pid]) { f._fuera[1]++; if (!enHorario(H[pid], x.creado_en, festivos, AUS[pid] || [])) f._fuera[0]++; } }
+      if (pend && f) {
+        const corr = (new Date(x.creado_en) - new Date(pend.t)) / 3600000, lab = hor(pid, pend.t, x.creado_en);
+        f._r.push(corr); f._rl.push(lab); f._obj[1]++; if (lab <= objetivo) f._obj[0]++;
+        if (H[pid] && !enHorario(H[pid], pend.t, festivos, AUS[pid] || [])) f._j.push(lab);
+      }
+      pend = null;
+    }
+  });
+  // ---- Sin contestar ahora (estado actual): el último mensaje del hilo es del cliente ----
+  const [ult] = await conn.query("SELECT m.cliente_id, m.creado_en FROM mensajes m JOIN (SELECT propuesta_id, servicio, MAX(id) AS mid FROM mensajes WHERE retirado_en IS NULL GROUP BY propuesta_id, servicio) u ON u.mid = m.id WHERE m.autor = 'cliente'");
+  Object.values(filas).forEach(f => { f.sin_contestar = 0; f.sin_contestar_max_h = null; });
+  ult.forEach(u => { const f = fila(deCli[u.cliente_id]); if (!f) return; f.sin_contestar++; const h = (Date.now() - new Date(u.creado_en)) / 3600000; f.sin_contestar_max_h = r1(Math.max(f.sin_contestar_max_h || 0, h)); });
+  // ---- Proceso: tiempo nuestro ----
+  const dias = (a, b) => (new Date(b) - new Date(a)) / 86400000;
+  const [dils] = await conn.execute('SELECT cliente_id, creado_en, resuelto_en FROM diligencias WHERE resuelto_en >= ? AND resuelto_en < ?', [sqlFecha(ini), sqlFecha(fin)]);
+  dils.forEach(d => { const f = fila(deCli[d.cliente_id]); if (f) f._aln.push(dias(d.creado_en, d.resuelto_en)); });
+  const [docs] = await conn.execute('SELECT id, cliente_id, propuesta_id, servicio, estado, creado_en, subido_en, revisado_en FROM documentos_fiscales WHERE (subido_en >= ? AND subido_en < ?) OR (revisado_en >= ? AND revisado_en < ?)', [sqlFecha(ini), sqlFecha(fin), sqlFecha(ini), sqlFecha(fin)]);
+  const idsDocs = docs.map(d => d.id);
+  let aperturas = [];
+  if (idsDocs.length) [aperturas] = await conn.query("SELECT objeto_id, MIN(creado_en) AS t FROM actividad WHERE ruta LIKE '%/documentos/%/descargar' AND objeto_id IN (?) GROUP BY objeto_id", [idsDocs]);
+  const abierto = {}; aperturas.forEach(a => { abierto[a.objeto_id] = a.t; });
+  const [recs] = await conn.query("SELECT objeto_id, creado_en FROM recordatorios_cliente WHERE tipo IN ('documento', 'doc')");
+  docs.forEach(d => {
+    const f = fila(deCli[d.cliente_id]); if (!f) return;
+    if (enMes(d.subido_en)) {
+      if (abierto[d.id] && new Date(abierto[d.id]) >= new Date(d.subido_en)) f._dabrir.push((new Date(abierto[d.id]) - new Date(d.subido_en)) / 3600000);
+      f._cdoc.push(dias(d.creado_en, d.subido_en));
+      f._crec.push(recs.filter(r => r.objeto_id === d.id && new Date(r.creado_en) <= new Date(d.subido_en)).length);
+    }
+    if (enMes(d.revisado_en) && d.subido_en) f._drev.push(dias(d.subido_en, d.revisado_en));
+  });
+  const [ents] = await conn.execute("SELECT e.cliente_id, e.propuesta_id, e.servicio, e.version, e.subido_en, e.conformidad_pedida_en, e.estado, e.respondido_en, (SELECT MAX(d.revisado_en) FROM documentos_fiscales d WHERE d.propuesta_id = e.propuesta_id AND d.servicio = e.servicio AND d.estado = 'valido' AND d.revisado_en <= e.subido_en) AS ult_doc FROM entregas e WHERE (e.subido_en >= ? AND e.subido_en < ?) OR (e.conformidad_pedida_en >= ? AND e.conformidad_pedida_en < ?) OR (e.respondido_en >= ? AND e.respondido_en < ?)", [sqlFecha(ini), sqlFecha(fin), sqlFecha(ini), sqlFecha(fin), sqlFecha(ini), sqlFecha(fin)]);
+  ents.forEach(e => {
+    const f = fila(deCli[e.cliente_id]); if (!f) return;
+    if (enMes(e.subido_en) && e.version === 1 && e.ult_doc) f._inf.push(dias(e.ult_doc, e.subido_en));
+    if (enMes(e.conformidad_pedida_en)) f._vbp.push(dias(e.subido_en, e.conformidad_pedida_en));
+    if (enMes(e.respondido_en) && e.estado === 'conforme' && e.conformidad_pedida_en) f._cvb.push(dias(e.conformidad_pedida_en, e.respondido_en));
+  });
+  // ---- Tiempo del cliente: aceptar la propuesta ----
+  const [props] = await conn.execute("SELECT cliente_id, creado_en, inicio_inmediato_en FROM propuestas WHERE inicio_inmediato_en >= ? AND inicio_inmediato_en < ?", [sqlFecha(ini), sqlFecha(fin)]);
+  props.forEach(p => { const f = fila(deCli[p.cliente_id]); if (f) f._cacep.push(dias(p.creado_en, p.inicio_inmediato_en)); });
+  // ---- IA: borradores pedidos ----
+  const [ia] = await conn.execute("SELECT persona_id AS asesor_id, COUNT(*) AS n FROM ia_uso WHERE funcion LIKE '%borrador%' AND ok = 1 AND creado_en >= ? AND creado_en < ? GROUP BY persona_id", [sqlFecha(ini), sqlFecha(fin)]);
+  Object.values(filas).forEach(f => { f.ia_borradores = 0; });
+  ia.forEach(x => { const f = fila(porAsesor[x.asesor_id]); if (f) f.ia_borradores = Number(x.n); });
+  // ---- Capacidad (próximos 60 días) ----
+  // el plazo de cada servicio se calcula (vistasDeFilas), no es una columna
+  const [svF] = await conn.query(SQL_SERVICIOS + " WHERE s.estado IN ('abierto', 'por_confirmar') AND s.confirmado = 1");
+  const svs = await vistasDeFilas(conn, svF), hoyD = hoyMadridISO(), limite60 = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10);
+  Object.values(filas).forEach(f => { f.cap_servicios_60d = 0; });
+  svs.filter(v => v.plazo && v.plazo >= hoyD && v.plazo < limite60).forEach(v => { const f = fila(deCli[v.cliente_id]); if (f) f.cap_servicios_60d++; });
+  // ---- Cierre por persona ----
+  const ahora60 = new Date(Date.now() + 60 * 86400000);
+  Object.values(filas).forEach(f => {
+    const pid = f.persona_id;
+    f.resp_mediana_h = r1(mediana(f._r)); f.resp_p90_h = r1(percentil(f._r, 90)); f.resp_lab_mediana_h = r1(mediana(f._rl));
+    f.resp_objetivo_pct = pct(f._obj[0], f._obj[1]); f.jornada_mediana_h = r1(mediana(f._j)); f.leer_mediana_h = r1(mediana(f._leer));
+    f.et_alta_dias = r1(mediana(f._aln)); f.et_doc_abrir_h = r1(mediana(f._dabrir)); f.et_doc_revisar_dias = r1(mediana(f._drev)); f.et_informe_dias = r1(mediana(f._inf)); f.et_vb_pedir_dias = r1(mediana(f._vbp));
+    f.cli_acepta_dias = r1(mediana(f._cacep)); f.cli_doc_dias = r1(mediana(f._cdoc)); f.cli_doc_7d_pct = pct(f._cdoc.filter(x => x <= 7).length, f._cdoc.length);
+    f.cli_recordatorios = f._crec.length ? r1(f._crec.reduce((a, b) => a + b, 0) / f._crec.length) : null; f.cli_vb_dias = r1(mediana(f._cvb));
+    // perfil de los mensajes (sin IA)
+    const ms = f._msgs.filter(m => String(m.texto || '').trim()), n = ms.length;
+    const conNombre = ms.filter(m => nombreCli[m.cliente_id] && nombreCli[m.cliente_id].length > 1 && new RegExp('\\b' + nombreCli[m.cliente_id].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(m.texto)).length;
+    const norm = t => String(t).toLowerCase().replace(/\s+/g, ' ').trim(), vistos = new Set(); let repes = 0;
+    ms.forEach(m => { const k = norm(m.texto); if (k.length > 20 && vistos.has(k)) repes++; vistos.add(k); });
+    f.msg_n = n; f.msg_longitud = n ? Math.round(ms.reduce((a, m) => a + String(m.texto).length, 0) / n) : null;
+    f.msg_saludo_pct = pct(ms.filter(m => SALUDO.test(m.texto)).length, n); f.msg_despedida_pct = pct(ms.filter(m => DESPEDIDA.test(m.texto)).length, n);
+    f.msg_nombre_pct = pct(conNombre, n); f.msg_preguntas_pct = pct(ms.filter(m => /\?/.test(m.texto)).length, n);
+    f.msg_usted_pct = pct(ms.filter(m => /\busted(es)?\b/i.test(m.texto)).length, n); f.msg_plantilla_pct = pct(repes, n);
+    f.tono_cercania = n ? Math.round(ms.reduce((a, m) => a + (SALUDO.test(m.texto) ? 25 : 0) + (DESPEDIDA.test(m.texto) ? 20 : 0) + (nombreCli[m.cliente_id] && new RegExp('\\b' + nombreCli[m.cliente_id].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(m.texto) ? 25 : 0) + (CERCANO.test(m.texto) ? 15 : 0) + (String(m.texto).length >= 80 ? 15 : 0), 0) / n) : null;
+    f.tono = f.tono_cercania == null ? null : f.tono_cercania >= 60 ? 'cercano' : f.tono_cercania >= 35 ? 'neutro' : 'seco';
+    f.ia_enviado_pct = pct(f._msgs.filter(m => m.ia_borrador).length, f._msgs.length); f.ia_cambio_mediana = r1(mediana(f._msgs.filter(m => m.ia_borrador && m.ia_cambio_pct != null).map(m => m.ia_cambio_pct)));
+    // horario: carga y capacidad (sin horario, no aplica)
+    f.tiene_horario = !!H[pid];
+    f.horas_disponibles = H[pid] ? r1(hor(pid, ini, fin)) : null;
+    f.carga_mensajes_hora = H[pid] && f.horas_disponibles ? Math.round(f._cli_msgs / f.horas_disponibles * 100) / 100 : null;
+    f.fuera_horario_pct = H[pid] ? pct(f._fuera[0], f._fuera[1]) : null;
+    f.cap_horas_60d = H[pid] ? r1(hor(pid, new Date(), ahora60)) : null;
+    f.cap_horas_por_servicio = H[pid] && f.cap_servicios_60d ? r1(f.cap_horas_60d / f.cap_servicios_60d) : null;
+    ['_r', '_rl', '_j', '_leer', '_aln', '_dabrir', '_drev', '_inf', '_vbp', '_cacep', '_cdoc', '_crec', '_cvb', '_msgs', '_obj', '_fuera', '_cli_msgs'].forEach(k => delete f[k]);
+  });
+  // ---- Equipo: etapas (mediana del equipo) y pasividad del cliente comparada ----
+  const vals = k => Object.values(filas).map(f => f[k]).filter(v => v != null);
+  const ETAPAS = [
+    ['et_alta_dias', 'Alta enviada → alta revisada', 'nuestro', 'días'], ['et_doc_abrir_h', 'Documento subido → lo abre el asesor', 'nuestro', 'h'],
+    ['et_doc_revisar_dias', 'Documento subido → revisado', 'nuestro', 'días'], ['et_informe_dias', 'Último documento válido → informe entregado', 'nuestro', 'días'],
+    ['et_vb_pedir_dias', 'Informe entregado → se pide el visto bueno', 'nuestro', 'días'],
+    ['cli_acepta_dias', 'Propuesta enviada → aceptada', 'cliente', 'días'], ['cli_doc_dias', 'Documento pedido → subido', 'cliente', 'días'],
+    ['cli_vb_dias', 'Visto bueno pedido → lo da', 'cliente', 'días'],
+  ];
+  const etapas = ETAPAS.map(([k, nombre, de, unidad]) => ({ clave: k, nombre, de, unidad, equipo: r1(mediana(vals(k))) }));
+  const medCliDoc = mediana(vals('cli_doc_dias'));
+  Object.values(filas).forEach(f => { f.cli_doc_vs_equipo = f.cli_doc_dias != null && medCliDoc ? Math.round(f.cli_doc_dias / medCliDoc * 100) / 100 : null; });
+  // ---- Cobertura: mensajes de clientes por día y hora frente a personas disponibles (solo quien tiene horario) ----
+  const conHorario = pers.filter(p => H[p.id] && p.activa && p.atiende_clientes);
+  let cobertura = null;
+  if (conHorario.length) {
+    const men = Array.from({ length: 7 }, () => Array(24).fill(0)), disp = Array.from({ length: 7 }, () => Array(24).fill(0));
+    for (let dw = 1; dw <= 7; dw++) for (let h = 0; h < 24; h++) conHorario.forEach(p => { if ((H[p.id].dias[dw] || H[p.id].dias[String(dw)] || []).some(([i, f]) => aMin(i) <= h * 60 && aMin(f) > h * 60)) disp[dw - 1][h]++; });
+    let sinCubrir = 0;
+    msgs.filter(x => x.autor === 'cliente' && enMes(x.creado_en)).forEach(x => { const T0 = msMadrid(x.creado_en), dw = ((new Date(T0).getUTCDay() + 6) % 7), h = new Date(T0).getUTCHours(); men[dw][h]++; if (!disp[dw][h] || festivos.has(fechaDe(T0))) sinCubrir++; });
+    cobertura = { mensajes: men, disponibles: disp, sin_cubrir: sinCubrir, personas_con_horario: conHorario.length };
+  }
+  const [eqs] = await conn.query('SELECT id, nombre FROM equipos WHERE activo = 1 ORDER BY nombre');
+  return { etapas, cobertura, objetivo_h: objetivo, festivos: [...festivos].sort(), equipos: eqs };
+}
+// ---- Horarios, ausencias, festivos y objetivo ----
+async function puedeTocarHorario(req, personaId) {
+  if (req.asesor.esAdmin) return true;
+  if (!req.asesor.roles.has('jefe')) return false;
+  const [f] = await pool.execute('SELECT e.jefe_persona_id, (SELECT id FROM personas WHERE asesor_id = ?) AS yo FROM personas p JOIN equipos e ON e.id = p.equipo_id WHERE p.id = ?', [req.asesor.id, personaId]);
+  return !!(f.length && f[0].yo && f[0].jefe_persona_id === f[0].yo);
+}
+function horarioValido(b) {
+  if (b && b.sin_horario) return { sin_horario: true };
+  const dias = {};
+  for (let d = 1; d <= 7; d++) {
+    const fr = ((b && b.dias && (b.dias[d] || b.dias[String(d)])) || []).filter(x => Array.isArray(x) && x[0] && x[1]);
+    if (fr.length > 3) return null;
+    for (const [i, f] of fr) { if (!/^\d{2}:\d{2}$/.test(i) || !/^\d{2}:\d{2}$/.test(f) || aMin(i) >= aMin(f) || aMin(f) > 1440) return null; }
+    dias[d] = fr.map(([i, f]) => [i, f]);
+  }
+  return { dias };
+}
+app.get('/api/admin/horarios', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const [p] = await pool.query('SELECT id, nombre, equipo_id, horario, activa, atiende_clientes FROM personas ORDER BY orden, id');
+  const [a] = await pool.query("SELECT id, persona_id, DATE_FORMAT(desde, '%Y-%m-%d') AS desde, DATE_FORMAT(hasta, '%Y-%m-%d') AS hasta, motivo FROM ausencias ORDER BY desde DESC");
+  const [aj] = await pool.query("SELECT clave, valor FROM ajustes WHERE clave IN ('festivos', 'objetivo_respuesta_h')");
+  const v = k => (aj.find(x => x.clave === k) || {}).valor;
+  res.json({ personas: p.map(x => ({ ...x, horario: x.horario ? JSON.parse(x.horario) : null })), ausencias: a, festivos: String(v('festivos') || '').split(/[\s,;]+/).filter(Boolean), objetivo_h: Number(v('objetivo_respuesta_h')) || 24 });
+});
+app.put('/api/admin/personas/:id(\\d+)/horario', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!(await puedeTocarHorario(req, id))) return res.status(403).json({ error: 'Solo un administrador o el jefe de su equipo pueden cambiar su horario' });
+  const h = horarioValido(req.body || {});
+  if (!h) return res.status(400).json({ error: 'Horario no válido: cada franja con hora de inicio y de fin (la de fin, después), y como mucho 3 por día' });
+  const [r] = await pool.execute('UPDATE personas SET horario = ? WHERE id = ?', [JSON.stringify(h), id]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'Persona no encontrada' });
+  res.json({ ok: true, horario: h });
+});
+app.post('/api/admin/ausencias', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, pid = Number(b.persona_id), re = /^\d{4}-\d{2}-\d{2}$/;
+  if (!(await puedeTocarHorario(req, pid))) return res.status(403).json({ error: 'Solo un administrador o el jefe de su equipo' });
+  if (!re.test(b.desde) || !re.test(b.hasta) || b.hasta < b.desde) return res.status(400).json({ error: 'Fechas no válidas' });
+  const [r] = await pool.execute('INSERT INTO ausencias (persona_id, desde, hasta, motivo) VALUES (?, ?, ?, ?)', [pid, b.desde, b.hasta, String(b.motivo || '').slice(0, 120) || null]);
+  res.status(201).json({ ok: true, id: r.insertId });
+});
+app.delete('/api/admin/ausencias/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT persona_id FROM ausencias WHERE id = ?', [Number(req.params.id)]);
+  if (!f.length) return res.status(404).json({ error: 'No encontrada' });
+  if (!(await puedeTocarHorario(req, f[0].persona_id))) return res.status(403).json({ error: 'Solo un administrador o el jefe de su equipo' });
+  await pool.execute('DELETE FROM ausencias WHERE id = ?', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+app.put('/api/admin/ajustes-rendimiento', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const b = req.body || {};
+  const fest = (Array.isArray(b.festivos) ? b.festivos : String(b.festivos || '').split(/[\s,;]+/)).map(String).filter(x => /^\d{4}-\d{2}-\d{2}$/.test(x));
+  const obj = Number(b.objetivo_respuesta_h);
+  if (b.objetivo_respuesta_h != null && !(obj >= 1 && obj <= 720)) return res.status(400).json({ error: 'El objetivo de respuesta va de 1 a 720 horas' });
+  for (const [k, v] of [['festivos', fest.join(',')], ['objetivo_respuesta_h', b.objetivo_respuesta_h != null ? String(obj) : null]]) if (v != null) await pool.execute('INSERT INTO ajustes (clave, valor) VALUES (?, ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)', [k, v]);
+  res.json({ ok: true, festivos: fest, objetivo_h: obj || undefined });
+});
+
+// ================================================================
+// RESPUESTAS POR CORREO DENTRO DEL PANEL (30/10, Vikn)
+// Cada correo del panel lleva su propia dirección de respuesta (r-<id>-<código>@CORREO_RESPUESTAS_DOMINIO). Cuando el cliente
+// contesta, Brevo (recepción de correos, «Inbound Parsing») lo manda a /api/correo-entrante/<secreto>; el servidor lo une al hilo
+// de su ficha, y los adjuntos van solos a la documentación del cliente, cifrados con la llave de Acros como los que sube él
+// («Recibido por correo: …», en revisión). Sin CORREO_RESPUESTAS_DOMINIO, todo sigue como antes (respuestas al buzón del asesor).
+// ================================================================
+const CORREO_RESPUESTAS_DOMINIO = String(process.env.CORREO_RESPUESTAS_DOMINIO || '').trim().toLowerCase();
+const CORREO_ENTRANTE_SECRETO = String(process.env.CORREO_ENTRANTE_SECRETO || '').trim();
+const MAX_ADJ_CORREO = 15 * 1024 * 1024, MAX_ADJ_POR_CORREO = 10;
+const TIPOS_ADJ_OK = /^(application\/pdf|image\/(png|jpe?g|webp|heic|heif)|text\/(csv|plain)|application\/(zip|x-zip-compressed|vnd\.ms-excel|msword|vnd\.openxmlformats-officedocument\.(spreadsheetml\.sheet|wordprocessingml\.document)))$/i;
+const EXT_ADJ_OK = /\.(pdf|png|jpe?g|webp|heic|heif|csv|txt|zip|xlsx?|docx?)$/i;
+const EXT_PELIGROSA = /\.(exe|bat|cmd|com|scr|js|vbs|msi|ps1|jar|sh|apk|dll)$/i;
+function direccionRespuesta(id, token) { return CORREO_RESPUESTAS_DOMINIO ? 'r-' + id + '-' + token + '@' + CORREO_RESPUESTAS_DOMINIO : null; }
+function cifrarParaDocumentos(buffer) {   // igual que el navegador del cliente: AES-256-GCM (etiqueta al final) y la clave con RSA-OAEP/SHA-256
+  const claveAES = crypto.randomBytes(32), iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', claveAES, iv);
+  const cifrado = Buffer.concat([c.update(buffer), c.final(), c.getAuthTag()]);
+  const clave = crypto.publicEncrypt({ key: CLAVE_PUBLICA_COPIAS, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, claveAES);
+  return { cifrado, iv: iv.toString('base64'), clave: clave.toString('base64') };
+}
+async function bajarAdjuntoBrevo(a) {
+  if (a.Content || a.content) return Buffer.from(String(a.Content || a.content), 'base64');
+  const tok = a.DownloadToken || a.downloadToken; if (!tok) throw new Error('sin contenido');
+  const base = new URL(process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email').origin;
+  const r = await axios.get(base + '/v3/inbound/attachments/' + encodeURIComponent(tok), { headers: { 'api-key': BREVO_API_KEY }, responseType: 'arraybuffer', timeout: 30000, maxContentLength: MAX_ADJ_CORREO + 4096 });
+  return Buffer.from(r.data);
+}
+function textoEntrante(it) {
+  let t = it.ExtractedMarkdownMessage || it.RawTextBody || it.text || '';
+  if (!t && it.RawHtmlBody) t = String(it.RawHtmlBody).replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
+  return String(t || '').replace(/\r/g, '').trim().slice(0, 20000);
+}
+async function guardarCorreoEntrante(it) {
+  const destinos = [].concat(it.To || it.to || [], it.Cc || [], it.Recipients || []).map(x => String((x && typeof x === 'object' ? (x.Address || x.address || x.email) : x) || '').trim().toLowerCase());
+  let m = null; for (const d of destinos) { m = d.match(/^r-(\d+)-([a-f0-9]{8,32})@/); if (m) break; }
+  if (!m) { anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: 'Correo recibido que no responde a ninguno nuestro (descartado)', detalle: { para: destinos.slice(0, 3) } }); return false; }
+  const [orig] = await pool.execute('SELECT * FROM correos_panel WHERE id = ? AND respuesta_token = ?', [Number(m[1]), m[2]]);
+  if (!orig.length) { anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: 'Correo recibido con una dirección de respuesta no válida (descartado)', detalle: { para: destinos.slice(0, 3) } }); return false; }
+  const o = orig[0];
+  const mid = String(it.MessageId || it.messageId || '').slice(0, 250) || null;
+  if (mid) { const [d] = await pool.execute('SELECT id FROM correos_panel WHERE mensaje_id = ?', [mid]); if (d.length) return false; }   // reintento de Brevo: ya guardado
+  const de = String((it.From && typeof it.From === 'object' ? (it.From.Address || it.From.address) : it.From || it.from) || '').trim().toLowerCase().slice(0, 190);
+  const asunto = String(it.Subject || it.subject || ('Re: ' + o.asunto)).slice(0, 150);
+  const [ins] = await pool.execute("INSERT INTO correos_panel (cliente_id, asesor_id, persona_id, para, asunto, cuerpo, direccion, de, en_respuesta_a, mensaje_id, hilo_id, ok) VALUES (?, ?, ?, ?, ?, ?, 'entrante', ?, ?, ?, ?, 1)",
+    [o.cliente_id, o.asesor_id, o.persona_id, o.responder_a || '', asunto, textoEntrante(it) || '(sin texto)', de, o.id, mid, o.hilo_id || o.id]);
+  const adj = [].concat(it.Attachments || it.attachments || []), notas = [];
+  if (adj.length) {
+    const [ps] = await pool.execute("SELECT id FROM propuestas WHERE cliente_id = ? AND estado = 'aceptada' ORDER BY id DESC LIMIT 1", [o.cliente_id]);
+    for (const [i, a] of adj.entries()) {
+      const nombre = String(a.Name || a.name || 'adjunto').replace(/[\\/:*?"<>|]+/g, '_').trim().slice(0, 200) || 'adjunto', tipo = String(a.ContentType || a.contentType || 'application/octet-stream').toLowerCase().split(';')[0];
+      if (i >= MAX_ADJ_POR_CORREO) { notas.push({ nombre, guardado: false, motivo: 'más de ' + MAX_ADJ_POR_CORREO + ' adjuntos en un correo' }); continue; }
+      if (!ps.length) { notas.push({ nombre, guardado: false, motivo: 'el cliente no tiene ningún encargo aceptado' }); continue; }
+      if (EXT_PELIGROSA.test(nombre) || (!TIPOS_ADJ_OK.test(tipo) && !EXT_ADJ_OK.test(nombre))) { notas.push({ nombre, guardado: false, motivo: 'formato no admitido' }); continue; }
+      if (Number(a.ContentLength || a.contentLength || 0) > MAX_ADJ_CORREO) { notas.push({ nombre, guardado: false, motivo: 'supera los 15 MB' }); continue; }
+      let datos; try { datos = await bajarAdjuntoBrevo(a); } catch (e) { notas.push({ nombre, guardado: false, motivo: 'no se pudo descargar' }); continue; }
+      if (!datos.length || datos.length > MAX_ADJ_CORREO) { notas.push({ nombre, guardado: false, motivo: datos.length ? 'supera los 15 MB' : 'está vacío' }); continue; }
+      const c = cifrarParaDocumentos(datos), clave = `docs/${o.cliente_id}/${generarToken()}.enc`;
+      await subirAR2(clave, c.cifrado, 'application/octet-stream');
+      const [d] = await pool.execute("INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, estado, documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, subido_en, nombre_original) VALUES (?, ?, 'general', ?, 'enviado', ?, ?, ?, ?, ?, ?)",
+        [o.cliente_id, ps[0].id, ('Recibido por correo: ' + nombre).slice(0, 200), clave, c.iv, c.clave, TIPOS_ADJ_OK.test(tipo) ? tipo : 'application/octet-stream', aSQLDatetime(ahora()), nombre]);
+      notas.push({ nombre, guardado: true, documento_id: d.insertId });
+    }
+    await pool.execute('UPDATE correos_panel SET adjuntos = ? WHERE id = ?', [JSON.stringify(notas).slice(0, 8000), ins.insertId]);
+  }
+  avisarCliente(o.cliente_id, '✉️', 'un cliente ha respondido a un correo', 'Lo tienes en su ficha, en «Correos».' + (notas.some(n => n.guardado) ? ' Trae adjuntos: ya están en su documentación, por revisar.' : ''), { etiqueta: 'envelope' });
+  anotarRegistro({ actor_tipo: 'cliente', actor_nombre: 'Cliente', tipo: 'cliente', accion: 'El cliente responde a un correo', cliente_id: o.cliente_id, objeto_id: ins.insertId, detalle: { adjuntos: adj.length, guardados: notas.filter(n => n.guardado).length } });
+  return true;
+}
+app.post('/api/correo-entrante/:secreto', async (req, res) => {
+  if (!CORREO_ENTRANTE_SECRETO || req.params.secreto !== CORREO_ENTRANTE_SECRETO) return res.status(404).json({ error: 'No encontrado' });
+  const items = Array.isArray(req.body && req.body.items) ? req.body.items : [req.body || {}];
+  let guardados = 0;
+  for (const it of items.slice(0, 50)) { try { if (await guardarCorreoEntrante(it)) guardados++; } catch (e) { console.error('Correo entrante:', e.message); } }
+  res.json({ ok: true, guardados });   // siempre 200: si no, Brevo reintenta sin fin
+});
+app.post('/api/admin/clientes/:id(\\d+)/correos/leidos', requiereSesionAsesor, async (req, res) => {
+  await pool.execute("UPDATE correos_panel SET leido_en = NOW() WHERE cliente_id = ? AND direccion = 'entrante' AND leido_en IS NULL", [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// ================================================================
+// CORREOS DESDE EL PANEL (30/10, Vikn)
+// Un asesor escribe a su cliente desde la ficha. Sale de la dirección única de Acros (BREVO_REMITENTE: hola@acrosfi.es) con su
+// nombre («Jorge, tu asesor de Acros»); las respuestas le llegan a su «Correo para clientes» (o, si no lo tiene, al de entrada) y
+// una copia oculta va a la bandeja común (Sistema; por defecto hola@acrosfi.es). Sin adjuntos: los archivos van por el Área.
+// Queda guardado en la ficha del cliente.
+// ================================================================
+// (correoValido ya existe en el servidor)
+async function bandejaComun() {
+  try { const [f] = await pool.query("SELECT valor FROM ajustes WHERE clave = 'bandeja_comun'"); if (f.length && correoValido(f[0].valor)) return f[0].valor; } catch (e) {}
+  return 'hola@acrosfi.es';
+}
+async function remitenteDeAsesor(asesorId) {
+  const [f] = await pool.execute('SELECT a.nombre AS a_nombre, a.correo AS a_correo, p.id AS persona_id, p.nombre, p.genero, p.correo_clientes FROM asesores a LEFT JOIN personas p ON p.asesor_id = a.id WHERE a.id = ?', [asesorId]);
+  const x = f[0] || {}, nombre = x.nombre || x.a_nombre || 'Acros', genero = x.genero || generoPorNombre(nombre);
+  return { persona_id: x.persona_id || null, nombre, presentacion: nombre + ', tu ' + (genero === 'f' ? 'asesora' : 'asesor') + ' de Acros', responder_a: correoValido(x.correo_clientes) ? x.correo_clientes : x.a_correo };
+}
+app.get('/api/admin/correo-ajustes', requiereSesionAsesor, requiereAdminWeb, async (req, res) => { res.json({ bandeja_comun: await bandejaComun(), remitente: BREVO_REMITENTE || null }); });
+app.put('/api/admin/correo-ajustes', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const c = String((req.body || {}).bandeja_comun || '').trim().toLowerCase();
+  if (!correoValido(c)) return res.status(400).json({ error: 'Escribe una dirección de correo válida' });
+  await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('bandeja_comun', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [c]);
+  res.json({ ok: true, bandeja_comun: c });
+});
+app.get('/api/admin/clientes/:id(\\d+)/correos', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT c.id, c.asunto, c.cuerpo, c.enviado_en, c.ok, c.error, c.responder_a, c.presentacion, c.direccion, c.de, c.en_respuesta_a, c.leido_en, c.adjuntos FROM correos_panel c WHERE c.cliente_id = ? ORDER BY c.id DESC LIMIT 80', [Number(req.params.id)]);
+  const r = await remitenteDeAsesor(req.asesor.id);
+  res.json({ correos: f.map(x => Object.assign(x, { direccion: x.direccion || 'saliente', adjuntos: (() => { try { return x.adjuntos ? JSON.parse(x.adjuntos) : []; } catch (e) { return []; } })() })),
+    sin_leer: f.filter(x => x.direccion === 'entrante' && !x.leido_en).length,
+    remitente: { presentacion: r.presentacion, responder_a: CORREO_RESPUESTAS_DOMINIO ? 'el panel (en esta ficha)' : r.responder_a, al_panel: !!CORREO_RESPUESTAS_DOMINIO, desde: BREVO_REMITENTE || null, copia: await bandejaComun() } });
+});
+app.post('/api/admin/clientes/:id(\\d+)/correo', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), b = req.body || {};
+  const asunto = String(b.asunto || '').trim().slice(0, 150), cuerpo = String(b.cuerpo || '').replace(/\r/g, '').trim().slice(0, 5000);
+  if (!asunto) return res.status(400).json({ error: 'Escribe el asunto' });
+  if (!cuerpo) return res.status(400).json({ error: 'Escribe el mensaje' });
+  if (!brevoActivo()) return res.status(503).json({ error: 'El correo no está configurado (Brevo)' });
+  const [cl] = await pool.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [id]);
+  if (!cl.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+  if (!correoValido(cl[0].correo)) return res.status(400).json({ error: 'Este cliente no tiene un correo válido' });
+  const r = await remitenteDeAsesor(req.asesor.id), copia = await bandejaComun();
+  // ¿responde a un correo del cliente? Se queda en el mismo hilo (también en el programa de correo del cliente)
+  let previo = null;
+  if (b.en_respuesta_a) { const [pv] = await pool.execute("SELECT * FROM correos_panel WHERE id = ? AND cliente_id = ? AND direccion = 'entrante'", [Number(b.en_respuesta_a), id]); previo = pv[0] || null; }
+  const token = crypto.randomBytes(6).toString('hex');
+  const [ins] = await pool.execute("INSERT INTO correos_panel (cliente_id, asesor_id, persona_id, para, asunto, cuerpo, presentacion, responder_a, copia, ok, direccion, respuesta_token, en_respuesta_a, hilo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'saliente', ?, ?, ?)",
+    [id, req.asesor.id, r.persona_id, cl[0].correo, asunto, cuerpo, r.presentacion, r.responder_a, copia, token, previo ? previo.id : null, previo ? (previo.hilo_id || previo.id) : null]);
+  const responderA = direccionRespuesta(ins.insertId, token) || r.responder_a;
+  if (!previo) await pool.execute('UPDATE correos_panel SET hilo_id = id WHERE id = ?', [ins.insertId]);
+  const c = plantillaCorreo({
+    titulo: asunto,
+    parrafos: cuerpo.split(/\n{2,}/).map(p => ESC_HTML(p).replace(/\n/g, '<br>')),
+    boton: SITE_URL ? { texto: 'Ir a mi área', url: SITE_URL + '/area?login=1' } : null,
+    nota: 'Puedes responder a este correo: le llega directamente a ' + ESC_HTML(r.nombre) + (CORREO_RESPUESTAS_DOMINIO ? '. Si nos mandas documentos como adjuntos, se guardan solos en tu área.' : '.'),
+  });
+  let ok = 1, error = null;
+  const cab = previo && previo.mensaje_id ? { 'In-Reply-To': previo.mensaje_id, References: previo.mensaje_id } : null;
+  try { await enviarCorreo(cl[0].correo, asunto, c.html, c.texto, { nombre: r.presentacion, responderA: responderA, copiaOculta: copia, cabeceras: cab }); }
+  catch (e) { ok = 0; error = String((e.response && e.response.data && e.response.data.message) || e.message).slice(0, 300); }
+  await pool.execute('UPDATE correos_panel SET ok = ?, error = ?, responder_a = ? WHERE id = ?', [ok, error, responderA, ins.insertId]);
+  if (previo) await pool.execute("UPDATE correos_panel SET leido_en = COALESCE(leido_en, NOW()) WHERE id = ?", [previo.id]);
+  if (!ok) return res.status(502).json({ error: 'No se ha podido enviar: ' + error, id: ins.insertId });
+  res.status(201).json({ ok: true, id: ins.insertId });
+});
+
 // Middleware de error genérico (10/09): un payload que supera el límite de
 // express.json() (15mb) llegaba antes como una página HTML cruda de
 // Express, no como el JSON que espera el resto de la web. No es un fallo
 // nuevo de la subida de documentos — afectaba a cualquier ruta — pero se
 // nota más ahí porque es la única que mueve archivos grandes de verdad.
+// 29/10: una dirección que no existe: página de Acros para el navegador, JSON para los programas
+// ---- Consultar el registro (solo administradores) ----
+function filtrosRegistro(q) {
+  const w = [], p = [];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(q.desde || '')) { w.push('r.creado_en >= ?'); p.push(q.desde + ' 00:00:00'); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(q.hasta || '')) { w.push('r.creado_en < ? + INTERVAL 1 DAY'); p.push(q.hasta + ' 00:00:00'); }
+  if (['acceso', 'lectura', 'cambio', 'cliente', 'sistema'].includes(q.tipo)) { w.push('r.tipo = ?'); p.push(q.tipo); }
+  if (q.persona) { w.push('r.actor_nombre LIKE ?'); p.push('%' + String(q.persona).slice(0, 60) + '%'); }
+  if (/^\d+$/.test(q.cliente || '')) { w.push('r.cliente_id = ?'); p.push(Number(q.cliente)); }
+  else if (q.cliente) { w.push('(c.correo LIKE ? OR c.nombre LIKE ? OR c.apellidos LIKE ? OR c.codigo = ?)'); const t = '%' + String(q.cliente).slice(0, 60) + '%'; p.push(t, t, t, String(q.cliente)); }
+  if (q.q) { w.push('(r.accion LIKE ? OR r.ruta LIKE ? OR r.detalle LIKE ?)'); const t = '%' + String(q.q).slice(0, 80) + '%'; p.push(t, t, t); }
+  if (/^\d+$/.test(q.antes_de || '')) { w.push('r.id < ?'); p.push(Number(q.antes_de)); }
+  return { where: w.length ? ' WHERE ' + w.join(' AND ') : '', params: p };
+}
+const SQL_REG = "SELECT r.id, r.creado_en, r.actor_tipo, r.actor_id, r.actor_nombre, r.tipo, r.accion, r.metodo, r.ruta, r.estado_http, r.objeto_id, r.cliente_id, r.detalle, r.ip, TRIM(CONCAT(COALESCE(c.nombre, ''), ' ', COALESCE(c.apellidos, ''))) AS cliente_nombre, c.correo AS cliente_correo, c.codigo AS cliente_codigo FROM registro r LEFT JOIN clientes c ON c.id = r.cliente_id";
+app.get('/api/admin/registro', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const { where, params } = filtrosRegistro(req.query || {}), lim = Math.min(500, Number(req.query.limite) || 200);
+  const [f] = await pool.query(SQL_REG + where + ' ORDER BY r.id DESC LIMIT ' + lim, params);
+  res.json({ filas: f.map(x => Object.assign(x, { detalle: detalleSeguro(x.detalle) })), hay_mas: f.length === lim });
+});
+app.get('/api/admin/registro.csv', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
+  const { where, params } = filtrosRegistro(req.query || {});
+  const [f] = await pool.query(SQL_REG + where + ' ORDER BY r.id DESC LIMIT 20000', params);
+  const c = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const filas = [['Fecha', 'Quién', 'Tipo', 'Qué', 'Cliente', 'Resultado', 'Detalle', 'IP']].concat(f.map(x => [new Date(x.creado_en).toLocaleString('es-ES', { timeZone: 'Europe/Madrid' }), x.actor_nombre, x.tipo, x.accion, x.cliente_nombre || x.cliente_correo || (x.cliente_id ? 'Cliente ' + x.cliente_id : ''), x.estado_http, x.detalle, x.ip]));
+  res.set('Content-Type', 'text/csv; charset=utf-8'); res.set('Content-Disposition', 'attachment; filename="registro-acros.csv"');
+  res.send('\ufeff' + filas.map(l => l.map(c).join(';')).join('\r\n'));
+});
+// ---- Herramienta del asistente (solo si pregunta un administrador). Los clientes salen por código y sin sus datos personales ----
+const DATOS_PERSONALES_CLI = /^(nombre|apellidos|correo|telefono|telefono2|numero_documento|tipo_documento|direccion|codigo_postal|fecha_nacimiento|iban)$/i;
+async function iaRegistro(e, req, usados) {
+  if (!req.asesor || !req.asesor.esAdmin) return { error: 'El registro maestro solo lo pueden consultar los administradores.' };
+  const { where, params } = filtrosRegistro({ desde: e.desde, hasta: e.hasta, tipo: e.tipo, persona: e.persona, q: e.texto });
+  const [f] = await pool.query(SQL_REG + where + ' ORDER BY r.id DESC LIMIT 80', params);
+  const cli = await iaClientes(null);
+  const limpia = d => { if (!d || !d.cambios) return d; const c = d.cambios; if (c.tabla === 'clientes') ['antes', 'despues'].forEach(k => { Object.keys(c[k] || {}).forEach(x => { if (DATOS_PERSONALES_CLI.test(x)) c[k][x] = '(dato personal)'; }); }); return d; };
+  return { anotaciones: f.map(x => { const k = x.cliente_id && cli.get(x.cliente_id); if (k) usados.set(k.cod, x.cliente_id); const d = limpia(detalleSeguro(x.detalle)); if (d && d.datos) delete d.datos.correo;
+    return { fecha: new Date(x.creado_en).toLocaleString('es-ES', { timeZone: 'Europe/Madrid' }), quien: x.actor_tipo === 'cliente' ? (k ? 'cliente ' + k.cod : 'cliente') : x.actor_nombre, tipo: x.tipo, que: x.accion, cliente: k ? k.cod : null, resultado: x.estado_http, detalle: d }; }), nota: f.length === 80 ? 'Hay más: acota por fechas, persona o tipo.' : undefined };
+}
+
+app.use((req, res, next) => {
+  if (pideHTML(req) && !String(req.path).startsWith('/api/')) return res.status(404).type('html').send(paginaError(req, '404'));
+  res.status(404).json({ error: 'No encontrado' });
+});
 app.use((err, req, res, next) => {
   if (err.type === 'entity.too.large') {
     return res.status(413).json({ error: 'El archivo es demasiado grande (máximo 15 MB por subida).' });
@@ -7655,6 +8610,7 @@ app.use((err, req, res, next) => {
   // 08/10: cualquier otro error de una ruta (ver el envoltorio junto a «const app»)
   console.error('Error en ' + req.method + ' ' + req.path + ':', err.message || err);
   if (res.headersSent) return next(err);
+  if (pideHTML(req) && !String(req.path).startsWith('/api/')) return res.status(500).type('html').send(paginaError(req, '500'));
   res.status(500).json({ error: 'Error interno del servidor. Inténtalo de nuevo en un momento.' });
 });
 
