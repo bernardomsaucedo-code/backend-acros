@@ -120,7 +120,7 @@ const ACCIONES = [
   [/^POST \/api\/propuestas\/:token\/pago$/, () => 'El cliente declara el pago'], [/^POST \/api\/propuestas\/:token\/diligencia$/, () => 'El cliente envía el alta'],
   [/^POST \/api\/propuestas\/:token\/documentos\/:id\/subir$/, () => 'El cliente sube un documento'], [/^POST \/api\/propuestas\/:token\/entregas\/:id\/conformidad$/, () => 'El cliente da el visto bueno'],
   [/^POST \/api\/propuestas\/:token\/entregas\/:id\/cambios$/, () => 'El cliente pide un cambio en el informe'], [/^POST \/api\/propuestas\/:token\/cambio-asesor$/, () => 'El cliente pide cambiar de asesor'],
-  [/^POST \/api\/propuestas\/:token\/mensajes$/, () => 'El cliente escribe en el chat'], [/^GET \/api\/propuestas\/:token\/entregas\/:id\/descargar$/, () => 'El cliente descarga un informe'],
+  [/^POST \/api\/propuestas\/:token\/mensajes$/, () => 'El cliente escribe en el chat'], [/^POST \/api\/propuestas\/:token\/mis-datos$/, (s) => s < 400 ? 'El cliente cambia sus datos' : 'El cliente intenta cambiar sus datos (no se guardó)'], [/^GET \/api\/propuestas\/:token\/entregas\/:id\/descargar$/, () => 'El cliente descarga un informe'],
   [/^GET \/api\/propuestas\/:token\/mensajes\/:id\/archivo$/, () => 'El cliente descarga un archivo del chat'], [/^POST \/api\/(presupuesto|llamada)/, () => 'Solicitud desde la web'],
 ];
 const detalleSeguro = t => { if (!t) return null; try { return JSON.parse(t); } catch (e) { return { ilegible: true }; } };
@@ -192,6 +192,7 @@ app.use(async (req, res, next) => {
         else { actor = 'visitante'; actorNombre = 'Visitante de la web'; }
       }
       const detalle = { estado: est, ms: Date.now() - t0 };
+      if (req.registroDetalle) Object.assign(detalle, req.registroDetalle);   // la ruta puede añadir su antes y después
       const cuerpo = resumenCuerpo(req.body); if (Object.keys(cuerpo).length && metodo !== 'GET') detalle.datos = cuerpo;
       if (tabla && est < 400) { const despues = metodo === 'DELETE' ? null : await filaReg(tabla, idObj); const d = diferenciasReg(antes, despues); if (d) detalle.cambios = Object.assign({ tabla }, d); if (!clienteId && (antes || despues)) clienteId = (antes || despues).cliente_id || (tabla === 'clientes' ? idObj : null); }
       if (ajAntes && est < 400) { const [f] = await pool.query('SELECT clave, valor FROM ajustes'); const aD = Object.fromEntries(f.map(x => [x.clave, x.valor])); const ca = {}; new Set([...Object.keys(ajAntes), ...Object.keys(aD)]).forEach(k => { if (ajAntes[k] !== aD[k]) ca[k] = /^ntfy_/.test(k) ? { antes: ajAntes[k] ? '(canal)' : null, despues: aD[k] ? '(canal nuevo)' : null } : { antes: ajAntes[k] == null ? null : ajAntes[k], despues: aD[k] == null ? null : aD[k] }; }); if (Object.keys(ca).length) detalle.ajustes = ca; }
@@ -199,6 +200,35 @@ app.use(async (req, res, next) => {
       anotarRegistro({ actor_tipo: actor, actor_id: actorId, actor_nombre: actorNombre, tipo: tipoDe(actor, metodo, ruta), accion: accionDe(metodo, ruta, est), metodo, ruta, estado_http: est, objeto_id: idObj || (ids.length ? ids[0] : null), cliente_id: clienteId, detalle, ip: String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim().slice(0, 64) });
     } catch (e) { console.error('Registro:', e.message); }
   });
+  next();
+});
+// ---- 31/10 (auditoría): frenos contra abusos y cabeceras de seguridad ----
+// Sin freno, cualquiera podía pedir cien enlaces de acceso (o de contraseña) para un mismo correo, o llenar los formularios de la
+// web: muchos correos de seguridad iguales hunden la reputación del dominio (spam). En pruebas solo actúan con x-probar-frenos: 1.
+const FRENOS = new Map();
+function frenoSuperado(clave, max, ventanaMs) {
+  const t = Date.now(); let x = FRENOS.get(clave);
+  if (!x || x.hasta < t) { x = { n: 0, hasta: t + ventanaMs }; FRENOS.set(clave, x); }
+  x.n++;
+  if (FRENOS.size > 20000) for (const [k, v] of FRENOS) if (v.hasta < t) FRENOS.delete(k);
+  return x.n > max;
+}
+const ipFreno = req => String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+const correoFreno = req => String((req.body || {}).correo || '').trim().toLowerCase().slice(0, 190);
+const REGLAS_FRENO = [
+  [/^\/api\/acceso\/solicitar$/, req => [['acceso-correo:' + correoFreno(req), 3, 15 * 60e3], ['acceso-ip:' + ipFreno(req), 10, 60 * 60e3]], 'Ya te hemos enviado un enlace hace poco. Espera unos minutos y mira también en la carpeta de spam.'],
+  [/^\/api\/admin\/contrasena\/olvidada$/, req => [['olvido-correo:' + correoFreno(req), 3, 15 * 60e3], ['olvido-ip:' + ipFreno(req), 10, 60 * 60e3]], 'Ya te hemos enviado un enlace hace poco. Espera unos minutos y mira también en la carpeta de spam.'],
+  [/^\/api\/(presupuesto|llamada|empresas|sugerencias)$/, req => [['web-ip:' + ipFreno(req), 6, 10 * 60e3], ['web-dia:' + ipFreno(req), 30, 24 * 3600e3]], 'Has enviado varias solicitudes seguidas. Espera unos minutos y vuelve a intentarlo.'],
+];
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff'); res.set('Referrer-Policy', 'no-referrer'); res.set('X-Frame-Options', 'DENY');
+  if (process.env.ACROS_PRUEBAS !== '1') res.set('Strict-Transport-Security', 'max-age=31536000');
+  if (req.method !== 'POST') return next();
+  if (process.env.ACROS_PRUEBAS === '1' && req.get('x-probar-frenos') !== '1') return next();
+  const r = REGLAS_FRENO.find(([re]) => re.test(req.path)); if (!r) return next();
+  for (const [k, max, v] of r[1](req)) {
+    if (frenoSuperado(k, max, v)) { anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: 'Freno contra abusos: demasiadas peticiones seguidas', ruta: req.path, detalle: { regla: k.split(':')[0] } }); return res.status(429).json({ error: r[2] }); }
+  }
   next();
 });
 
@@ -377,13 +407,13 @@ function plantillaCorreo({ titulo, parrafos = [], boton, nota, hilo }) {
     </td></tr>
     <tr><td style="padding:16px 30px 0;"><div style="font-family:${fuente}; font-size:11.5px; line-height:1.55; color:#8A8378; text-align:justify;">¿El botón no funciona? Copia este enlace en tu navegador: <a href="${ESC_HTML(boton.url)}" style="color:#8A8378; word-break:break-all;">${ESC_HTML(boton.url)}</a></div></td></tr>` : ''}
     ${nota ? `<tr><td style="padding:18px 30px 0; font-family:${fuente}; font-size:13px; line-height:1.5; color:#6B655C;">${nota}</td></tr>` : ''}
-    <tr><td style="padding:24px 30px 24px;"><div style="border-top:1px solid #E6DCCD; padding-top:14px; text-align:center; font-family:${fuente}; font-size:12px; line-height:1.6; color:#8A8378;">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href="${web}" style="color:#8A8378;">acrosfi.es</a> / 668 170 020</div></td></tr>
+    <tr><td style="padding:24px 30px 24px;"><div style="border-top:1px solid #E6DCCD; padding-top:14px; text-align:center; font-family:${fuente}; font-size:12px; line-height:1.6; color:#8A8378;">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href="${web}" style="color:#8A8378;">acrosfi.es</a> / 668170020</div></td></tr>
   </table>
   <!--[if mso]></td></tr></table><![endif]-->
 </td></tr></table>
 </body></html>`;
   const sinEtiquetas = t => String(t).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
-  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), ...(hilo || []).flatMap(h => ['', '> ' + h.quien + (h.fecha ? ' · ' + h.fecha : '') + ':', ...String(h.texto).split('\n').map(l => '> ' + l)]), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros, tu asesoría fiscal de criptoactivos. Contacta en: acrosfi.es / 668 170 020'].join('\n');
+  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), ...(hilo || []).flatMap(h => ['', '> ' + h.quien + (h.fecha ? ' · ' + h.fecha : '') + ':', ...String(h.texto).split('\n').map(l => '> ' + l)]), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros, tu asesoría fiscal de criptoactivos. Contacta en: acrosfi.es / 668170020'].join('\n');
   return { html, texto };
 }
 
@@ -1100,6 +1130,7 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('personas', '`correo_clientes`', 'VARCHAR(190) NULL');   // 30/10: correos desde el panel
       await pool.execute('CREATE TABLE IF NOT EXISTS correos_panel (id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, asesor_id INT NULL, persona_id INT NULL, para VARCHAR(190) NOT NULL, asunto VARCHAR(150) NOT NULL, cuerpo TEXT NOT NULL, presentacion VARCHAR(120) NULL, responder_a VARCHAR(190) NULL, copia VARCHAR(190) NULL, ok TINYINT(1) NOT NULL DEFAULT 1, error VARCHAR(300) NULL, enviado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_cliente (cliente_id))');
       for (const [c, t] of [['direccion', "VARCHAR(10) NOT NULL DEFAULT 'saliente'"], ['de', 'VARCHAR(190) NULL'], ['en_respuesta_a', 'INT NULL'], ['mensaje_id', 'VARCHAR(255) NULL'], ['hilo_id', 'INT NULL'], ['respuesta_token', 'VARCHAR(32) NULL'], ['leido_en', 'DATETIME NULL'], ['adjuntos', 'TEXT NULL']]) await agregaColumnaSiFalta('correos_panel', '`' + c + '`', t);   // 30/10: respuestas por correo dentro del panel
+      await creaIndiceSiFalta('idx_correos_mensaje ON correos_panel (mensaje_id(120))').catch(() => {});   // 31/10 (auditoría): reintentos de Brevo sin recorrer la tabla
       // 30/10: las notas y marcas de cobertura de fichas ya fusionadas se quedaron en la ficha duplicada (inerte): se pasan a la que quedó
       try { const [inertes] = await pool.query("SELECT id, correo FROM clientes WHERE estado = 'inerte' AND correo LIKE 'fusionado-%'"); for (const d of inertes) { const orig = String(d.correo).replace(/^fusionado-\d+-/, ''); const [pr] = await pool.query("SELECT id FROM clientes WHERE correo = ? AND (estado IS NULL OR estado <> 'inerte') ORDER BY id LIMIT 1", [orig]); if (!pr.length) continue; for (const t of ['notas_cliente', 'cobertura_marcas', 'recordatorios_cliente', 'ausencias_cliente']) await pool.execute('UPDATE `' + t + '` SET cliente_id = ? WHERE cliente_id = ?', [pr[0].id, d.id]).catch(() => {}); } } catch (e) { console.error('Recolocar notas de fichas fusionadas:', e.message); }
       await agregaColumnaSiFalta('personas', '`horario`', 'TEXT NULL'); await agregaColumnaSiFalta('mensajes', '`ia_borrador`', 'TINYINT(1) NULL'); await agregaColumnaSiFalta('mensajes', '`ia_cambio_pct`', 'TINYINT NULL');   // 29/10: métricas del equipo
@@ -3264,7 +3295,7 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
           `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
         ],
         boton: { texto: 'Ver mi propuesta', url: enlace },
-        nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 170 020.`,
+        nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668170020.`,
       } : {
         titulo: 'Tu propuesta está lista',
         parrafos: ['Hola:', `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
@@ -5364,7 +5395,8 @@ async function iaEjecutarHerramienta(nombre, entrada, req, usados) {
     return { periodo_dias: dias, total: lista.length, mostrados: sel.length, mensajes: sel.map(x => ({ codigo: x.h.codigo, asesor: x.h.asesor, servicio: x.h.servicio, fecha: x.m.creado_en, texto: recorte(seudonimizarTexto(x.m.texto, x.h.cli), 400) })) };
   }
   if (nombre === 'equipo') {
-    const [ps] = await pool.query('SELECT q.id, q.nombre, e.nombre AS equipo FROM personas q LEFT JOIN equipos e ON e.id = q.equipo_id WHERE q.activa = 1 AND q.atiende_clientes = 1 ORDER BY q.nombre');
+    let [ps] = await pool.query('SELECT q.id, q.nombre, e.nombre AS equipo FROM personas q LEFT JOIN equipos e ON e.id = q.equipo_id WHERE q.activa = 1 AND q.atiende_clientes = 1 ORDER BY q.nombre');
+    if (!(req.asesor.roles || new Set()).has('admin')) { const { todas } = await personasACargo(req.asesor.id, req.asesor.roles || new Set(['asesor'])); ps = ps.filter(q => todas.has(q.id)); }   // 31/10: solo sus personas a cargo
     const [cs] = await pool.query('SELECT id, asesor_persona_id FROM clientes');
     const hilos = await iaHilos(permitidos, null);
     const res = ps.map(q => {
@@ -5397,7 +5429,7 @@ app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
   const usados = new Map();   // código → id de cliente de lo que ha consultado (para poner nombres en el panel)
   const conPanel = !!(req.asesor && req.asesor.roles && ['asesor', 'jefe', 'encargado', 'admin'].some(x => req.asesor.roles.has(x)));
   const llamar = async conWeb => {
-    const sistema = iaSistemaCon(base + (conWeb ? IA_ASISTENTE_CON_WEB : IA_ASISTENTE_SIN_WEB) + (conPanel ? '\n' + IA_ASISTENTE_CON_PANEL : ''), a.conocimiento);
+    const sistema = iaSistemaCon(base + (conWeb ? IA_ASISTENTE_CON_WEB : IA_ASISTENTE_SIN_WEB) + (conPanel ? '\n' + IA_ASISTENTE_CON_PANEL + '\n' + await iaTextoAlcance(req) : ''), a.conocimiento);   // 31/10: su alcance según el rango
     let conv = mensajes, textos = [], fuentes = [], busquedas = 0, consultas = [];
     const herramientas = (conWeb ? [IA_HERRAMIENTA_WEB] : []).concat(conPanel ? IA_HERRAMIENTAS_PANEL.filter(h => h.name !== 'registro' || (req && req.asesor && req.asesor.esAdmin)) : []);   // 30/10: el registro, solo para administradores
     // Vueltas: «pause_turn» (búsquedas largas) o «tool_use» (consultas al panel). Máx. 8.
@@ -5670,7 +5702,7 @@ app.post('/api/admin/cambios-asesor/:id/resolver', requiereSesionAsesor, requier
         titulo: 'Sobre tu cambio de asesor',
         parrafos: [cambio.cliente_nombre ? `Hola, ${ESC_HTML(cambio.cliente_nombre)}:` : 'Hola:', `Por ahora no hemos podido hacer el cambio que pediste${actual ? ` y seguirá atendiéndote <strong>${ESC_HTML(actual.nombre)}</strong>` : ''}.`],
         hilo: hiloCambioAsesor(cambio, destino, respuesta),
-        nota: 'Si quieres comentarlo, escríbenos desde tu área o llámanos al 668 170 020.',
+        nota: 'Si quieres comentarlo, escríbenos desde tu área o llámanos al 668170020.',
         boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
       });
       enviarCorreo(cambio.correo, accion === 'aceptar' ? `${destino.nombre} es tu nuevo asesor de Acros` : 'Sobre tu cambio de asesor en Acros', c.html, c.texto).catch(err => console.error('Correo de cambio de asesor no enviado:', err.message));
@@ -6315,10 +6347,8 @@ async function avisarFalloCopia(mensaje) {
     const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
     for (const a of admins) {
       try {
-        await enviarCorreo(a.correo, '⚠️ La copia de seguridad de Acros ha fallado',
-          '<p>La copia nocturna de la base de datos de Acros no se ha podido hacer.</p>' +
-          '<p>Motivo técnico: <code>' + String(mensaje).replace(/[<>&]/g, '') .slice(0, 300) + '</code></p>' +
-          '<p>El sistema lo reintenta cada hora. Si mañana sigue fallando, revisa el registro de Railway o las variables de Cloudflare R2.</p><p>— Acros</p>');
+        const cf = plantillaCorreo({ titulo: 'La copia de seguridad ha fallado', parrafos: ['La copia nocturna de la base de datos de Acros no se ha podido hacer.', 'Motivo técnico: <code>' + String(mensaje).replace(/[<>&]/g, '').slice(0, 300) + '</code>', 'El sistema lo reintenta cada hora. Si mañana sigue fallando, revisa el registro de Railway o las variables de Cloudflare R2.'], boton: { texto: 'Abrir las copias en el panel', url: PANEL_URL + '/?vista=copias' } });
+        await enviarCorreo(a.correo, 'La copia de seguridad de Acros ha fallado', cf.html, cf.texto);   // 31/10: con la plantilla y sin emoji
       } catch (e) { console.error('Correo de fallo de copia no enviado:', e.message); }
     }
   } finally { conn.release(); }
@@ -7512,7 +7542,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-10-30.1';
+const VERSION_ACROS = '2026-10-31.1';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -7723,12 +7753,28 @@ const iaEjecutarHerramientaBase = iaEjecutarHerramienta;
 iaEjecutarHerramienta = async function (nombre, entrada, req, usados) {
   if (iaHerramientasExtra[nombre]) return iaHerramientasExtra[nombre](entrada || {}, await iaAlcance(req), usados);
   if (nombre === 'registro') return iaRegistro(entrada || {}, req, usados);   // 30/10: solo administradores
+  if (iaMasFuncion(nombre)) return iaMasFuncion(nombre)(entrada || {}, req, usados);   // 31/10: cifras, cliente, solicitudes, bandeja
   return iaEjecutarHerramientaBase(nombre, entrada, req, usados);
 };
+IA_HERRAMIENTAS_PANEL.push(...iaMasDefiniciones());   // 31/10
 IA_HERRAMIENTAS_PANEL.push({ name: 'registro', description: 'Registro maestro de actividad (solo para administradores): quién hizo qué y cuándo en el panel y en el Área (entradas, PIN, cambios de roles y permisos con el antes y el después, fichas y documentos abiertos, acciones de los clientes, correos y avisos enviados). Úsalo para preguntas como «¿alguien ha cambiado roles?» o «¿quién abrió la ficha de C12?». Responde con fecha, quién y qué.',
   input_schema: { type: 'object', properties: { desde: { type: 'string', description: 'AAAA-MM-DD' }, hasta: { type: 'string', description: 'AAAA-MM-DD' }, tipo: { type: 'string', enum: ['acceso', 'lectura', 'cambio', 'cliente', 'sistema'] }, persona: { type: 'string', description: 'Nombre (o parte) de quien lo hizo' }, texto: { type: 'string', description: 'Palabra a buscar en la acción o el detalle, p. ej. «roles», «PIN», «fusiona»' } } } });
 
 // Solo en las baterías de pruebas (ACROS_PRUEBAS=1; en Railway no existe): ejecutar una herramienta como lo haría el asistente
+// 31/10 (Vikn): lo que puede consultar quien pregunta, en palabras, para que el asistente lo respete y lo diga
+async function iaTextoAlcance(req) {
+  const R = req.asesor.roles || new Set(['asesor']), nombre = req.asesor.nombre || 'quien pregunta';
+  const rol = [R.has('admin') && 'administrador', R.has('encargado') && 'encargado', R.has('jefe') && 'jefe de equipo', R.has('asesor') && 'asesor'].filter(Boolean).join(', ') || 'sin rol de clientes';
+  if (R.has('admin')) return 'ALCANCE: quien pregunta es ' + nombre + ' (' + rol + '). Puede consultarlo todo: todos los clientes, todas las personas y equipos, y el registro maestro.';
+  if (!['asesor', 'jefe', 'encargado'].some(x => R.has(x))) return 'ALCANCE: quien pregunta es ' + nombre + ' (' + rol + '). No tiene acceso a datos de clientes ni del equipo: si pregunta por ellos, dile con amabilidad que con su rango no puede consultarlos.';
+  const { todas, equipos } = await personasACargo(req.asesor.id, R);
+  const [ps] = todas.size ? await pool.query('SELECT nombre FROM personas WHERE id IN (?) ORDER BY nombre', [[...todas]]) : [[]];
+  const [es] = (equipos || []).length ? await pool.query('SELECT nombre FROM equipos WHERE id IN (?) ORDER BY nombre', [equipos]) : [[]];
+  return 'ALCANCE: quien pregunta es ' + nombre + ' (' + rol + '). ' + (es.length ? 'Puede consultar sus equipos (' + es.map(x => x.nombre).join(', ') + '): ' : 'Solo puede consultar ') +
+    'los clientes y las personas ' + (ps.length ? '(' + ps.map(x => x.nombre).join(', ') + ')' : '(solo los suyos)') + ', más los clientes en los que colabora. Las herramientas ya le devuelven solo eso. ' +
+    'Si pregunta por clientes, personas o equipos fuera de su alcance, o por el registro maestro, dile claramente que con su rango no tiene acceso a esa información; no lo deduzcas ni lo inventes.';
+}
+if (process.env.ACROS_PRUEBAS === '1') app.post('/api/admin/ia/alcance-prueba', requiereSesionAsesor, async (req, res) => { res.json({ texto: await iaTextoAlcance(req) }); });
 if (process.env.ACROS_PRUEBAS === '1') app.post('/api/admin/ia/herramienta-prueba', requiereSesionAsesor, async (req, res) => {
   const usados = new Map();
   res.json({ resultado: await iaEjecutarHerramienta(String((req.body || {}).nombre), (req.body || {}).entrada || {}, req, usados), codigos: [...usados.keys()] });
@@ -8406,6 +8452,163 @@ app.put('/api/admin/ajustes-rendimiento', requiereSesionAsesor, requiereAdminWeb
   if (b.objetivo_respuesta_h != null && !(obj >= 1 && obj <= 720)) return res.status(400).json({ error: 'El objetivo de respuesta va de 1 a 720 horas' });
   for (const [k, v] of [['festivos', fest.join(',')], ['objetivo_respuesta_h', b.objetivo_respuesta_h != null ? String(obj) : null]]) if (v != null) await pool.execute('INSERT INTO ajustes (clave, valor) VALUES (?, ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)', [k, v]);
   res.json({ ok: true, festivos: fest, objetivo_h: obj || undefined });
+});
+
+// ================================================================
+// EL ASISTENTE VE TODO LO QUE HAY EN EL PANEL (31/10, Vikn)
+// Siempre dentro del rango de quien pregunta (clientesPermitidos); los INGRESOS, solo administradores. Clientes por código; antes de
+// mandar texto a la IA se tapan correos, teléfonos, IBAN y documentos. Funciones con «function» (se pueden usar desde cualquier sitio).
+// ================================================================
+function iaTapar(t) { return String(t || '').replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, '[correo]').replace(/\bES\d{2}(?:\s?\d{4}){5}\b/gi, '[IBAN]').replace(/\b[XYZ]?\d{7,8}[-\s]?[A-Z]\b/gi, '[documento]').replace(/\+?\d[\d\s]{7,14}\d/g, '[teléfono]').slice(0, 600); }
+function iaEuros(c) { return Math.round(Number(c || 0)) / 100; }
+function iaEsAdmin(req) { return !!(req.asesor && (req.asesor.esAdmin || (req.asesor.roles && req.asesor.roles.has('admin')))); }
+function iaNombreServicioLegacy(id) {
+  try { const d = Object.values(TIPOS_SERVICIO).find(x => x.legacy === id); if (d) return String(d.nombre.es('')).replace(/\s*\(\s*\)\s*$/, '').replace(/\s+(de|del)\s*$/, '').trim() || id; } catch (e) {}
+  return id;
+}
+function iaDesglose(p) {
+  let l; try { l = JSON.parse(p.servicios); } catch (e) { l = []; }
+  if (Array.isArray(l) && l.length && l[0] && typeof l[0] === 'object') return l.map(x => ({ id: x.id, c: Number(x.precio_centimos) || 0 }));
+  const ids = (Array.isArray(l) ? l : []).filter(x => typeof x === 'string');
+  return ids.map(id => ({ id, c: Math.round(Number(p.importe_centimos || 0) / ids.length) }));
+}
+async function iaMasCifras(e, req) {
+  const permitidos = await iaAlcance(req), admin = iaEsAdmin(req), anio = Number(e.anio) || new Date().getFullYear();
+  const [cs] = await pool.query("SELECT id, asesor_persona_id FROM clientes WHERE estado IS NULL OR estado <> 'inerte'");
+  const mis = cs.filter(c => !permitidos || permitidos.has(c.id)), ids = new Set(mis.map(c => c.id));
+  const [ps] = await pool.query('SELECT id, cliente_id, estado, cobro, importe_centimos, servicios, creado_en FROM propuestas');
+  const propias = ps.filter(p => ids.has(p.cliente_id));
+  const [pg] = await pool.query('SELECT propuesta_id, estado, confirmado_en, creado_en FROM pagos');
+  const pagoDe = {}; pg.forEach(x => { const a = pagoDe[x.propuesta_id]; if (!a || x.estado === 'confirmado') pagoDe[x.propuesta_id] = x; });
+  const r = { alcance: admin ? 'todo el despacho' : 'solo lo que puede ver quien pregunta', clientes: { total: mis.length, con_algun_encargo_aceptado: new Set(propias.filter(p => p.estado === 'aceptada').map(p => p.cliente_id)).size } };
+  if (admin) r.clientes.sin_asesor = mis.filter(c => !c.asesor_persona_id).length;
+  const porEstado = {}; propias.forEach(p => { porEstado[p.estado] = (porEstado[p.estado] || 0) + 1; });
+  r.encargos = { por_estado: porEstado, creados_en_el_anio: propias.filter(p => new Date(p.creado_en).getFullYear() === anio).length };
+  try { const [sv] = await pool.query(SQL_SERVICIOS + ' WHERE s.confirmado IN (0, 1)'); const vs = (await vistasDeFilas(pool, sv)).filter(v => ids.has(v.cliente_id)); const enC = vs.filter(v => v.en_curso);
+    r.servicios = { en_curso: enC.length, terminados: vs.length - enC.length, progreso_medio_en_curso: enC.length ? Math.round(enC.reduce((a, v) => a + (v.progreso || 0), 0) / enC.length) : null }; } catch (er) {}
+  if (!admin) { r.ingresos = 'Solo los administradores pueden ver los ingresos.'; return r; }
+  const fechaPago = p => new Date(pagoDe[p.id].confirmado_en || pagoDe[p.id].creado_en);
+  const pagadas = ps.filter(p => pagoDe[p.id] && pagoDe[p.id].estado === 'confirmado'), delAnio = pagadas.filter(p => fechaPago(p).getFullYear() === anio);
+  const meses = {}, porServ = {};
+  delAnio.forEach(p => { const k = anio + '-' + String(fechaPago(p).getMonth() + 1).padStart(2, '0'); meses[k] = (meses[k] || 0) + Number(p.importe_centimos || 0);
+    iaDesglose(p).forEach(x => { const n = iaNombreServicioLegacy(x.id); porServ[n] = porServ[n] || { encargos: 0, c: 0 }; porServ[n].encargos++; porServ[n].c += x.c; }); });
+  const total = delAnio.reduce((a, p) => a + Number(p.importe_centimos || 0), 0), nCli = new Set(delAnio.map(p => p.cliente_id)).size;
+  const sinCobrar = ps.filter(p => p.estado === 'aceptada' && !(pagoDe[p.id] && pagoDe[p.id].estado === 'confirmado'));
+  r.ingresos = { anio, confirmados_euros: iaEuros(total), encargos_pagados: delAnio.length, media_por_encargo_euros: delAnio.length ? iaEuros(total / delAnio.length) : 0, clientes_que_han_pagado: nCli, media_por_cliente_euros: nCli ? iaEuros(total / nCli) : 0,
+    por_mes_euros: Object.fromEntries(Object.keys(meses).sort().map(k => [k, iaEuros(meses[k])])),
+    por_servicio: Object.entries(porServ).sort((a, b) => b[1].c - a[1].c).map(([n, v]) => ({ servicio: n, encargos: v.encargos, euros: iaEuros(v.c) })),
+    desde_siempre_euros: iaEuros(pagadas.reduce((a, p) => a + Number(p.importe_centimos || 0), 0)),
+    pendiente_de_cobro: { encargos: sinCobrar.length, euros: iaEuros(sinCobrar.reduce((a, p) => a + Number(p.importe_centimos || 0), 0)), con_pago_declarado_sin_confirmar: sinCobrar.filter(p => pagoDe[p.id]).length, de_pagar_despues: sinCobrar.filter(p => p.cobro === 'despues').length },
+    como_se_cuenta: 'Encargos con el pago confirmado por un administrador, por la fecha de confirmación, con el importe de su propuesta.' };
+  return r;
+}
+async function iaMasCliente(e, req, usados) {
+  const permitidos = await iaAlcance(req), cli = await iaClientes(permitidos), admin = iaEsAdmin(req);
+  const cod = String(e.codigo || '').trim().toUpperCase(), c = [...cli.values()].find(x => String(x.cod).toUpperCase() === cod);
+  if (!c) return { error: 'No hay ningún cliente con ese código que pueda ver quien pregunta.' };
+  usados.set(c.cod, c.id); const id = c.id;
+  const [[cl]] = await pool.query("SELECT estado, creado_en, (telefono IS NOT NULL AND telefono <> '') AS tiene_telefono, (numero_documento IS NOT NULL AND numero_documento <> '') AS tiene_documento FROM clientes WHERE id = ?", [id]);
+  const [ps] = await pool.query('SELECT id, estado, cobro, importe_centimos, servicios, creado_en FROM propuestas WHERE cliente_id = ? ORDER BY id', [id]);
+  const [pg] = ps.length ? await pool.query('SELECT propuesta_id, estado, metodo, confirmado_en FROM pagos WHERE propuesta_id IN (?)', [ps.map(p => p.id)]) : [[]];
+  const [sv] = await pool.query(SQL_SERVICIOS + ' WHERE s.cliente_id = ? AND s.confirmado IN (0, 1)', [id]); const vs = await vistasDeFilas(pool, sv);
+  const [docs] = await pool.query('SELECT nombre, estado, subido_en, revisado_en FROM documentos_fiscales WHERE cliente_id = ? ORDER BY id DESC LIMIT 40', [id]);
+  const [ent] = await pool.query('SELECT servicio, version, estado, subido_en FROM entregas WHERE cliente_id = ? ORDER BY id DESC LIMIT 20', [id]);
+  const [no] = await pool.query('SELECT n.texto, n.origen, n.creado_en, a.nombre AS quien FROM notas_cliente n LEFT JOIN asesores a ON a.id = n.asesor_id WHERE n.cliente_id = ? ORDER BY n.id DESC LIMIT 10', [id]);
+  let co = []; try { [co] = await pool.query('SELECT direccion, asunto, enviado_en, leido_en FROM correos_panel WHERE cliente_id = ? ORDER BY id DESC LIMIT 10', [id]); } catch (er) {}
+  const [ms] = await pool.query('SELECT autor, creado_en FROM mensajes WHERE cliente_id = ? AND retirado_en IS NULL ORDER BY id DESC LIMIT 1', [id]);
+  return { codigo: c.cod, asesor: c.asesor || 'sin asignar', cliente_desde: cl.creado_en, estado: cl.estado || 'activo', tiene_telefono: !!cl.tiene_telefono, tiene_documento: !!cl.tiene_documento,
+    encargos: ps.map(p => { const pp = pg.filter(x => x.propuesta_id === p.id); return { fecha: p.creado_en, estado: p.estado, cobro: p.cobro === 'despues' ? 'pagar después' : 'pagar antes', servicios: iaDesglose(p).map(x => iaNombreServicioLegacy(x.id)), importe_euros: admin ? iaEuros(p.importe_centimos) : undefined, pago: pp.some(x => x.estado === 'confirmado') ? 'confirmado' : pp.length ? 'declarado, sin confirmar' : 'sin pagar' }; }),
+    servicios: vs.map(v => ({ servicio: v.nombre_es, estado: v.estado, en_curso: v.en_curso, progreso: v.progreso, docs_pendientes: v.docs_pendientes, docs_por_revisar: v.docs_por_revisar, informe: v.entrega_estado || null })),
+    documentos: docs.map(d => ({ nombre: iaTapar(d.nombre), estado: d.estado, subido: d.subido_en, revisado: d.revisado_en })),
+    informes: ent.map(x => ({ servicio: x.servicio, version: x.version, estado: x.estado, fecha: x.subido_en })),
+    notas: no.map(n => ({ texto: iaTapar(n.texto), de: n.origen === 'cliente' ? 'el propio cliente' : (n.quien || n.origen), fecha: n.creado_en })),
+    correos: co.map(x => ({ tipo: x.direccion === 'entrante' ? 'respuesta del cliente' : 'enviado', asunto: iaTapar(x.asunto), fecha: x.enviado_en, sin_leer: x.direccion === 'entrante' && !x.leido_en })),
+    ultimo_mensaje_chat: ms.length ? { de: ms[0].autor, fecha: ms[0].creado_en } : null };
+}
+async function iaMasSolicitudes(e, req) {
+  const R = req.asesor.roles || new Set();
+  if (!['asesor', 'jefe', 'encargado', 'admin'].some(x => R.has(x))) return { error: 'Con su rango no puede ver las solicitudes de la web.' };
+  const [pr] = await pool.query('SELECT id, servicios, detalle, origen, atendida, creado_en FROM solicitudes_presupuesto ORDER BY id DESC LIMIT 300');
+  const [ll] = await pool.query('SELECT id, origen, atendida, creado_en FROM solicitudes_llamada ORDER BY id DESC LIMIT 300');
+  const pend = pr.filter(x => !x.atendida), lp = ll.filter(x => !x.atendida), hace30 = Date.now() - 30 * 864e5;
+  const serv = t => { try { return JSON.parse(t); } catch (er) { return t; } };
+  return { presupuestos: { sin_atender: pend.length, recibidos_ultimos_30_dias: pr.filter(x => new Date(x.creado_en).getTime() > hace30).length, pendientes: pend.slice(0, 30).map(x => ({ id: x.id, fecha: x.creado_en, servicios: serv(x.servicios), detalle: iaTapar(x.detalle), origen: x.origen })) },
+    llamadas: { sin_atender: lp.length, recibidas_ultimos_30_dias: ll.filter(x => new Date(x.creado_en).getTime() > hace30).length, pendientes: lp.slice(0, 30).map(x => ({ id: x.id, fecha: x.creado_en, origen: x.origen })) } };
+}
+async function iaMasBandeja(e, req, usados) {
+  const permitidos = await iaAlcance(req), cli = await iaClientes(permitidos), admin = iaEsAdmin(req), r = {};
+  const cod = id => { const c = cli.get(id); if (c) usados.set(c.cod, id); return c ? c.cod : null; };
+  try { const [x] = await pool.query("SELECT cliente_id, asunto, enviado_en FROM correos_panel WHERE direccion = 'entrante' AND leido_en IS NULL ORDER BY id DESC LIMIT 200"); r.respuestas_por_correo_sin_leer = x.filter(y => cli.has(y.cliente_id)).map(y => ({ cliente: cod(y.cliente_id), asunto: iaTapar(y.asunto), fecha: y.enviado_en })); } catch (er) {}
+  try { const [x] = await pool.query('SELECT * FROM cambios_asesor ORDER BY id DESC LIMIT 200'); r.cambios_de_asesor = x.filter(y => cli.has(y.cliente_id)).slice(0, 30).map(y => ({ cliente: cod(y.cliente_id), estado: y.estado || null, fecha: y.creado_en, motivo: iaTapar(y.texto_cliente || y.motivo || '') })); } catch (er) {}
+  try { const [x] = await pool.query('SELECT * FROM valoraciones ORDER BY id DESC LIMIT 200'); r.valoraciones = x.filter(y => !y.cliente_id || cli.has(y.cliente_id)).slice(0, 30).map(y => ({ cliente: y.cliente_id ? cod(y.cliente_id) : null, nota: y.puntuacion ?? y.estrellas ?? y.nota ?? null, comentario: iaTapar(y.comentario || y.texto || ''), fecha: y.creado_en })); } catch (er) {}
+  try { const [x] = await pool.query('SELECT * FROM recordatorios_cliente ORDER BY id DESC LIMIT 200'); r.recordatorios_enviados = x.filter(y => cli.has(y.cliente_id)).slice(0, 20).map(y => ({ cliente: cod(y.cliente_id), fecha: y.creado_en || y.enviado_en || null })); } catch (er) {}
+  if (admin) { try { const [x] = await pool.query('SELECT * FROM sugerencias ORDER BY id DESC LIMIT 30'); r.sugerencias = x.map(y => ({ texto: iaTapar(y.texto || y.sugerencia || ''), estado: y.estado || null, fecha: y.creado_en })); } catch (er) {} }
+  return r;
+}
+function iaMasFuncion(nombre) { return { cifras: iaMasCifras, cliente: iaMasCliente, solicitudes: iaMasSolicitudes, bandeja: iaMasBandeja }[nombre] || null; }
+function iaMasDefiniciones() {
+  return [
+    { name: 'cifras', description: 'Cifras del despacho: clientes (total, con encargo aceptado, sin asesor), encargos por estado, servicios en curso y terminados, y —SOLO si pregunta un administrador— ingresos confirmados del año (total, por mes, por servicio, media por encargo y por cliente, histórico y pendiente de cobro). Para quien no es administrador devuelve que no puede ver ingresos.', input_schema: { type: 'object', properties: { anio: { type: 'integer', description: 'Año (por defecto, el actual)' } } } },
+    { name: 'cliente', description: 'Ficha completa de un cliente por su código: asesor, encargos (estado, cobro, pago; importe solo para administradores), servicios con progreso, documentos, informes, últimas notas, correos y último mensaje del chat. Solo clientes que puede ver quien pregunta.', input_schema: { type: 'object', properties: { codigo: { type: 'string', description: 'Código del cliente (p. ej. BM08I6X14M o C12)' } }, required: ['codigo'] } },
+    { name: 'solicitudes', description: 'Solicitudes que llegan desde la web: presupuestos y llamadas sin atender, y cuántas han llegado en los últimos 30 días.', input_schema: { type: 'object', properties: {} } },
+    { name: 'bandeja', description: 'Lo que espera atención: respuestas por correo de clientes sin leer, peticiones de cambio de asesor, valoraciones de clientes, recordatorios enviados y (solo administradores) sugerencias.', input_schema: { type: 'object', properties: {} } },
+  ];
+}
+
+// ================================================================
+// EL CLIENTE CAMBIA SUS DATOS (31/10, Vikn)
+// Desde «Mis datos» del Área: nombre, apellidos, teléfono y documento (DNI/NIE con su letra de control). El correo no (es con lo que
+// entra): ese lo pide a su asesor. Siempre se avisa al asesor: nota automática en la ficha (antes → después), aviso ntfy sin datos
+// personales y correo a su cuenta. Queda en el registro maestro con el antes y el después.
+// ================================================================
+const LETRAS_DNI = 'TRWAGMYFPDXBNJZSQVHLCKE';
+function documentoValido(tipo, num) {
+  const n = String(num || '').toUpperCase().replace(/[\s.\-]/g, '');
+  if (tipo === 'dni') return /^\d{8}[A-Z]$/.test(n) && LETRAS_DNI[Number(n.slice(0, 8)) % 23] === n[8];
+  if (tipo === 'nie') { if (!/^[XYZ]\d{7}[A-Z]$/.test(n)) return false; return LETRAS_DNI[Number('XYZ'.indexOf(n[0]) + n.slice(1, 8)) % 23] === n[8]; }
+  if (tipo === 'pasaporte') return /^[A-Z0-9]{5,20}$/.test(n);
+  return false;
+}
+const docEnmascarado = (tipo, num) => { const n = String(num || ''); return n ? (String(tipo || '').toUpperCase() + ' ' + '•'.repeat(Math.max(0, n.length - 4)) + n.slice(-4)).trim() : '—'; };
+app.post('/api/propuestas/:token/mis-datos', async (req, res) => {
+  const b = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [cf] = await conn.execute('SELECT id, codigo, nombre, apellidos, telefono, tipo_documento, numero_documento FROM clientes WHERE id = ?', [p.cliente_id]);
+    const a = cf[0];
+    const nuevo = {
+      nombre: b.nombre !== undefined ? String(b.nombre).trim().slice(0, 100) : a.nombre,
+      apellidos: b.apellidos !== undefined ? String(b.apellidos).trim().slice(0, 150) : a.apellidos,
+      telefono: b.telefono !== undefined ? String(b.telefono).trim().slice(0, 30) : a.telefono,
+      tipo_documento: b.tipo_documento ? String(b.tipo_documento).toLowerCase() : a.tipo_documento,
+      numero_documento: b.numero_documento && String(b.numero_documento).trim() ? String(b.numero_documento).toUpperCase().replace(/[\s.\-]/g, '') : a.numero_documento,
+    };
+    if ((nuevo.nombre || '').length < 2 || (nuevo.apellidos || '').length < 2) return res.status(400).json({ error: 'Escribe tu nombre y tus apellidos' });
+    if (nuevo.telefono && !/^\+?[\d\s]{6,20}$/.test(nuevo.telefono)) return res.status(400).json({ error: 'El teléfono no es válido' });
+    const docCambia = nuevo.tipo_documento !== a.tipo_documento || nuevo.numero_documento !== a.numero_documento;
+    if (docCambia && !documentoValido(nuevo.tipo_documento, nuevo.numero_documento)) return res.status(400).json({ error: nuevo.tipo_documento === 'pasaporte' ? 'El número de pasaporte no es válido' : 'El número de documento no es válido: revisa los números y la letra' });
+    const campos = ['nombre', 'apellidos', 'telefono', 'tipo_documento', 'numero_documento'];
+    const cambios = campos.filter(k => String(a[k] || '') !== String(nuevo[k] || ''));
+    if (!cambios.length) return res.json({ ok: true, cambios: 0 });
+    await conn.execute('UPDATE clientes SET nombre = ?, apellidos = ?, telefono = ?, tipo_documento = ?, numero_documento = ? WHERE id = ?', [nuevo.nombre, nuevo.apellidos, nuevo.telefono || null, nuevo.tipo_documento, nuevo.numero_documento, a.id]);
+    const ETQ = { nombre: 'Nombre', apellidos: 'Apellidos', telefono: 'Teléfono', tipo_documento: 'Tipo de documento', numero_documento: 'Documento' };
+    const ver = (k, o) => k === 'numero_documento' ? docEnmascarado(o.tipo_documento, o.numero_documento) : k === 'tipo_documento' ? String(o[k] || '—').toUpperCase() : (o[k] || '—');
+    const lineas = cambios.map(k => ETQ[k] + ': ' + ver(k, a) + ' → ' + ver(k, nuevo));
+    await conn.execute("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, NULL, 'cliente', ?)", [a.id, 'Ha cambiado sus datos desde su área. ' + lineas.join('; ') + '.']);
+    avisarCliente(a.id, '✏️', 'un cliente ha cambiado sus datos', 'Tienes los cambios en su ficha, en «Notas».', { etiqueta: 'pencil' });
+    try {
+      const [as] = await pool.execute('SELECT ac.correo FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id JOIN asesores ac ON ac.id = q.asesor_id WHERE c.id = ?', [a.id]);
+      if (as.length && brevoActivo()) {
+        const c = plantillaCorreo({ titulo: 'Un cliente ha cambiado sus datos', parrafos: ['El cliente ' + ESC_HTML(a.codigo || ('#' + a.id)) + ' ha cambiado sus datos desde su área:', lineas.map(l => '· ' + ESC_HTML(l)).join('<br>'), 'Lo tienes también como nota en su ficha. Si algo no cuadra (por ejemplo, el documento del alta), habla con él.'], boton: { texto: 'Abrir su ficha', url: PANEL_URL + '/?cliente=' + a.id } });
+        enviarCorreo(as[0].correo, 'Un cliente ha cambiado sus datos', c.html, c.texto).catch(e => console.error('Aviso de datos cambiados:', e.message));
+      }
+    } catch (e) { console.error('Aviso de datos cambiados:', e.message); }
+    req.registroDetalle = { cambios: { tabla: 'clientes', antes: Object.fromEntries(cambios.map(k => [k, k === 'numero_documento' ? docEnmascarado(a.tipo_documento, a[k]) : a[k]])), despues: Object.fromEntries(cambios.map(k => [k, k === 'numero_documento' ? docEnmascarado(nuevo.tipo_documento, nuevo[k]) : nuevo[k]])) } };
+    res.json({ ok: true, cambios: cambios.length, cliente: { nombre: nuevo.nombre, apellidos: nuevo.apellidos, telefono: nuevo.telefono, tipo_documento: nuevo.tipo_documento, numero_documento: nuevo.numero_documento } });
+  } catch (err) { console.error('Mis datos:', err.message); res.status(500).json({ error: 'No se han podido guardar tus datos' }); }
+  finally { conn.release(); }
 });
 
 // ================================================================
