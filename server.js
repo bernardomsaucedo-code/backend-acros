@@ -2909,14 +2909,15 @@ const SQL_DERECHO = 'SELECT c.id AS cliente_id, q.asesor_id FROM clientes c JOIN
   'UNION SELECT c.id, j.asesor_id FROM clientes c JOIN personas t ON t.id = c.asesor_persona_id JOIN equipos e ON e.id = t.equipo_id AND e.activo = 1 ' +
   "JOIN personas j ON j.id = e.jefe_persona_id JOIN asesores aj ON aj.id = j.asesor_id WHERE FIND_IN_SET('jefe', REPLACE(aj.roles, ' ', '')) > 0 " +
   'UNION SELECT c.id, n.asesor_id FROM clientes c JOIN personas t ON t.id = c.asesor_persona_id JOIN equipos e ON e.id = t.equipo_id AND e.activo = 1 ' +
-  "JOIN personas n ON n.id = e.encargado_persona_id JOIN asesores an ON an.id = n.asesor_id WHERE FIND_IN_SET('encargado', REPLACE(an.roles, ' ', '')) > 0";
+  "JOIN personas n ON n.id = e.encargado_persona_id JOIN asesores an ON an.id = n.asesor_id WHERE FIND_IN_SET('encargado', REPLACE(an.roles, ' ', '')) > 0 " +
+  'UNION SELECT c.id, ad.id FROM clientes c JOIN asesores ad ON ad.es_admin = 1 AND ad.activo = 1';   // 31/10: los administradores, todos
 app.get('/api/admin/llaves/pendientes', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   // Se retiran las que ya no tocan (cliente reasignado, colaboración quitada…)
   await pool.query(`DELETE l FROM llaves_documento l JOIN (${SQL_DOCS}) x ON x.tipo = l.tipo AND x.objeto_id = l.objeto_id
     LEFT JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id AND t.asesor_id = l.asesor_id WHERE t.asesor_id IS NULL`);
   const [f] = await pool.query(`SELECT x.tipo, x.objeto_id, x.clave_cifrada, a.id AS asesor_id, a.llave_publica FROM (${SQL_DOCS}) x
     JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id
-    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.es_admin = 0 AND a.llave_publica IS NOT NULL
+    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.llave_publica IS NOT NULL
     LEFT JOIN llaves_documento l ON l.tipo = x.tipo AND l.objeto_id = x.objeto_id AND l.asesor_id = a.id
     WHERE l.id IS NULL LIMIT 300`);
   res.json(f);
@@ -7390,13 +7391,13 @@ app.post('/api/admin/urgencias/revisar', requiereSesionAsesor, soloAdministrador
 app.get('/api/admin/llaves/por-conceder', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const [p] = await pool.query(`SELECT COUNT(*) AS n FROM (${SQL_DOCS}) x
     JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id
-    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.es_admin = 0 AND a.llave_publica IS NOT NULL
+    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.llave_publica IS NOT NULL
     LEFT JOIN llaves_documento l ON l.tipo = x.tipo AND l.objeto_id = x.objeto_id AND l.asesor_id = a.id
     WHERE l.id IS NULL`);
   // quien tiene derecho pero aún no ha creado su llave (la crea al entrar por primera vez en el panel)
   const [s] = await pool.query(`SELECT COUNT(DISTINCT a.id) AS n FROM (${SQL_DOCS}) x
     JOIN (${SQL_DERECHO}) t ON t.cliente_id = x.cliente_id
-    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.es_admin = 0 AND a.llave_publica IS NULL`);
+    JOIN asesores a ON a.id = t.asesor_id AND a.activo = 1 AND a.llave_publica IS NULL`);
   res.json({ pendientes: p[0].n, asesores_sin_llave: s[0].n });
 });
 
@@ -7542,7 +7543,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-10-31.1';
+const VERSION_ACROS = '2026-10-31.2';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
