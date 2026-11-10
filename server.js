@@ -906,7 +906,13 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('personas', '`equipo_id`', 'INT NULL');
       await pool.execute('CREATE TABLE IF NOT EXISTS equipos (`id` INT AUTO_INCREMENT PRIMARY KEY, `nombre` VARCHAR(80) NOT NULL, `jefe_persona_id` INT NULL, `encargado_persona_id` INT NULL, `ntfy_topic` VARCHAR(80) NULL, `activo` TINYINT(1) NOT NULL DEFAULT 1, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
       await agregaColumnaSiFalta('documentos_fiscales', '`nombre_original`', 'VARCHAR(255) NULL');
-      await prepararFormatosArchivo();   // 03/11: formatos de archivo conocidos (semilla) y columnas de renombrado   // 15/10: nombre del archivo tal cual lo subió el cliente
+      await prepararYsi();   // 05/11: simulador público «¿Y si…?» (contactos y usos)
+      await prepararFormatosArchivo();
+      await prepararTemporadas();   // 06/11: temporadas de la web y codigo_promo
+      await prepararFormularios();  // 11/11: preguntas dinámicas
+      await prepararFormulariosCliente();  // 11/11: baterías del Área
+      await prepararMapas();  // 11/11: mapa cripto (inicial, final y diferencias)
+      await prepararCierre();  // 11/11: cierre del expediente   // 03/11: formatos de archivo conocidos (semilla) y columnas de renombrado   // 15/10: nombre del archivo tal cual lo subió el cliente
       await pool.execute('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');   // 15/10
       setTimeout(cargarCanales, 500);
       // 14/10: llaves de documentos por asesor (ver «LLAVES POR ASESOR»)
@@ -1660,13 +1666,14 @@ app.post('/api/presupuesto', async (req, res) => {
     return res.status(400).json({ error: 'Faltan servicios o el teléfono no es válido' });
   }
   if (esSpam(req.body)) return res.status(201).json({ ok: true }); // honeypot: no se guarda, pero no se delata
-  const { servicios, detalle, telefono, correo, cuestionario } = req.body;
+  const { servicios, detalle, telefono, correo } = req.body;
+  const cuestionario = await cuestionarioConFormulario(req.body.cuestionario).catch(() => null);   // 11/11: batería 1 (forma {_v2})
   const { utm, origen } = resolverAtribucion(req.body);
   const conCuestionario = !!(cuestionario && Object.keys(cuestionario).length);
   const tokenCuest = conCuestionario ? null : crypto.randomBytes(16).toString('hex');
   try {
     const [ins] = await pool.execute(
-      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `token_cuestionario`, `asesor_preferido_id`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `token_cuestionario`, `asesor_preferido_id`, codigo_promo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         Array.isArray(servicios) ? JSON.stringify(servicios) : servicios.toString().trim(),
         detalle ? detalle.toString().trim() : null,
@@ -1677,6 +1684,7 @@ app.post('/api/presupuesto', async (req, res) => {
         conCuestionario ? JSON.stringify(cuestionario) : null,
         tokenCuest,
         Number.isInteger(Number(req.body.asesor_preferido)) && Number(req.body.asesor_preferido) > 0 ? Number(req.body.asesor_preferido) : null,
+        codigoPromoValido(req.body.codigo_promo),   // 06/11: solo códigos conocidos (PIZZA22)
       ]
     );
     avisarCaptacion('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
@@ -3264,10 +3272,17 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
   // 20/10: ejercicio (o rango) y plazo por servicio, opcionales: { renta: 2025, pganterior: { desde: 2021, hasta: 2024 } }
   const ejerciciosN = normalizarEjerciciosPropuesta(req.body.ejercicios, serviciosDePropuesta({ servicios: JSON.stringify(normalizado.servicios) }));
   if (ejerciciosN.error) return res.status(400).json({ error: ejerciciosN.error });
+  const ampliaA = Number((req.body || {}).amplia_a) || null;   // 05/11: ampliación de un encargo aceptado
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     const cliente = await obtenerOCrearCliente(conn, { correo, telefono });
+    let encargoAmpliado = null;
+    if (ampliaA) {
+      const [pa] = await conn.execute('SELECT id, cliente_id, estado, creado_en FROM propuestas WHERE id = ?', [ampliaA]);
+      if (!pa.length || pa[0].cliente_id !== cliente.id || pa[0].estado !== 'aceptada') { await conn.rollback(); return res.status(400).json({ error: 'Solo se puede ampliar un encargo aceptado de este mismo cliente' }); }
+      encargoAmpliado = pa[0];
+    }
     // Fase B (10/10): sin asesor todavía → el que le envía la propuesta (si es
     // una persona del equipo que atiende clientes)
     await conn.execute(
@@ -3280,8 +3295,8 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
     const token = generarToken();
     const expira = finValidezPropuesta();
     const [r] = await conn.execute(
-      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id, servicios_detalle, cobro) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id, ejerciciosN.detalle ? JSON.stringify(ejerciciosN.detalle) : null, cobro]
+      'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id, servicios_detalle, cobro, amplia_a) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id, ejerciciosN.detalle ? JSON.stringify(ejerciciosN.detalle) : null, cobro, ampliaA]
     );
     const retirar = (Array.isArray(req.body.retirar) ? req.body.retirar : []).map(Number).filter(n => Number.isInteger(n) && n > 0 && n !== r.insertId);   // 21/10
     if (retirar.length) await conn.query("UPDATE propuestas SET estado = 'caducada', token_expira_en = NOW() WHERE id IN (?) AND cliente_id = ? AND estado = 'enviada'", [retirar, cliente.id]);
@@ -3292,20 +3307,20 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
       const asesorP = await personaDeCliente(cliente.id).catch(() => null);
       const quienP = asesorP ? `${ESC_HTML(asesorP.nombre)}, tu asesor de Acros,` : 'Tu asesor de Acros';
       const correoP = plantillaCorreo(enlace ? {
-        titulo: 'Tu propuesta está lista',
+        titulo: encargoAmpliado ? 'Ampliación de tu encargo' : 'Tu propuesta está lista',
         parrafos: [
           'Hola:',
-          `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
+          `${quienP} ha preparado ${encargoAmpliado ? 'una ampliación de tu encargo del ' + fechaLargaES(new Date(encargoAmpliado.creado_en)) + ' (solo lo que se añade)' : 'tu propuesta'}, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
         ],
         boton: { texto: 'Ver mi propuesta', url: enlace },
         nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 17 00 20.`,
       } : {
-        titulo: 'Tu propuesta está lista',
-        parrafos: ['Hola:', `${quienP} ha preparado tu propuesta, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
+        titulo: encargoAmpliado ? 'Ampliación de tu encargo' : 'Tu propuesta está lista',
+        parrafos: ['Hola:', `${quienP} ha preparado ${encargoAmpliado ? 'una ampliación de tu encargo del ' + fechaLargaES(new Date(encargoAmpliado.creado_en)) + ' (solo lo que se añade)' : 'tu propuesta'}, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
         nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido.`,
       });
       try {
-        await enviarCorreo(correo, 'Tu propuesta de Acros está lista', correoP.html, correoP.texto, { desde: 'asesor' });
+        await enviarCorreo(correo, encargoAmpliado ? 'Ampliación de tu encargo de Acros' : 'Tu propuesta de Acros está lista', correoP.html, correoP.texto, { desde: 'asesor' });
 
       } catch (err) {
         console.error('Error al enviar el correo de propuesta (Brevo):', err.response?.data || err.message);
@@ -4104,7 +4119,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
-      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en, cobro
+      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en, cobro, amplia_a
        FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC`, [id]);
     const ids = propuestas.map(p => p.id);
     let pagos = [], diligencias = [], documentos = [], entregasF = [];
@@ -7215,7 +7230,7 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [props] = await conn.execute("SELECT id, token, estado, servicios, creado_en, inicio_inmediato_en, token_expira_en, cobro FROM propuestas WHERE cliente_id = ? AND (estado = 'aceptada' OR (estado = 'enviada' AND token_expira_en > NOW())) ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
+    const [props] = await conn.execute("SELECT id, token, estado, servicios, creado_en, inicio_inmediato_en, token_expira_en, cobro, amplia_a FROM propuestas WHERE cliente_id = ? AND (estado = 'aceptada' OR (estado = 'enviada' AND token_expira_en > NOW())) ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
     const ids = props.map(x => x.id);
     const vacio = { encargos: [], documentos: [], entregas: [], mensajes: [], historial: [], subidas_hoy: 0, limite_subidas: LIMITE_SUBIDAS_DIA };
     if (!ids.length) return res.json(vacio);
@@ -7243,7 +7258,7 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
     h.sort((a, b) => new Date(b.cuando) - new Date(a.cuando));
     const [recPago] = await conn.execute("SELECT objeto_id, MAX(creado_en) AS ultimo FROM recordatorios_cliente WHERE tipo = 'pago' AND cliente_id = ? GROUP BY objeto_id", [p.cliente_id]);   // 26/10
     res.json({
-      encargos: props.map(x => ({ id: x.id, token: x.token, estado: x.estado, creado_en: x.creado_en, alta_aprobada: aprobadas.has(x.id),
+      encargos: props.map(x => ({ id: x.id, token: x.token, estado: x.estado, creado_en: x.creado_en, amplia_a: x.amplia_a || null, alta_aprobada: aprobadas.has(x.id),
         pago_recordado_en: ((recPago.find(r => r.objeto_id === x.id)) || {}).ultimo || null,
         pago: pagos.some(g => g.propuesta_id === x.id), pago_confirmado: pagos.some(g => g.propuesta_id === x.id && g.estado === 'confirmado'), cobro: x.cobro || 'antes', plazo_pago: plazoPagoDe(x), informes_bloqueados: pagos.some(g => g.propuesta_id === x.id && g.estado === 'confirmado') ? 0 : ents.filter(e => e.propuesta_id === x.id && e.estado === 'entregado').length, alta: ((dils.filter(g => g.propuesta_id === x.id).slice(-1)[0]) || {}).estado || null, servicios_nombres: x.estado === 'aceptada' ? serviciosDePropuesta(x).map(id => { const t = TIPOS_SERVICIO[tipoDeServicio(id)]; return t && t.generico ? t.generico : { es: id, en: id }; }) : undefined, expira_en: x.estado === 'enviada' ? x.token_expira_en : null, servicios: x.estado === 'enviada' ? serviciosDePropuesta(x) : undefined })),
       documentos: docs, entregas: ents.filter(e => pagos.some(g => g.propuesta_id === e.propuesta_id && g.estado === 'confirmado')),   // 29/10: los informes solo con el pago confirmado
@@ -7545,7 +7560,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-11-04.1';
+const VERSION_ACROS = '2026-11-11.1';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -8089,7 +8104,7 @@ app.get('/api/admin/cliente-por-codigo/:codigo', requiereSesionAsesor, async (re
 // PANTALLAS DE ERROR BONITAS (29/10, Vikn) — generado por generar_errores.py
 // A quien llega con un navegador a una dirección que no existe o que falla se le enseña una página de Acros; a los programas, el JSON de siempre.
 // ================================================================
-const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#16301F; --panel:#1F3428; --linea:#3A5245; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main></body></html>"}};
+const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main></body></html>"}};
 function pideHTML(req) { const a = String(req.headers.accept || ''); return a.includes('text/html') && !a.includes('application/json'); }
 function paginaError(req, codigo) { const i = /^en\b/i.test(String(req.headers['accept-language'] || '')) ? 'en' : 'es'; return PAGINAS_ERROR[i][codigo]; }
 
@@ -8832,6 +8847,277 @@ const SEMILLA_FORMATOS = [
   ['Explorador EVM (Etherscan y similares)', 'wallet', ['txhash', 'blockno', 'unixtimestamp', 'from', 'to'], 'csv', 'export-*', 'Ethereum, Arbitrum, Base, Polygon, Optimism…'],
   ['Quantfury', 'exchange', [], 'pdf', '*quantfury*', 'PDF: solo por el nombre'],
 ];
+// ================================================================
+// SIMULADOR PÚBLICO «¿Y SI…?» (Acros 9, 05/11, Vikn) — embudo de captación
+// Lo que llega desde el simulador gratuito de la web:
+//  · usos anónimos (sin datos personales) para medir el embudo;
+//  · correos (ver escenarios, guardar la cartera, recordatorios) → «Simulador ¿Y si…?» del panel;
+//  · peticiones de revisión (o la casilla «quiero que un asesor me escriba») → una solicitud de presupuesto
+//    normal en «Solicitudes y llamadas», con origen «ysi» y el resumen de su cartera, lista para «Preparar propuesta».
+// Nunca se habla al cliente de conversión ni de formato interno (regla de Vikn del 04/11).
+// Los archivos no se guardan aquí: el convertidor de la web aún no existe (pendiente); cuando exista, se adjuntarán
+// a la solicitud solo si la persona pide revisión.
+// ================================================================
+const YSI_SERVICIO = 'Revisión de cartera e informe de pérdidas y ganancias';   // «Preparar propuesta» marca el informe de PyG (la revisión lo incluye, Vikn 04/11)
+const YSI_MAX_CARTERA = 1500000;               // bytes de la cartera guardada (texto JSON)
+
+// Precio «Revisión a partir de» (Vikn, 04/11): (plataformas × 5 € + tramo de operaciones) × (1 + 0,5 × (años − 1)),
+// tramo 10/20/30 € (hasta 200, hasta 1.000, más), +10 € con operaciones complejas. La actividad en blockchain no
+// cambia el precio: avisa de que puede cambiar.
+function precioRevisionYsi(r) {
+  const plataformas = Math.max(1, Math.min(100, Number(r && r.plataformas) || 1));
+  const operaciones = Math.max(0, Number(r && r.operaciones) || 0);
+  const anos = Math.max(1, Math.min(30, Number(r && r.anos) || 1));
+  const tramo = operaciones <= 200 ? 10 : (operaciones <= 1000 ? 20 : 30);
+  const precio = (plataformas * 5 + tramo) * (1 + 0.5 * (anos - 1)) + (r && r.complejas ? 10 : 0);
+  return Math.round(precio);
+}
+
+// Resumen que manda la web: solo cifras y nombres de plataformas, recortado y sin nada que no esperemos
+function limpiarResumenYsi(r) {
+  if (!r || typeof r !== 'object') return {};
+  const num = (v, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : null; };
+  const lista = Array.isArray(r.exchanges) ? r.exchanges : (Array.isArray(r.plataformas_nombres) ? r.plataformas_nombres : []);
+  const exchanges = lista.map(x => String(x || '').trim().slice(0, 40)).filter(Boolean).slice(0, 40);
+  const avisos = (Array.isArray(r.avisos) ? r.avisos : []).map(x => String(x || '').trim().slice(0, 200)).filter(Boolean).slice(0, 20);
+  const out = {
+    exchanges,
+    plataformas: num(r.plataformas != null ? r.plataformas : exchanges.length, 0, 100),
+    operaciones: num(r.operaciones, 0, 10000000),
+    anos: num(r.anos, 0, 30),
+    ano_desde: num(r.ano_desde, 2009, 2100),
+    salud: num(r.salud, 0, 100),
+    avisos,
+    impuesto: num(r.impuesto, 0, 1e9),
+    resultado_ventas: num(r.resultado_ventas, -1e10, 1e10),
+    no_realizado: num(r.no_realizado, -1e10, 1e10),
+    valor_cartera: num(r.valor_cartera, 0, 1e11),
+    complejas: !!r.complejas,
+    onchain: !!r.onchain,
+  };
+  out.precio = precioRevisionYsi(out);
+  out.aviso_721 = out.valor_cartera != null && out.valor_cartera > 50000;
+  return out;
+}
+const eurosYsi = n => (n < 0 ? '−' : '') + String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ' €';
+
+// Lo que ve el asesor en la solicitud (se pinta como un cuestionario: pregunta → respuesta)
+function cuestionarioYsi(res, extra = {}) {
+  const c = { 'Viene de': 'Simulador ¿Y si…? de la web' };
+  if (extra.nombre) c['Nombre'] = extra.nombre;
+  if (res.exchanges && res.exchanges.length) c['Plataformas'] = res.exchanges.join(', ');
+  if (res.operaciones != null) c['Operaciones'] = res.operaciones.toLocaleString('es-ES');
+  if (res.anos) c['Años con actividad'] = res.anos + (res.ano_desde ? ' (desde ' + res.ano_desde + ')' : '');
+  if (res.salud != null) c['Salud de sus datos'] = res.salud + ' %';
+  if (res.avisos && res.avisos.length) c['Avisos que vio'] = res.avisos.join(' · ');
+  if (res.resultado_ventas != null) c[res.resultado_ventas < 0 ? 'Pérdidas por ventas este año (sin revisar)' : 'Ganancias por ventas este año (sin revisar)'] = eurosYsi(res.resultado_ventas);
+  if (res.impuesto != null) c['Impuesto orientativo si el año acabara hoy'] = eurosYsi(res.impuesto);
+  if (res.no_realizado != null) c['PyG no realizado'] = eurosYsi(res.no_realizado);
+  if (res.valor_cartera != null) c['Valor de la cartera hoy'] = eurosYsi(res.valor_cartera);
+  c['Revisión a partir de (lo que vio)'] = eurosYsi(res.precio);
+  if (res.onchain) c['Actividad en blockchain'] = 'Sí: el presupuesto puede cambiar';
+  if (res.complejas) c['Operaciones complejas'] = 'Sí (futuros, DeFi, staking o NFT)';
+  if (res.aviso_721) c['Modelo 721'] = 'Supera 50.000 €: revisar si debe presentarlo';
+  if (extra.motivo) c['Cómo llegó'] = extra.motivo;
+  return c;
+}
+
+async function prepararYsi() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS ysi_contactos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    correo VARCHAR(190) NOT NULL,
+    nombre VARCHAR(120) NULL,
+    telefono VARCHAR(30) NULL,
+    token CHAR(48) NOT NULL,
+    quiere_asesor TINYINT(1) NOT NULL DEFAULT 0,
+    novedades TINYINT(1) NOT NULL DEFAULT 1,
+    resumen TEXT NULL,
+    cartera MEDIUMTEXT NULL,
+    solicitud_id INT NULL,
+    usos INT NOT NULL DEFAULT 1,
+    baja_en DATETIME NULL,
+    ultimo_aviso_en DATETIME NULL,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_ysi_correo (correo), UNIQUE KEY uq_ysi_token (token)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS ysi_usos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sesion CHAR(32) NULL,
+    paso VARCHAR(12) NOT NULL,
+    exchanges VARCHAR(400) NULL,
+    plataformas SMALLINT NULL, operaciones INT NULL, anos SMALLINT NULL, salud TINYINT NULL, avisos SMALLINT NULL,
+    onchain TINYINT(1) NOT NULL DEFAULT 0,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_ysi_usos (paso, creado_en), INDEX idx_ysi_sesion (sesion)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+
+const PASOS_YSI = ['analisis', 'resultado', 'correo', 'revision'];
+const sesionYsi = v => (/^[a-f0-9]{32}$/i.test(String(v || '')) ? String(v).toLowerCase() : null);
+async function anotarUsoYsi(sesion, paso, res) {
+  try {
+    await pool.execute('INSERT INTO ysi_usos (sesion, paso, exchanges, plataformas, operaciones, anos, salud, avisos, onchain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [sesion, paso, (res.exchanges || []).join(', ').slice(0, 400) || null, res.plataformas, res.operaciones, res.anos, res.salud, (res.avisos || []).length, res.onchain ? 1 : 0]);
+  } catch (e) { console.error('Uso del simulador no anotado:', e.message); }
+}
+const correoValidoYsi = c => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(c || '').trim()) && String(c).trim().length <= 190;
+
+// Crea la solicitud de presupuesto (o la reutiliza si ya hay una pendiente de este correo desde el simulador)
+async function solicitudDesdeYsi({ correo, telefono, nombre, nota, res, motivo }) {
+  const [ya] = await pool.execute("SELECT id FROM solicitudes_presupuesto WHERE correo = ? AND origen = 'ysi' AND atendida = 0 ORDER BY id DESC LIMIT 1", [correo]);
+  const cuest = JSON.stringify(cuestionarioYsi(res, { nombre, motivo }));
+  if (ya.length) {
+    await pool.execute('UPDATE solicitudes_presupuesto SET cuestionario = ?, detalle = COALESCE(?, detalle), telefono = IF(? <> \'\', ?, telefono) WHERE id = ?', [cuest, nota || null, telefono || '', telefono || '', ya[0].id]);
+    return { id: ya[0].id, nueva: false };
+  }
+  const [ins] = await pool.execute(
+    'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `cuestionario_en`) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())',
+    [JSON.stringify([YSI_SERVICIO]), nota || null, telefono || '', correo, null, 'ysi', cuest]);
+  avisarCaptacion('Nueva petición desde el simulador ¿Y si…?', 'Quiere que un asesor revise su cartera. Está en «Solicitudes y llamadas».', { etiqueta: 'memo' });
+  return { id: ins.insertId, nueva: true };
+}
+
+// Alta o actualización del contacto (un registro por correo)
+async function guardarContactoYsi({ correo, nombre, telefono, quiereAsesor, novedades, res, cartera }) {
+  const [f] = await pool.execute('SELECT id, token FROM ysi_contactos WHERE correo = ?', [correo]);
+  const resumen = JSON.stringify(res);
+  if (f.length) {
+    await pool.execute('UPDATE ysi_contactos SET resumen = ?, cartera = COALESCE(?, cartera), nombre = COALESCE(?, nombre), telefono = COALESCE(?, telefono), quiere_asesor = GREATEST(quiere_asesor, ?), novedades = ?, usos = usos + 1, baja_en = NULL WHERE id = ?',
+      [resumen, cartera, nombre || null, telefono || null, quiereAsesor ? 1 : 0, novedades ? 1 : 0, f[0].id]);
+    return { id: f[0].id, token: f[0].token, nuevo: false };
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  const [ins] = await pool.execute('INSERT INTO ysi_contactos (correo, nombre, telefono, token, quiere_asesor, novedades, resumen, cartera) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [correo, nombre || null, telefono || null, token, quiereAsesor ? 1 : 0, novedades ? 1 : 0, resumen, cartera]);
+  return { id: ins.insertId, token, nuevo: true };
+}
+
+function correoBienvenidaYsi(correo, token, quiereAsesor) {
+  if (!brevoActivo()) return;
+  const volver = SITE_URL ? SITE_URL + '/simulador?volver=' + token : null;
+  const baja = SITE_URL ? SITE_URL + '/simulador?baja=' + token : null;
+  const c = plantillaCorreo({
+    titulo: 'Tu cartera está guardada',
+    parrafos: ['Hola:', 'Ya puedes ver los escenarios de tu cartera en el simulador ¿Y si…? de Acros. La hemos guardado para que vuelvas cuando quieras sin subir nada otra vez.',
+      'Te avisaremos antes del 31 de diciembre y cada vez que haya novedades o maneras de optimizar tu resultado fiscal.',
+      quiereAsesor ? 'Además, un asesor de Acros te escribirá para comentar tu cartera.' : 'Si algo no te cuadra, puedes pedir que un asesor revise tu cartera desde el mismo simulador.',
+      'Recuerda que el resultado es orientativo: está calculado con tus datos sin revisar.'],
+    boton: volver ? { texto: 'Volver a mi cartera', url: volver } : null,
+    nota: baja ? 'Si no quieres recibir más correos del simulador, date de baja aquí: ' + baja : 'Si no has sido tú, ignora este correo.',
+  });
+  enviarCorreo(correo, 'Tu cartera está guardada en el simulador ¿Y si…?', c.html, c.texto)
+    .catch(err => console.error('Correo del simulador no enviado:', err.message));
+}
+
+// --- Rutas públicas (las llama la página del simulador) ---
+app.post('/api/ysi/uso', async (req, res) => {
+  const b = req.body || {};
+  const paso = PASOS_YSI.includes(b.paso) ? b.paso : null;
+  if (!paso || paso === 'correo' || paso === 'revision') return res.status(400).json({ error: 'Paso no válido' });
+  await anotarUsoYsi(sesionYsi(b.sesion), paso, limpiarResumenYsi(b.resumen));
+  res.status(201).json({ ok: true });
+});
+
+app.post('/api/ysi/precio', (req, res) => {
+  const r = limpiarResumenYsi((req.body || {}).resumen || req.body);
+  res.json({ precio: r.precio, onchain: r.onchain, aviso_721: r.aviso_721 });
+});
+
+app.post('/api/ysi/correo', async (req, res) => {
+  const b = req.body || {};
+  if (esSpam(b)) return res.status(201).json({ ok: true });
+  const correo = String(b.correo || '').trim().toLowerCase();
+  if (!correoValidoYsi(correo)) return res.status(400).json({ error: 'Escribe un correo válido' });
+  let cartera = null;
+  if (b.cartera != null) {
+    cartera = typeof b.cartera === 'string' ? b.cartera : JSON.stringify(b.cartera);
+    if (cartera.length > YSI_MAX_CARTERA) return res.status(413).json({ error: 'La cartera es demasiado grande para guardarla' });
+  }
+  const r = limpiarResumenYsi(b.resumen);
+  const quiereAsesor = !!b.quiere_asesor;
+  try {
+    const c = await guardarContactoYsi({ correo, quiereAsesor, novedades: b.novedades !== false, res: r, cartera });
+    await anotarUsoYsi(sesionYsi(b.sesion), 'correo', r);
+    let solicitud = null;
+    if (quiereAsesor) {
+      solicitud = await solicitudDesdeYsi({ correo, res: r, motivo: 'Dejó su correo y marcó «Quiero que un asesor de Acros me escriba»' });
+      await pool.execute('UPDATE ysi_contactos SET solicitud_id = ? WHERE id = ?', [solicitud.id, c.id]);
+      if (solicitud.nueva) await anotarUsoYsi(sesionYsi(b.sesion), 'revision', r);
+    }
+    correoBienvenidaYsi(correo, c.token, quiereAsesor);
+    res.status(201).json({ ok: true, token: c.token, precio: r.precio });
+  } catch (err) {
+    console.error('Error al guardar el correo del simulador:', err);
+    res.status(500).json({ error: 'No se pudo guardar' });
+  }
+});
+
+app.post('/api/ysi/revision', async (req, res) => {
+  const b = req.body || {};
+  if (esSpam(b)) return res.status(201).json({ ok: true });
+  const correo = String(b.correo || '').trim().toLowerCase();
+  const nombre = String(b.nombre || '').trim().slice(0, 120);
+  const telefono = String(b.telefono || '').trim().slice(0, 30);
+  const nota = String(b.nota || '').trim().slice(0, 2000) || null;
+  if (!correoValidoYsi(correo)) return res.status(400).json({ error: 'Escribe un correo válido' });
+  if (!nombre) return res.status(400).json({ error: 'Escribe tu nombre' });
+  if (telefono && telefono.replace(/\D/g, '').length < 9) return res.status(400).json({ error: 'El teléfono no es válido' });
+  const r = limpiarResumenYsi(b.resumen);
+  try {
+    const sol = await solicitudDesdeYsi({ correo, telefono, nombre, nota, res: r, motivo: 'Pidió que un asesor revise su cartera' });
+    const c = await guardarContactoYsi({ correo, nombre, telefono, quiereAsesor: true, novedades: b.novedades !== false, res: r, cartera: null });
+    await pool.execute('UPDATE ysi_contactos SET solicitud_id = ? WHERE id = ?', [sol.id, c.id]);
+    if (sol.nueva) await anotarUsoYsi(sesionYsi(b.sesion), 'revision', r);
+    res.status(201).json({ ok: true, precio: r.precio });
+  } catch (err) {
+    console.error('Error al guardar la revisión del simulador:', err);
+    res.status(500).json({ error: 'No se pudo guardar la petición' });
+  }
+});
+
+// Volver a la cartera guardada desde el enlace del correo
+app.get('/api/ysi/volver/:token([a-f0-9]{48})', async (req, res) => {
+  const [f] = await pool.execute('SELECT resumen, cartera FROM ysi_contactos WHERE token = ? AND baja_en IS NULL', [req.params.token]);
+  if (!f.length) return res.status(404).json({ error: 'Este enlace ya no es válido' });
+  let resumen = {}; try { resumen = JSON.parse(f[0].resumen || '{}'); } catch (e) {}
+  let cartera = null; try { cartera = f[0].cartera ? JSON.parse(f[0].cartera) : null; } catch (e) {}
+  res.json({ resumen, cartera });
+});
+
+// Baja: deja de recibir correos y se borra la cartera guardada (el contacto se queda para no volver a escribirle)
+app.post('/api/ysi/baja/:token([a-f0-9]{48})', async (req, res) => {
+  const [r] = await pool.execute('UPDATE ysi_contactos SET baja_en = NOW(), novedades = 0, cartera = NULL WHERE token = ? AND baja_en IS NULL', [req.params.token]);
+  res.json({ ok: true, ya_estaba: r.affectedRows === 0 });
+});
+
+// --- Panel: «Simulador ¿Y si…?» (jefes, encargados y marketing; admin siempre) ---
+app.get('/api/admin/ysi/contactos', requiereSesionAsesor, requiereRol('jefe', 'encargado', 'marketing'), async (req, res) => {
+  const [filas] = await pool.query(`SELECT y.id, y.correo, y.nombre, y.telefono, y.quiere_asesor, y.novedades, y.resumen, y.solicitud_id, y.usos, y.baja_en, y.creado_en, y.actualizado_en,
+      (y.cartera IS NOT NULL) AS cartera_guardada, s.atendida AS solicitud_atendida, s.atendida_motivo AS solicitud_motivo,
+      (SELECT c.id FROM clientes c WHERE c.correo = y.correo LIMIT 1) AS cliente_id,
+      (SELECT COUNT(*) FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE c.correo = y.correo AND p.estado = 'aceptada') AS contratado
+    FROM ysi_contactos y LEFT JOIN solicitudes_presupuesto s ON s.id = y.solicitud_id
+    ORDER BY y.actualizado_en DESC LIMIT 500`);
+  res.json(filas.map(x => { let r = {}; try { r = JSON.parse(x.resumen || '{}'); } catch (e) {} return { ...x, resumen: r }; }));
+});
+
+app.get('/api/admin/ysi/metricas', requiereSesionAsesor, requiereRol('jefe', 'encargado', 'marketing'), async (req, res) => {
+  const dias = [7, 30, 365].includes(Number(req.query.dias)) ? Number(req.query.dias) : 30;
+  const [pasos] = await pool.query('SELECT paso, COUNT(*) n, COUNT(DISTINCT COALESCE(sesion, CONCAT(\'u\', id))) personas FROM ysi_usos WHERE creado_en >= NOW() - INTERVAL ? DAY GROUP BY paso', [dias]);
+  const de = p => { const x = pasos.find(y => y.paso === p); return x ? Number(x.personas || x.n) : 0; };
+  const [[cont]] = await pool.query(`SELECT COUNT(*) correos, SUM(quiere_asesor) asesor, SUM(baja_en IS NOT NULL) bajas FROM ysi_contactos WHERE creado_en >= NOW() - INTERVAL ? DAY`, [dias]);
+  const [[contr]] = await pool.query(`SELECT COUNT(DISTINCT y.id) n FROM ysi_contactos y JOIN clientes c ON c.correo = y.correo JOIN propuestas p ON p.cliente_id = c.id AND p.estado = 'aceptada' WHERE y.creado_en >= NOW() - INTERVAL ? DAY`, [dias]);
+  const [plat] = await pool.query("SELECT exchanges FROM ysi_usos WHERE paso = 'analisis' AND creado_en >= NOW() - INTERVAL ? DAY AND exchanges IS NOT NULL", [dias]);
+  const cuenta = {}; plat.forEach(f => String(f.exchanges).split(',').map(s => s.trim()).filter(Boolean).forEach(e => { cuenta[e] = (cuenta[e] || 0) + 1; }));
+  res.json({
+    dias,
+    embudo: { analisis: de('analisis'), resultado: de('resultado'), correo: de('correo'), revision: de('revision'), contratado: Number(contr.n || 0) },
+    correos: Number(cont.correos || 0), quieren_asesor: Number(cont.asesor || 0), bajas: Number(cont.bajas || 0),
+    exchanges: Object.entries(cuenta).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([nombre, n]) => ({ nombre, n })),
+  });
+});
+
 async function prepararFormatosArchivo() {
   await pool.query(`CREATE TABLE IF NOT EXISTS formatos_archivo (
     id INT AUTO_INCREMENT PRIMARY KEY, exchange VARCHAR(80) NOT NULL, tipo VARCHAR(20) NOT NULL DEFAULT 'exchange',
@@ -8845,6 +9131,7 @@ async function prepararFormatosArchivo() {
   }
   await agregaColumnaSiFalta('documentos_fiscales', '`nombre_anterior`', 'VARCHAR(255) NULL');   // 03/11: nombre que tenía antes de que el asesor lo renombrara
   await agregaColumnaSiFalta('documentos_fiscales', '`renombrado_en`', 'DATETIME NULL');
+  await agregaColumnaSiFalta('propuestas', '`amplia_a`', 'INT NULL');   // 05/11: la propuesta amplía este encargo aceptado
 }
 const limpiaLista = (xs, max) => (Array.isArray(xs) ? xs : []).map(x => String(x || '').trim().toLowerCase().slice(0, 120)).filter(Boolean).slice(0, max);
 function filaFormato(f) {
@@ -8900,6 +9187,486 @@ app.put('/api/admin/documentos/:id(\\d+)/nombre', requiereSesionAsesor, async (r
     await pool.execute('UPDATE documentos_fiscales SET nombre = ?, nombre_anterior = ?, renombrado_en = ? WHERE id = ?', [nombre, f[0].nombre, aSQLDatetime(ahora()), f[0].id]);
     res.json({ ok: true, nombre, nombre_anterior: f[0].nombre });
   } catch (e) { console.error('Renombrar documento:', e.message); res.status(500).json({ error: 'No se pudo renombrar' }); }
+});
+
+// ================================================================
+// TEMPORADAS DE LA WEB (06/11, Vikn): Navidad, Semana Santa, campaña de la renta (junio), Pizza Day y halving.
+// Por defecto van solas por fechas (las calcula acros_web.js en el navegador). Desde el panel (Web → Temporadas)
+// se puede: dejarlas en automático, forzar una, apagarlas todas, apagar alguna concreta y fijar la fecha del halving.
+// Pizza Day trae un minijuego que da un código promocional; la solicitud de presupuesto lo guarda (solo códigos conocidos).
+// ================================================================
+const TEMPORADAS = ['navidad', 'semana-santa', 'renta', 'pizza', 'halving'];
+const CODIGOS_PROMO = { PIZZA22: 'Pizza Day' };
+const codigoPromoValido = c => { const k = String(c || '').trim().toUpperCase(); return CODIGOS_PROMO[k] ? k : null; };
+const TEMPORADA_POR_DEFECTO = { modo: 'auto', forzada: null, apagadas: [], halving_fecha: null };
+async function prepararTemporadas() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS web_temporadas (
+    id TINYINT PRIMARY KEY, datos TEXT NOT NULL, asesor_id INT NULL, actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await agregaColumnaSiFalta('solicitudes_presupuesto', '`codigo_promo`', 'VARCHAR(30) NULL');   // p. ej. PIZZA22 (minijuego del Pizza Day)
+}
+async function leerTemporadas() {
+  const [f] = await pool.query('SELECT datos FROM web_temporadas WHERE id = 1');
+  if (!f.length) return { ...TEMPORADA_POR_DEFECTO };
+  try { return { ...TEMPORADA_POR_DEFECTO, ...JSON.parse(f[0].datos) }; } catch (e) { return { ...TEMPORADA_POR_DEFECTO }; }
+}
+app.get('/api/web/temporada', async (req, res) => {
+  try { res.set('Cache-Control', 'no-cache'); res.json(await leerTemporadas()); }
+  catch (e) { res.json({ ...TEMPORADA_POR_DEFECTO }); }   // si falla, la web sigue en automático
+});
+app.get('/api/admin/web-temporadas', requiereSesionAsesor, async (req, res) => {
+  try { res.json({ config: await leerTemporadas(), temporadas: TEMPORADAS, codigos: CODIGOS_PROMO }); }
+  catch (e) { res.status(500).json({ error: 'No se pudo leer' }); }
+});
+app.put('/api/admin/web-temporadas', requiereSesionAsesor, requiereRol('marketing'), async (req, res) => {
+  const b = req.body || {};
+  const modo = ['auto', 'forzar', 'apagado'].includes(b.modo) ? b.modo : null;
+  if (!modo) return res.status(400).json({ error: 'Modo no válido' });
+  const forzada = TEMPORADAS.includes(b.forzada) ? b.forzada : null;
+  if (modo === 'forzar' && !forzada) return res.status(400).json({ error: 'Elige qué temporada forzar' });
+  const apagadas = (Array.isArray(b.apagadas) ? b.apagadas : []).filter(x => TEMPORADAS.includes(x));
+  const hf = b.halving_fecha ? String(b.halving_fecha) : null;
+  if (hf && !/^\d{4}-\d{2}-\d{2}$/.test(hf)) return res.status(400).json({ error: 'Fecha del halving no válida (AAAA-MM-DD)' });
+  const datos = { modo, forzada: modo === 'forzar' ? forzada : null, apagadas: [...new Set(apagadas)], halving_fecha: hf };
+  try {
+    await pool.execute('INSERT INTO web_temporadas (id, datos, asesor_id) VALUES (1, ?, ?) ON DUPLICATE KEY UPDATE datos = VALUES(datos), asesor_id = VALUES(asesor_id)', [JSON.stringify(datos), req.asesor.id]);
+    res.json({ ok: true, config: datos });
+  } catch (e) { console.error('Temporadas:', e.message); res.status(500).json({ error: 'No se pudo guardar' }); }
+});
+
+// ================================================================
+// PREGUNTAS DINÁMICAS (11/11, Vikn) — banco de formularios por servicio, por baterías.
+// - La definición vive aquí (tabla formularios_def, versionada: cada «Guardar» del editor crea una versión nueva y queda quién y cuándo).
+// - Batería 1 (web, obligatoria): la responde el cliente antes de la solicitud; viaja con /api/presupuesto (columna cuestionario,
+//   con forma {_v2: …}) y el servidor guarda además el resumen legible con los textos de la versión usada.
+// - Baterías siguientes (Área): fase 2 de la obra (formularios_cliente).
+// Las ids de preguntas y respuestas son estables: lo ya respondido nunca se pierde aunque se cambien textos o se retiren opciones.
+// ================================================================
+const FORMULARIOS = ['cripto'];
+const ANIO_ACTUAL = new Date().getFullYear();
+const op = (id, t, extra) => Object.assign({ id, t, s: '', mapa: true, img: null, burbujas: null }, extra || {});
+const PLANTILLA_DEF = { izq: ['paso', 'pregunta', 'respuestas', 'recordatorio', 'info'], der: ['nube'], anchoIzq: 62, zona: 330, aire: { paso: 0, pregunta: 0, respuestas: 22, recordatorio: 14, info: 16, nube: 0 } };
+const EXCHANGES = ['Binance', 'Coinbase', 'Kraken', 'Bit2Me', 'Bitpanda', 'Revolut', 'KuCoin', 'Bybit', 'OKX', 'Crypto.com', 'Bitget', 'eToro', 'Trade Republic', 'Bitstamp', 'Gate.io', 'Otros'];
+const REDES = ['Bitcoin', 'Ethereum', 'BNB Chain', 'Solana', 'Tron', 'Cardano', 'Hyperliquid', 'Polygon', 'Arbitrum', 'Base', 'Optimism', 'Otras'];
+// 11/11: las «más» (mas: true) solo se ven al marcar «Otros»/«Otras»; en el cierre del expediente se buscan todas
+const EXCHANGES_MAS = ['Bitfinex', 'Gemini', 'HTX (Huobi)', 'MEXC', 'Phemex', 'Deribit', 'BitMart', 'Poloniex', 'Bitvavo', 'Young Platform', 'Bitso', 'Nexo', 'Celsius', 'BlockFi', 'FTX', 'Binance US', 'LBank', 'CEX.IO', 'Pionex', 'BingX', 'BloFin', '3Commas', 'Quantfury', 'Exodus', 'Ledger Live', 'Trust Wallet', 'MetaMask', 'Uphold', 'Bitget Wallet', 'Coinbase Wallet'];
+const REDES_MAS = ['Avalanche', 'Lightning', 'Cosmos', 'Osmosis', 'Polkadot', 'Near', 'Aptos', 'Sui', 'Sei', 'Injective', 'TON', 'Berachain', 'Sonic (Fantom)', 'Gnosis', 'zkSync Era', 'Linea', 'Scroll', 'Starknet', 'Blast', 'Mantle', 'Unichain', 'Ink', 'Soneium', 'World Chain', 'Zora', 'Abstract', 'Celo', 'Cronos', 'Ronin', 'Immutable', 'Manta', 'Metis', 'Kava', 'Moonbeam', 'Hedera', 'Algorand', 'Tezos', 'XRP Ledger', 'Stellar', 'Litecoin', 'Kaspa', 'Mode', 'Taiko', 'Monad'];
+const slug = t => String(t).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+function definicionInicialCripto() {
+  const b = (n, g, r) => ({ t: n, grupo: g, r: r || 28 });
+  return {
+    formulario: 'cripto', nombre: 'Cripto', servicios: 'cripto',
+    flujo: [
+      { id: 'b1', tipo: 'bateria', nombre: 'Batería 1 · Primeras preguntas', donde: 'web', obligatoria: true,
+        intro: ['<b>Son {n} preguntas y se responden en un minuto.</b> Con ellas preparamos tu propuesta sin tener que llamarte.',
+                '<b>No es un examen.</b> Si dudas, elige lo que más se parezca a tu caso. Cuanto más sincero seas, más rápido y más barato será tu servicio.',
+                '<b>Si alguna respuesta no es exacta, no pasa nada:</b> lo veremos al revisar tus documentos. Eso sí, nos llevará más tiempo entender tu caso y el servicio podría encarecerse.'],
+        espera: 10, recordatorio: 'Responder con sinceridad hace tu servicio más rápido y más barato.', plantilla: PLANTILLA_DEF,
+        preguntas: [
+          { id: 'anio', texto: '¿Desde qué año tienes criptomonedas?', tipo: 'anio', forma: 'barra', desde: 2013, hasta: ANIO_ACTUAL, nota: 'Si no recuerdas el año exacto, elige el más cercano.',
+            expl: 'Nos dice cuántos años de historial habrá que revisar. Cuenta la primera vez que compraste o recibiste cualquier criptomoneda, aunque fuera una cantidad pequeña o una prueba.', opciones: [] },
+          { id: 'donde', texto: '¿Dónde has tenido tus criptos?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media',
+            expl: 'Un exchange guarda tus criptos por ti, como haría un banco, y nos puede dar tu historial. En una wallet propia las custodias tú y tus movimientos quedan en la blockchain, así que habrá que buscarlos allí.',
+            opciones: [op('cex', 'Solo en exchanges o apps', { s: 'Binance, Coinbase, Revolut, Bit2Me…', burbujas: [b('Exchanges', 'cex', 30)] }),
+                       op('wallet', 'También en una wallet propia', { s: 'MetaMask, Ledger, Trust Wallet…', burbujas: [b('Exchanges', 'cex', 28), b('Wallet propia', 'cadena', 30), b('Blockchain', 'cadena', 20), b('DeFi', 'cadena', 18)] }),
+                       op('nose', 'No estoy seguro', { burbujas: [b('Exchanges', 'cex', 30)] })] },
+          { id: 'cuantos', texto: '¿En cuántos exchanges o apps has operado alguna vez?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media',
+            expl: 'Cada exchange tiene su propio historial que hay que descargar y unir con los demás. Incluye los que ya no uses, los que cerraron y la app de tu banco si alguna vez compraste criptos con ella.',
+            opciones: [op('3', '3 o menos', { burbujas: Array(3).fill(0).map(() => b('', 'cex', 15)) }), op('5', 'Entre 4 y 5', { burbujas: Array(5).fill(0).map(() => b('', 'cex', 14)) }),
+                       op('6', '6 o más', { s: 'Cuenta también los que ya no usas o que cerraron', burbujas: Array(7).fill(0).map(() => b('', 'cex', 13)) })] },
+          { id: 'recibidas', texto: '¿Has recibido criptos sin comprarlas?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media',
+            expl: 'Cuando recibes criptos sin pagar por ellas, por ejemplo como intereses por tener otras, Hacienda lo considera un ingreso en el momento en que te llegan. Y si después las vendes, esa venta se declara de nuevo por separado.',
+            opciones: [op('si', 'Sí', { s: 'Recompensas, staking, airdrops o pagos por un trabajo', burbujas: [b('Recompensas', 'ingresos', 22), b('Staking', 'ingresos', 17), b('Airdrops', 'ingresos', 16)] }),
+                       op('no', 'No', { mapa: false }), op('nose', 'No estoy seguro', { mapa: false })] },
+          { id: 'problema', texto: '¿Has tenido algún problema con tus criptos?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'media',
+            expl: 'Un exchange que cierra, perder el acceso o sufrir una estafa no te libra de declarar, pero en algunos casos permite reflejar esa pérdida. Contárnoslo nos ayuda a buscar la mejor solución para tu caso.',
+            opciones: [op('si', 'Sí', { s: 'Un exchange que cerró, perder el acceso o una estafa', burbujas: [b('Incidencia', 'aviso', 19)] }), op('no', 'No', { mapa: false })] }
+        ] },
+      { id: 's-solicitud', tipo: 'sistema', nombre: 'Solicitud de presupuesto' },
+      { id: 's-cuenta', tipo: 'sistema', nombre: 'Crear la cuenta' },
+      { id: 'b2', tipo: 'bateria', nombre: 'Batería 2 · Para tu presupuesto', donde: 'area', obligatoria: true, intro: [], espera: 0,
+        recordatorio: 'Responder con sinceridad hace tu servicio más rápido y más barato.', plantilla: PLANTILLA_DEF,
+        preguntas: [
+          { id: 'exchanges', texto: '¿En qué exchanges o apps has operado?', tipo: 'varias', forma: 'rejilla', col: 4, opciones: EXCHANGES.map(t => op(slug(t), t, { burbujas: [b(t, 'cex', 22)] })).concat(EXCHANGES_MAS.map(t => op(slug(t), t, { mas: true, burbujas: [b(t, 'cex', 20)] }))) },
+          { id: 'ventas', texto: '¿Has vendido o cambiado criptomonedas?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media', opciones: [op('si', 'Sí', { s: 'Por euros o por otras criptos', burbujas: [b('Ventas', 'base', 20)] }), op('no', 'No', { mapa: false }), op('nose', 'No estoy seguro', { mapa: false })] },
+          { id: 'futuros', texto: '¿Has operado con futuros o con apalancamiento?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'media', opciones: [op('si', 'Sí', { burbujas: [b('Futuros', 'base', 20)] }), op('no', 'No', { mapa: false })] },
+          { id: 'futuros_donde', texto: '¿Dónde has operado con futuros?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media', dep: { pregunta: 'futuros', respuestas: ['si'], y: { pregunta: 'donde', respuestas: ['wallet'] } },
+            opciones: [op('cex', 'En exchanges', { mapa: false }), op('defi', 'En plataformas DeFi', { burbujas: [b('Futuros DeFi', 'cadena', 18)] }), op('ambos', 'En ambos', { burbujas: [b('Futuros DeFi', 'cadena', 18)] })] },
+          { id: 'valor', texto: '¿Cuánto valían tus criptos a 31 de diciembre del año pasado?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media', expl: 'Solo para saber si debes presentar el modelo 721 o el Impuesto sobre el Patrimonio.',
+            opciones: [op('menos50', 'Menos de 50.000 €', { mapa: false }), op('50a700', 'De 50.000 a 700.000 €', { mapa: false }), op('mas700', 'Más de 700.000 €', { mapa: false })] },
+          { id: 'redes', texto: '¿Qué redes has usado?', tipo: 'varias', forma: 'rejilla', col: 4, dep: { pregunta: 'donde', respuestas: ['wallet'] }, opciones: REDES.map(t => op(slug(t), t, { burbujas: [b(t, 'cadena', 20)] })).concat(REDES_MAS.map(t => op(slug(t), t, { mas: true, burbujas: [b(t, 'cadena', 18)] }))) },
+          { id: 'fuera', texto: '¿Qué has hecho fuera de los exchanges?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'donde', respuestas: ['wallet'] },
+            opciones: ['Staking', 'Préstamos (lending)', 'Pools de liquidez', 'Airdrops', 'Presales', 'NFTs', 'Intercambios en DEX'].map(t => op(slug(t), t, { burbujas: [b(t, 'cadena', 17)] })) },
+          { id: 'forma', texto: '¿De qué forma recibiste esas criptos?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'recibidas', respuestas: ['si'] },
+            opciones: ['Staking o recompensas', 'Airdrops', 'Préstamos', 'Minería', 'Pagos por un trabajo o servicio'].map(t => op(slug(t), t, { burbujas: [b(t, 'ingresos', 16)] })) },
+          { id: 'que_paso', texto: '¿Qué pasó?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'problema', respuestas: ['si'] },
+            opciones: ['Un exchange cerró o quebró', 'Perdí el acceso', 'Estafa', 'Hackeo'].map(t => op(slug(t), t, { mapa: false })) },
+          { id: 'denuncia', texto: '¿Tienes denuncia policial?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'media', dep: { pregunta: 'que_paso', respuestas: ['estafa'] }, opciones: [op('si', 'Sí', { mapa: false }), op('no', 'No', { mapa: false })] },
+          { id: 'comentario', texto: '¿Algo más que quieras contarnos?', tipo: 'texto', forma: 'texto', opciones: [] }
+        ] },
+      { id: 's-propuesta', tipo: 'sistema', nombre: 'Propuesta' },
+      { id: 's-servicio', tipo: 'sistema', nombre: 'Servicio en marcha' },
+      { id: 'b3', tipo: 'bateria', nombre: 'Batería final · ¿Acertaste?', donde: 'area', obligatoria: false, espera: 0, recordatorio: 'No hay respuestas buenas ni malas: es un juego.', plantilla: PLANTILLA_DEF,
+        intro: ['<b>Tu informe ya está listo.</b> Antes de enseñarte tu mapa cripto definitivo, juguemos un momento.', '<b>Adivina {n} cosas</b> sobre tus criptos y luego te enseñamos cuánto te acercaste.'],
+        preguntas: [
+          { id: 'g_operaciones', texto: '¿Cuántas operaciones crees que hiciste?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'baja', expl: 'Cuenta cada compra, venta, cambio, envío o recompensa.', opciones: [op('o50', 'Menos de 50', { mapa: false }), op('o200', 'Entre 50 y 200', { mapa: false }), op('o1000', 'Entre 200 y 1.000', { mapa: false }), op('omas', 'Más de 1.000', { mapa: false })] },
+          { id: 'g_resultado', texto: '¿Crees que ganaste o perdiste?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media', opciones: [op('gano', 'Gané', { mapa: false }), op('perdio', 'Perdí', { mapa: false }), op('igual', 'Me quedé más o menos igual', { mapa: false })] },
+          { id: 'g_exchanges', texto: '¿En cuántos exchanges o apps crees que estuviste?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'baja', opciones: [op('e1', 'Solo 1', { mapa: false }), op('e3', '2 o 3', { mapa: false }), op('e5', '4 o 5', { mapa: false }), op('emas', '6 o más', { mapa: false })] },
+          { id: 'g_redes', texto: '¿Y en cuántas redes (blockchains)?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'baja', opciones: [op('r0', 'Ninguna', { mapa: false }), op('r2', '1 o 2', { mapa: false }), op('r5', 'De 3 a 5', { mapa: false }), op('rmas', 'Más de 5', { mapa: false })] }
+        ] }
+    ]
+  };
+}
+
+async function prepararFormularios() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS formularios_def (
+    id INT AUTO_INCREMENT PRIMARY KEY, formulario VARCHAR(40) NOT NULL, version INT NOT NULL, definicion MEDIUMTEXT NOT NULL,
+    asesor_id INT NULL, nota VARCHAR(200) NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_form_version (formulario, version)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  for (const f of FORMULARIOS) {
+    const [h] = await pool.query('SELECT 1 FROM formularios_def WHERE formulario = ? LIMIT 1', [f]);
+    if (!h.length) await pool.query('INSERT INTO formularios_def (formulario, version, definicion, nota) VALUES (?, 1, ?, ?)', [f, JSON.stringify(definicionInicialCripto()), 'Versión inicial']);
+  }
+}
+async function leerDefinicion(form, version) {
+  const [f] = version
+    ? await pool.query('SELECT version, definicion FROM formularios_def WHERE formulario = ? AND version = ?', [form, version])
+    : await pool.query('SELECT version, definicion FROM formularios_def WHERE formulario = ? ORDER BY version DESC LIMIT 1', [form]);
+  if (!f.length) return null;
+  const d = JSON.parse(f[0].definicion); d.version = f[0].version; return d;
+}
+
+/* ---------- Validación de una definición (la usa el editor al guardar) ---------- */
+function validarDefinicion(d) {
+  if (!d || !Array.isArray(d.flujo) || !d.flujo.length) return 'La definición no tiene recorrido';
+  const pos = id => d.flujo.findIndex(p => p.id === id);
+  for (const s of ['s-solicitud', 's-cuenta', 's-propuesta']) if (pos(s) < 0) return 'Falta el paso del sistema «' + s + '»';
+  const ids = new Set(), orden = [];
+  for (const [i, p] of d.flujo.entries()) {
+    if (p.tipo !== 'bateria') continue;
+    if (!/^[a-z0-9_-]{1,40}$/.test(p.id || '')) return 'Batería con identificador no válido';
+    if (p.donde === 'web' && i > pos('s-solicitud')) return '«' + p.nombre + '» va en la web: tiene que ir antes de la solicitud';
+    if (p.donde === 'area' && i < pos('s-cuenta')) return '«' + p.nombre + '» va en el Área: tiene que ir después de crear la cuenta';
+    for (const q of (p.preguntas || [])) {
+      if (!/^[a-z0-9_-]{1,40}$/.test(q.id || '') || ids.has(q.id)) return 'Pregunta con identificador repetido o no válido: ' + (q.id || '?');
+      if (!String(q.texto || '').trim()) return 'Hay una pregunta sin texto';
+      if (!['una', 'varias', 'anio', 'texto'].includes(q.tipo)) return 'Tipo de pregunta no válido en «' + q.texto + '»';
+      const oids = new Set(); for (const o of (q.opciones || [])) { if (!o.id || oids.has(o.id)) return 'Respuesta repetida en «' + q.texto + '»'; oids.add(o.id); }
+      if ((q.tipo === 'una' || q.tipo === 'varias') && !(q.opciones || []).length) return '«' + q.texto + '» no tiene respuestas';
+      ids.add(q.id); orden.push(q);
+    }
+  }
+  const idx = new Map(orden.map((q, i) => [q.id, i]));
+  for (const q of orden) for (let dp = q.dep; dp; dp = dp.y) {
+    const base = orden[idx.get(dp.pregunta)];
+    if (!base) return '«' + q.texto + '» depende de una pregunta que ya no existe';
+    if (idx.get(dp.pregunta) > idx.get(q.id)) return '«' + q.texto + '» depende de «' + base.texto + '», que va después';
+    if (!(dp.respuestas || []).every(r => (base.opciones || []).some(o => o.id === r))) return '«' + q.texto + '» depende de una respuesta que ya no existe';
+  }
+  if (JSON.stringify(d).length > 400000) return 'La definición es demasiado grande';
+  return null;
+}
+
+/* ---------- Resumen legible de unas respuestas (con los textos de la versión que se usó) ---------- */
+function visible(q, resp, mapaPreg) {
+  for (let dp = q.dep; dp; dp = dp.y) { const v = resp[dp.pregunta]; const vals = Array.isArray(v) ? v : [v]; if (!vals.some(x => dp.respuestas.includes(x))) return false; }
+  return true;
+}
+function resumenRespuestas(def, bateriaId, resp) {
+  const bat = def.flujo.find(p => p.id === bateriaId); if (!bat) return null;
+  const todas = {}; def.flujo.forEach(p => (p.preguntas || []).forEach(q => { todas[q.id] = q; }));
+  const filas = [];
+  for (const q of bat.preguntas) {
+    if (!visible(q, resp)) continue;
+    const v = resp[q.id]; if (v === undefined || v === null || v === '') continue;
+    let texto;
+    if (q.tipo === 'anio' || q.tipo === 'texto') texto = String(v).slice(0, 2000);
+    else { const vals = Array.isArray(v) ? v : [v]; texto = vals.map(x => /^x:/.test(x) ? x.slice(2) : (q.opciones.find(o => o.id === x) || {}).t).filter(Boolean).join(', '); if (!texto) continue; }
+    filas.push({ id: q.id, pregunta: q.texto, respuesta: texto });
+  }
+  return filas;
+}
+// Lo que llega con /api/presupuesto: {_v2: {formulario, version, bateria, respuestas}} → se completa con el resumen del servidor
+async function cuestionarioConFormulario(c) {
+  if (!c || typeof c !== 'object' || !c._v2) return c;
+  const v = c._v2, form = FORMULARIOS.includes(v.formulario) ? v.formulario : null;
+  if (!form || typeof v.respuestas !== 'object' || !v.respuestas) return null;
+  const def = await leerDefinicion(form, Number(v.version) || null) || await leerDefinicion(form);
+  if (!def) return null;
+  const resp = {}; for (const [k, x] of Object.entries(v.respuestas)) if (/^[a-z0-9_-]{1,40}$/.test(k)) resp[k] = Array.isArray(x) ? x.slice(0, 60).map(String) : String(x).slice(0, 2000);
+  return { _v2: { formulario: form, version: def.version, bateria: String(v.bateria || 'b1'), respuestas: resp, resumen: resumenRespuestas(def, String(v.bateria || 'b1'), resp) || [] } };
+}
+
+/* ---------- Rutas ---------- */
+app.get('/api/formularios/:form', async (req, res) => {
+  if (!FORMULARIOS.includes(req.params.form)) return res.status(404).json({ error: 'Formulario desconocido' });
+  try { res.set('Cache-Control', 'no-cache'); res.json(await leerDefinicion(req.params.form)); }
+  catch (e) { console.error('Formulario:', e.message); res.status(500).json({ error: 'No se pudo leer el formulario' }); }
+});
+app.get('/api/admin/formularios/:form', requiereSesionAsesor, async (req, res) => {
+  if (!FORMULARIOS.includes(req.params.form)) return res.status(404).json({ error: 'Formulario desconocido' });
+  try {
+    const def = await leerDefinicion(req.params.form);
+    const [hist] = await pool.query('SELECT f.version, f.creado_en, f.nota, a.nombre AS asesor FROM formularios_def f LEFT JOIN asesores a ON a.id = f.asesor_id WHERE f.formulario = ? ORDER BY f.version DESC LIMIT 30', [req.params.form]);
+    res.json({ definicion: def, historial: hist, puede_editar: tieneRol(req, 'encargado') });
+  } catch (e) { res.status(500).json({ error: 'No se pudo leer el formulario' }); }
+});
+app.put('/api/admin/formularios/:form', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const form = req.params.form; if (!FORMULARIOS.includes(form)) return res.status(404).json({ error: 'Formulario desconocido' });
+  const d = (req.body || {}).definicion, previa = Number((req.body || {}).version_base) || 0;
+  const error = validarDefinicion(d); if (error) return res.status(400).json({ error });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [u] = await conn.query('SELECT MAX(version) AS v FROM formularios_def WHERE formulario = ? FOR UPDATE', [form]);
+    const ultima = u[0].v || 0;
+    if (previa && previa !== ultima) { await conn.rollback(); return res.status(409).json({ error: 'Alguien ha guardado cambios mientras editabas. Recarga para ver la versión ' + ultima + '.' }); }
+    const limpio = Object.assign({}, d); delete limpio.version;
+    await conn.query('INSERT INTO formularios_def (formulario, version, definicion, asesor_id, nota) VALUES (?, ?, ?, ?, ?)', [form, ultima + 1, JSON.stringify(limpio), req.asesor.id, String((req.body || {}).nota || '').slice(0, 200) || null]);
+    await conn.commit();
+    res.json({ ok: true, version: ultima + 1 });
+  } catch (e) { await conn.rollback().catch(() => {}); console.error('Guardar formulario:', e.message); res.status(500).json({ error: 'No se pudo guardar' }); }
+  finally { conn.release(); }
+});
+// Imágenes de las respuestas (burbujas del mapa): PNG, JPG o WebP; se guardan con las de la web y se sirven en /api/web/imagen/:id
+app.post('/api/admin/formularios/imagen', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const tipo = String((req.body || {}).tipo || '');
+  if (!['image/png', 'image/jpeg', 'image/webp'].includes(tipo)) return res.status(400).json({ error: 'Usa una imagen PNG, JPG o WebP' });
+  let buffer; try { buffer = Buffer.from(String((req.body || {}).datos || ''), 'base64'); } catch (e) { buffer = null; }
+  if (!buffer || !buffer.length) return res.status(400).json({ error: 'La imagen llegó vacía' });
+  if (buffer.length > 400 * 1024) return res.status(400).json({ error: 'La imagen pesa demasiado (máximo 400 KB)' });
+  const firma = buffer.slice(0, 12), esPng = firma[0] === 0x89 && firma[1] === 0x50, esJpg = firma[0] === 0xFF && firma[1] === 0xD8, esWebp = firma.slice(0, 4).toString() === 'RIFF' && firma.slice(8, 12).toString() === 'WEBP';
+  if ((tipo === 'image/png' && !esPng) || (tipo === 'image/jpeg' && !esJpg) || (tipo === 'image/webp' && !esWebp)) return res.status(400).json({ error: 'El archivo no es una imagen válida' });
+  const id = crypto.createHash('sha256').update(buffer).digest('hex').slice(0, 32);
+  try { await pool.execute('INSERT IGNORE INTO web_imagenes (id, tipo, datos, bytes, creado_por_asesor_id) VALUES (?,?,?,?,?)', [id, tipo, buffer, buffer.length, req.asesor.id]); res.json({ ok: true, id, url: '/api/web/imagen/' + id }); }
+  catch (e) { console.error('Imagen de formulario:', e.message); res.status(500).json({ error: 'No se pudo guardar la imagen' }); }
+});
+
+// ================================================================
+// F4 · BATERÍAS DEL ÁREA (11/11): las programa el formulario y las suelta el asesor desde la ficha; el cliente las responde en su Área
+// con el mismo motor; recordatorios a los 2, 5 y 10 días y, si sigue sin responder, aviso al asesor.
+// ================================================================
+const DIAS_RECORDATORIO = (process.env.FORM_DIAS || '2,5,10').split(',').map(Number);
+const SEG_DIA_FORM = Number(process.env.FORM_SEGUNDOS_DIA) || 86400;   // en pruebas se puede acortar
+async function prepararFormulariosCliente() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS formularios_cliente (
+    id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NOT NULL, formulario VARCHAR(40) NOT NULL, bateria VARCHAR(40) NOT NULL, version INT NOT NULL,
+    estado ENUM('enviada','respondida','retirada') NOT NULL DEFAULT 'enviada', respuestas MEDIUMTEXT NULL, resumen MEDIUMTEXT NULL,
+    enviada_por INT NULL, enviada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, respondida_en DATETIME NULL,
+    recordatorios INT NOT NULL DEFAULT 0, ultimo_recordatorio DATETIME NULL, aviso_asesor_en DATETIME NULL,
+    KEY ix_fc_cliente (cliente_id), KEY ix_fc_estado (estado)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+// Todo lo que ya ha contestado el cliente (batería 1 de su solicitud + baterías del Área), para las preguntas condicionales
+async function respuestasPreviasCliente(clienteId) {
+  const [[c]] = await pool.query('SELECT correo, telefono FROM clientes WHERE id = ?', [clienteId]);
+  const out = {}; let b1 = null;
+  if (c) {
+    const [s] = await pool.query("SELECT cuestionario, creado_en FROM solicitudes_presupuesto WHERE cuestionario LIKE '%\"_v2\"%' AND ((correo IS NOT NULL AND correo = ?) OR telefono = ?) ORDER BY id DESC LIMIT 1", [c.correo || '', c.telefono || '']);
+    if (s.length) { try { b1 = JSON.parse(s[0].cuestionario)._v2; Object.assign(out, b1.respuestas || {}); b1.fecha = s[0].creado_en; } catch (e) { b1 = null; } }
+  }
+  const [rs] = await pool.query("SELECT respuestas FROM formularios_cliente WHERE cliente_id = ? AND estado = 'respondida' ORDER BY respondida_en", [clienteId]);
+  rs.forEach(r => { try { Object.assign(out, JSON.parse(r.respuestas || '{}')); } catch (e) {} });
+  return { respuestas: out, b1 };
+}
+async function correoBateria(clienteId, fila, esRecordatorio) {
+  if (!brevoActivo()) return;
+  const [[c]] = await pool.query('SELECT correo, nombre FROM clientes WHERE id = ?', [clienteId]); if (!c || !c.correo) return;
+  const def = await leerDefinicion(fila.formulario, fila.version) || await leerDefinicion(fila.formulario);
+  const bat = def && def.flujo.find(p => p.id === fila.bateria); const n = bat ? bat.preguntas.length : 0;
+  const asesor = await personaDeCliente(clienteId).catch(() => null), quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
+  const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
+  const m = plantillaCorreo({
+    titulo: esRecordatorio ? 'Tienes unas preguntas pendientes' : 'Unas preguntas para seguir con tu caso',
+    parrafos: [c.nombre ? `Hola, ${ESC_HTML(c.nombre)}:` : 'Hola:',
+      esRecordatorio ? `Te recordamos que ${quien === 'Tu asesor' ? 'tu asesor' : quien} está esperando tus respuestas para seguir con tu caso.` : `${quien} necesita que respondas unas preguntas para seguir con tu caso.`,
+      (n ? `Son ${n === 1 ? 'una pregunta' : n + ' preguntas'} y` : 'Se') + ' responden en unos minutos desde tu área de cliente. Cuanto más sincero seas, más rápido y más barato será tu servicio.'],
+    boton: enlace ? { texto: 'Responder ahora', url: enlace } : null });
+  const conn = await pool.getConnection();
+  try { await notificarCliente(conn, clienteId, 'documentos', () => enviarCorreo(c.correo, esRecordatorio ? 'Tienes unas preguntas pendientes en Acros' : 'Unas preguntas para seguir con tu caso', m.html, m.texto, { desde: 'asesor' }), 'Acros: tienes unas preguntas pendientes en tu área'); }
+  catch (e) { console.error('Correo de batería no enviado:', e.message); } finally { conn.release(); }
+}
+// Panel: estado de las baterías de un cliente
+app.get('/api/admin/clientes/:id/formularios', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  try {
+    const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
+    const def = await leerDefinicion('cripto'), previas = await respuestasPreviasCliente(id);
+    const [filas] = await pool.query('SELECT f.*, a.nombre AS enviada_por_nombre FROM formularios_cliente f LEFT JOIN asesores a ON a.id = f.enviada_por WHERE f.cliente_id = ? ORDER BY f.id', [id]);
+    const baterias = def.flujo.filter(p => p.tipo === 'bateria' && p.donde === 'area').map(p => ({ id: p.id, nombre: p.nombre, obligatoria: !!p.obligatoria, preguntas: p.preguntas.length }));
+    res.json({ formulario: 'cripto', baterias, b1: previas.b1 ? { resumen: previas.b1.resumen || [], fecha: previas.b1.fecha } : null,
+      envios: filas.map(f => ({ id: f.id, bateria: f.bateria, estado: f.estado, enviada_en: f.enviada_en, enviada_por: f.enviada_por_nombre, respondida_en: f.respondida_en, recordatorios: f.recordatorios, resumen: f.resumen ? JSON.parse(f.resumen) : null })) });
+  } catch (e) { console.error('Formularios del cliente:', e.message); res.status(500).json({ error: 'No se pudieron leer sus formularios' }); }
+});
+app.post('/api/admin/clientes/:id/formularios/:bateria/enviar', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id), bateria = String(req.params.bateria);
+  try {
+    const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
+    const def = await leerDefinicion('cripto'), bat = def.flujo.find(p => p.id === bateria && p.tipo === 'bateria' && p.donde === 'area');
+    if (!bat) return res.status(404).json({ error: 'Esa batería no existe o no va en el Área' });
+    if (!bat.preguntas.length) return res.status(400).json({ error: 'Esa batería aún no tiene preguntas' });
+    if (bateria === 'b3') { const [[mf]] = await pool.query('SELECT COUNT(*) AS n FROM formularios_mapa WHERE cliente_id = ? AND metricas IS NOT NULL', [id]); if (!mf.n) return res.status(400).json({ error: 'Primero guarda su mapa final (lo que de verdad tenía y las cifras reales)' }); }
+    const [ya] = await pool.query("SELECT id, estado FROM formularios_cliente WHERE cliente_id = ? AND bateria = ? AND estado <> 'retirada' ORDER BY id DESC LIMIT 1", [id, bateria]);
+    if (ya.length && ya[0].estado === 'respondida') return res.status(409).json({ error: 'Ya la ha respondido' });
+    let fila;
+    if (ya.length) { await pool.query('UPDATE formularios_cliente SET recordatorios = recordatorios + 1, ultimo_recordatorio = NOW() WHERE id = ?', [ya[0].id]); fila = { id: ya[0].id, formulario: 'cripto', bateria, version: def.version }; }
+    else { const [r] = await pool.query('INSERT INTO formularios_cliente (cliente_id, formulario, bateria, version, enviada_por) VALUES (?, ?, ?, ?, ?)', [id, 'cripto', bateria, def.version, req.asesor.id]); fila = { id: r.insertId, formulario: 'cripto', bateria, version: def.version }; }
+    correoBateria(id, fila, !!ya.length);
+    res.json({ ok: true, id: fila.id, reenviada: !!ya.length });
+  } catch (e) { console.error('Enviar batería:', e.message); res.status(500).json({ error: 'No se pudo enviar' }); }
+});
+app.post('/api/admin/clientes/:id/formularios/:fid/retirar', requiereSesionAsesor, async (req, res) => {
+  const [r] = await pool.query("UPDATE formularios_cliente SET estado = 'retirada' WHERE id = ? AND cliente_id = ? AND estado = 'enviada'", [Number(req.params.fid), Number(req.params.id)]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'No hay nada pendiente que retirar' });
+  res.json({ ok: true });
+});
+// Área: preguntas pendientes y respuestas
+app.get('/api/clientes/formularios', requiereSesionCliente, async (req, res) => {
+  try {
+    const [filas] = await pool.query("SELECT id, formulario, bateria, version, enviada_en FROM formularios_cliente WHERE cliente_id = ? AND estado = 'enviada' ORDER BY id", [req.cliente.id]);
+    if (!filas.length) return res.json({ pendientes: [] });
+    const previas = await respuestasPreviasCliente(req.cliente.id), defs = {};
+    for (const f of filas) defs[f.version] = defs[f.version] || await leerDefinicion(f.formulario, f.version);
+    res.json({ contexto: previas.respuestas, pendientes: filas.map(f => { const d = defs[f.version], b = d && d.flujo.find(p => p.id === f.bateria); return b ? { id: f.id, bateria: f.bateria, nombre: b.nombre, preguntas: b.preguntas.length, enviada_en: f.enviada_en, version: f.version } : null; }).filter(Boolean), definiciones: defs });
+  } catch (e) { console.error('Formularios del Área:', e.message); res.status(500).json({ error: 'No se pudieron cargar tus preguntas' }); }
+});
+app.post('/api/clientes/formularios/:fid', requiereSesionCliente, async (req, res) => {
+  const fid = Number(req.params.fid), resp = (req.body || {}).respuestas;
+  if (!resp || typeof resp !== 'object') return res.status(400).json({ error: 'Faltan las respuestas' });
+  try {
+    const [[f]] = await pool.query("SELECT * FROM formularios_cliente WHERE id = ? AND cliente_id = ? AND estado = 'enviada'", [fid, req.cliente.id]);
+    if (!f) return res.status(404).json({ error: 'Estas preguntas ya están respondidas o no existen' });
+    const limpio = {}; for (const [k, x] of Object.entries(resp)) if (/^[a-z0-9_-]{1,40}$/.test(k)) limpio[k] = Array.isArray(x) ? x.slice(0, 60).map(String) : String(x).slice(0, 2000);
+    const def = await leerDefinicion(f.formulario, f.version), previas = await respuestasPreviasCliente(req.cliente.id);
+    const todo = Object.assign({}, previas.respuestas, limpio), resumen = (resumenRespuestas(def, f.bateria, todo) || []).filter(x => x.id in limpio);
+    await pool.query("UPDATE formularios_cliente SET estado = 'respondida', respuestas = ?, resumen = ?, respondida_en = NOW() WHERE id = ?", [JSON.stringify(limpio), JSON.stringify(resumen), fid]);
+    avisarCliente(req.cliente.id, '📝', 'ha respondido sus preguntas', 'Las tienes en su ficha, en «Preguntas».');
+    res.json({ ok: true });
+  } catch (e) { console.error('Responder batería:', e.message); res.status(500).json({ error: 'No se pudieron guardar tus respuestas' }); }
+});
+// Recordatorios: a los 2, 5 y 10 días; después, aviso al asesor (una vez)
+let tareaFormEnMarcha = false;
+async function recordatoriosFormularios() {
+  if (tareaFormEnMarcha) return; tareaFormEnMarcha = true;
+  try {
+    const [filas] = await pool.query("SELECT id, cliente_id, formulario, bateria, version, recordatorios, aviso_asesor_en, TIMESTAMPDIFF(SECOND, enviada_en, NOW()) AS seg FROM formularios_cliente WHERE estado = 'enviada'");
+    for (const f of filas) {
+      const toca = DIAS_RECORDATORIO[f.recordatorios];
+      if (toca !== undefined && f.seg >= toca * SEG_DIA_FORM) { await pool.query('UPDATE formularios_cliente SET recordatorios = recordatorios + 1, ultimo_recordatorio = NOW() WHERE id = ?', [f.id]); await correoBateria(f.cliente_id, f, true); continue; }
+      if (toca === undefined && !f.aviso_asesor_en && f.seg >= (DIAS_RECORDATORIO[DIAS_RECORDATORIO.length - 1] + 2) * SEG_DIA_FORM) {
+        await pool.query('UPDATE formularios_cliente SET aviso_asesor_en = NOW() WHERE id = ?', [f.id]);
+        avisarCliente(f.cliente_id, '⏳', 'no ha respondido sus preguntas', 'Lleva ' + Math.round(f.seg / SEG_DIA_FORM) + ' días sin responder pese a los recordatorios. Quizá convenga llamarle.');
+      }
+    }
+  } catch (e) { console.error('Recordatorios de formularios:', e.message); } finally { tareaFormEnMarcha = false; }
+}
+setInterval(recordatoriosFormularios, Math.max(5000, Number(process.env.FORM_TAREA_MS) || 60 * 60 * 1000)).unref();
+app.post('/api/admin/formularios/tarea-recordatorios', requiereSesionAsesor, requiereRol('admin'), async (req, res) => { await recordatoriosFormularios(); res.json({ ok: true }); });
+
+// ================================================================
+// F6 · MAPA CRIPTO (11/11, Vikn): tres nubes.
+//  1) Inicial: con sus respuestas a las baterías 1 y 2; en el Área solo cuando ha respondido las dos y hay pago confirmado (como un recibo;
+//     más adelante quizá un NFT). 2) Final corregida: lo que de verdad tenía (la guarda el asesor al cerrar). 3) Lo que hubo que añadir.
+//  Y «¿Acertaste?»: el cliente adivina operaciones, si ganó o perdió, exchanges y redes; luego ve la realidad (métricas del asesor).
+// ================================================================
+async function prepararMapas() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS formularios_mapa (cliente_id INT PRIMARY KEY, correccion MEDIUMTEXT NULL, metricas TEXT NULL,
+    guardado_por INT NULL, guardado_en DATETIME NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+const tramo = (n, cortes, ids) => { for (let i = 0; i < cortes.length; i++) if (n < cortes[i]) return ids[i]; return ids[ids.length - 1]; };
+function realesDe(m, correccion) {
+  const nEx = ((correccion || {}).exchanges || []).length, nRe = ((correccion || {}).redes || []).length;
+  return { g_operaciones: tramo(Number(m.operaciones) || 0, [50, 200, 1001], ['o50', 'o200', 'o1000', 'omas']), g_resultado: m.resultado || null,
+    g_exchanges: tramo(nEx, [2, 4, 6], ['e1', 'e3', 'e5', 'emas']), g_redes: tramo(nRe, [1, 3, 6], ['r0', 'r2', 'r5', 'rmas']), _n: { operaciones: Number(m.operaciones) || 0, exchanges: nEx, redes: nRe, importe: m.importe || null } };
+}
+async function estadoMapa(clienteId) {
+  const previas = await respuestasPreviasCliente(clienteId);
+  const [bs] = await pool.query("SELECT bateria, respuestas FROM formularios_cliente WHERE cliente_id = ? AND estado = 'respondida'", [clienteId]);
+  const respondidas = new Set(bs.map(x => x.bateria)); const b3 = bs.find(x => x.bateria === 'b3');
+  const [[pago]] = await pool.query("SELECT COUNT(*) AS n FROM pagos pa JOIN propuestas p ON p.id = pa.propuesta_id WHERE p.cliente_id = ? AND pa.estado = 'confirmado'", [clienteId]);
+  const [[m]] = await pool.query('SELECT correccion, metricas, guardado_en FROM formularios_mapa WHERE cliente_id = ?', [clienteId]).then(r => [r[0].length ? r[0] : [null]]);
+  const inicial = {}; Object.assign(inicial, (previas.b1 && previas.b1.respuestas) || {}); bs.filter(x => x.bateria === 'b2').forEach(x => { try { Object.assign(inicial, JSON.parse(x.respuestas)); } catch (e) {} });
+  return { previas, respondidas, b3: b3 ? JSON.parse(b3.respuestas || '{}') : null, pagado: pago.n > 0, inicial, correccion: m && m.correccion ? JSON.parse(m.correccion) : null, metricas: m && m.metricas ? JSON.parse(m.metricas) : null, guardado_en: m && m.guardado_en };
+}
+app.get('/api/admin/clientes/:id/mapa', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id); const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
+  try { const e = await estadoMapa(id); res.json({ definicion: await leerDefinicion('cripto'), inicial: e.inicial, tiene_b1: !!e.previas.b1, tiene_b2: e.respondidas.has('b2'), pagado: e.pagado, correccion: e.correccion, metricas: e.metricas, guardado_en: e.guardado_en, acertaste: e.b3 }); }
+  catch (er) { console.error('Mapa (panel):', er.message); res.status(500).json({ error: 'No se pudo leer su mapa' }); }
+});
+app.put('/api/admin/clientes/:id/mapa', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id); const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
+  const b = req.body || {}, c = b.correccion, m = b.metricas || {};
+  if (!c || typeof c !== 'object') return res.status(400).json({ error: 'Falta el mapa corregido' });
+  const limpio = {}; for (const [k, x] of Object.entries(c)) if (/^[a-z0-9_-]{1,40}$/.test(k)) limpio[k] = Array.isArray(x) ? x.slice(0, 80).map(String) : String(x).slice(0, 200);
+  const met = { operaciones: Math.max(0, Math.min(10000000, Math.round(Number(m.operaciones) || 0))), resultado: ['gano', 'perdio', 'igual'].includes(m.resultado) ? m.resultado : null, importe: m.importe === '' || m.importe == null ? null : Math.round(Number(m.importe) || 0) };
+  if (!met.resultado) return res.status(400).json({ error: 'Indica si ganó, perdió o se quedó igual' });
+  await pool.query('INSERT INTO formularios_mapa (cliente_id, correccion, metricas, guardado_por, guardado_en) VALUES (?, ?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE correccion = VALUES(correccion), metricas = VALUES(metricas), guardado_por = VALUES(guardado_por), guardado_en = NOW()', [id, JSON.stringify(limpio), JSON.stringify(met), req.asesor.id]);
+  res.json({ ok: true });
+});
+app.get('/api/clientes/mapa', requiereSesionCliente, async (req, res) => {
+  try {
+    const e = await estadoMapa(req.cliente.id), def = await leerDefinicion('cripto');
+    const inicialLista = !!e.previas.b1 && e.respondidas.has('b2') && e.pagado;
+    const out = { definicion: def, inicial: inicialLista ? e.inicial : null, falta: inicialLista ? null : (!e.previas.b1 || !e.respondidas.has('b2') ? 'preguntas' : 'pago') };
+    if (inicialLista && e.correccion && e.metricas && e.b3) { const reales = realesDe(e.metricas, e.correccion); out.final = e.correccion; out.acertaste = { tuyas: e.b3, reales, metricas: e.metricas }; }
+    else if (inicialLista && e.b3) out.esperando_final = true;
+    res.json(out);
+  } catch (er) { console.error('Mapa (Área):', er.message); res.status(500).json({ error: 'No se pudo cargar tu mapa' }); }
+});
+
+// ================================================================
+// CIERRE DEL EXPEDIENTE (11/11, Vikn): obligatorio para servicios cripto y Modelo 100, pero el asesor puede saltarlo (con motivo).
+// Guarda el mapa final (correcto + lo que faltaba, sin lo que no era así), las cifras reales y el resumen; deja nota en la ficha;
+// opcionalmente envía «¿Acertaste?». Lo que el asesor añade a mano va como «x:Nombre».
+// ================================================================
+const CIERRE_TIPOS = ['pyg', 'pyg_anteriores', 'origen', 'certificado', 'nft', 'm721', 'renta'];
+async function prepararCierre() {
+  await agregaColumnaSiFalta('formularios_mapa', '`cierre`', "VARCHAR(10) NULL");           // cerrado | saltado
+  await agregaColumnaSiFalta('formularios_mapa', '`cierre_motivo`', 'VARCHAR(300) NULL');
+  await agregaColumnaSiFalta('formularios_mapa', '`cierre_resumen`', 'TEXT NULL');
+}
+async function estadoCierre(clienteId) {
+  const [sv] = await pool.query('SELECT tipo, estado FROM servicios_cliente WHERE cliente_id = ?', [clienteId]);
+  const suyos = sv.filter(x => CIERRE_TIPOS.includes(x.tipo));
+  const [[m]] = await pool.query('SELECT cierre, cierre_motivo, cierre_resumen, guardado_en FROM formularios_mapa WHERE cliente_id = ?', [clienteId]).then(r => [r[0].length ? r[0] : [null]]);
+  const hecho = m && m.cierre ? { estado: m.cierre, motivo: m.cierre_motivo, resumen: m.cierre_resumen ? JSON.parse(m.cierre_resumen) : null, en: m.guardado_en } : null;
+  const abiertos = suyos.filter(x => !['terminado', 'cerrado_sin_respuesta'].includes(x.estado)).length;
+  return { aplica: suyos.length > 0, hecho, pendiente: suyos.length > 0 && !hecho && abiertos === 0, abiertos, sin_proponer: suyos.filter(x => x.estado === 'abierto').length };
+}
+app.get('/api/admin/clientes/:id/cierre', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id); const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
+  try { res.json(await estadoCierre(id)); } catch (e) { res.status(500).json({ error: 'No se pudo leer el cierre' }); }
+});
+app.post('/api/admin/clientes/:id/cierre', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id); const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
+  const b = req.body || {}, quien = req.asesor.nombre || 'El asesor';
+  try {
+    if (b.accion === 'saltar') {
+      const motivo = String(b.motivo || '').trim().slice(0, 120), detalle = String(b.detalle || '').trim().slice(0, 180);
+      if (!motivo || (motivo === 'Otro' && !detalle)) return res.status(400).json({ error: 'Indica el motivo' + (motivo === 'Otro' ? ' (con «Otro», escribe el detalle)' : '') });
+      const texto = motivo + (detalle ? ' — ' + detalle : '');
+      await pool.query("INSERT INTO formularios_mapa (cliente_id, cierre, cierre_motivo, guardado_por, guardado_en) VALUES (?, 'saltado', ?, ?, NOW()) ON DUPLICATE KEY UPDATE cierre = 'saltado', cierre_motivo = VALUES(cierre_motivo), guardado_por = VALUES(guardado_por), guardado_en = NOW()", [id, texto, req.asesor.id]);
+      await pool.query("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, 'ficha', ?)", [id, req.asesor.id, quien + ' saltó el cierre del expediente. Motivo: ' + texto + '.']);
+      return res.json({ ok: true });
+    }
+    if (b.accion !== 'cerrar') return res.status(400).json({ error: 'Acción no válida' });
+    const c = b.correccion, m = b.metricas || {}, r = b.resumen || {};
+    if (!c || typeof c !== 'object') return res.status(400).json({ error: 'Falta lo comprobado' });
+    const limpio = {}; for (const [k, x] of Object.entries(c)) if (/^[a-z0-9_-]{1,40}$/.test(k)) limpio[k] = Array.isArray(x) ? x.slice(0, 80).map(v => String(v).slice(0, 80)) : String(x).slice(0, 80);
+    const met = { operaciones: Math.max(0, Math.min(10000000, Math.round(Number(m.operaciones) || 0))), resultado: ['gano', 'perdio', 'igual'].includes(m.resultado) ? m.resultado : null, importe: m.importe === '' || m.importe == null ? null : Math.round(Number(m.importe) || 0) };
+    if (!met.resultado || m.operaciones === '' || m.operaciones == null) return res.status(400).json({ error: 'Faltan las cifras reales (operaciones y resultado)' });
+    const resumen = { bien: +r.bien || 0, total: +r.total || 0, faltaban: +r.faltaban || 0, mal: +r.mal || 0 };
+    await pool.query("INSERT INTO formularios_mapa (cliente_id, correccion, metricas, cierre, cierre_resumen, guardado_por, guardado_en) VALUES (?, ?, ?, 'cerrado', ?, ?, NOW()) ON DUPLICATE KEY UPDATE correccion = VALUES(correccion), metricas = VALUES(metricas), cierre = 'cerrado', cierre_motivo = NULL, cierre_resumen = VALUES(cierre_resumen), guardado_por = VALUES(guardado_por), guardado_en = NOW()",
+      [id, JSON.stringify(limpio), JSON.stringify(met), JSON.stringify(resumen), req.asesor.id]);
+    await pool.query("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, 'ficha', ?)", [id, req.asesor.id,
+      quien + ' cerró el expediente: contó bien ' + resumen.bien + ' de ' + resumen.total + ' · faltaban ' + resumen.faltaban + ' · no era así ' + resumen.mal + '. Cifras reales: ' + met.operaciones + ' operaciones, ' + ({ gano: 'ganó', perdio: 'perdió', igual: 'más o menos igual' }[met.resultado]) + (met.importe ? ' (' + met.importe + ' €)' : '') + '.']);
+    let enviada = false;
+    if (b.enviar_b3) {
+      const def = await leerDefinicion('cripto'), bat = def.flujo.find(p => p.id === 'b3');
+      const [ya] = await pool.query("SELECT id FROM formularios_cliente WHERE cliente_id = ? AND bateria = 'b3' AND estado <> 'retirada'", [id]);
+      if (bat && bat.preguntas.length && !ya.length) { const [ins] = await pool.query("INSERT INTO formularios_cliente (cliente_id, formulario, bateria, version, enviada_por) VALUES (?, 'cripto', 'b3', ?, ?)", [id, def.version, req.asesor.id]); correoBateria(id, { id: ins.insertId, formulario: 'cripto', bateria: 'b3', version: def.version }, false); enviada = true; }
+    }
+    res.json({ ok: true, enviada_b3: enviada });
+  } catch (e) { console.error('Cierre del expediente:', e.message); res.status(500).json({ error: 'No se pudo guardar el cierre' }); }
 });
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
