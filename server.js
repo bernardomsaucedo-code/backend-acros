@@ -906,13 +906,16 @@ async function asegurarEsquema() {
       await agregaColumnaSiFalta('personas', '`equipo_id`', 'INT NULL');
       await pool.execute('CREATE TABLE IF NOT EXISTS equipos (`id` INT AUTO_INCREMENT PRIMARY KEY, `nombre` VARCHAR(80) NOT NULL, `jefe_persona_id` INT NULL, `encargado_persona_id` INT NULL, `ntfy_topic` VARCHAR(80) NULL, `activo` TINYINT(1) NOT NULL DEFAULT 1, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
       await agregaColumnaSiFalta('documentos_fiscales', '`nombre_original`', 'VARCHAR(255) NULL');
-      await prepararYsi();   // 05/11: simulador público «¿Y si…?» (contactos y usos)
+      await prepararSimulacros();   // 05/11: simulador público «SimulAcros» (contactos y usos)
+      await prepararArticulos();   // 11/11: artículos, guías y biblioteca de recuadros
+      await prepararPlataformas();   // 11/11: catálogo de plataformas y sus logos
       await prepararFormatosArchivo();
       await prepararTemporadas();   // 06/11: temporadas de la web y codigo_promo
       await prepararFormularios();  // 11/11: preguntas dinámicas
       await prepararFormulariosCliente();  // 11/11: baterías del Área
       await prepararMapas();  // 11/11: mapa cripto (inicial, final y diferencias)
-      await prepararCierre();  // 11/11: cierre del expediente   // 03/11: formatos de archivo conocidos (semilla) y columnas de renombrado   // 15/10: nombre del archivo tal cual lo subió el cliente
+      await prepararCierre();  // 11/11: cierre del expediente
+      await prepararDocumentosIntegros();  // 12/11: documentos íntegros   // 03/11: formatos de archivo conocidos (semilla) y columnas de renombrado   // 15/10: nombre del archivo tal cual lo subió el cliente
       await pool.execute('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');   // 15/10
       setTimeout(cargarCanales, 500);
       // 14/10: llaves de documentos por asesor (ver «LLAVES POR ASESOR»)
@@ -1955,7 +1958,7 @@ async function clientesPermitidosAntiguo(req) {
 }
 async function clienteDePropuestaId(id) { const [f] = await pool.execute('SELECT cliente_id FROM propuestas WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
 async function clienteDeObjeto(tabla, id) { const [f] = await pool.execute('SELECT cliente_id FROM ' + tabla + ' WHERE id = ?', [Number(id)]); return f.length ? f[0].cliente_id : null; }
-const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados|contrasena|mi-correo|sesion|pin)/];
+const RUTAS_LIBRES_ASESOR = [/^\/api\/admin\/(login|logout|mi-contrasena|asesores|personas|cambios-asesor|sugerencias|valoraciones|rendimiento|resumen-diario|copias-bd|web|avisos|solicitudes|llamadas|empresas|actividad|clientes\/duplicados|contrasena|mi-correo|sesion|pin|articulos|simulacros|plataformas)/];
 async function permisoCliente(req, res, next) {
   try {
     // 15/10: un admin con «Ver: lo mío» (cabecera x-ambito: mio) ve las listas
@@ -4260,7 +4263,7 @@ app.delete('/api/admin/documentos/:id', requiereSesionAsesor, async (req, res) =
 // El cliente sube el archivo (ya cifrado por su navegador) contra un
 // documento pedido en concreto. Mismo límite de tamaño que el DNI.
 // 15/10: límite de subidas por cliente y día (hora de Madrid)
-const LIMITE_SUBIDAS_DIA = 20;
+const LIMITE_SUBIDAS_DIA = 60;   // 12/11 (Vikn): antes 20; además, 1 GB al día (bloque de documentos íntegros)
 async function subidasDeHoy(conn, clienteId) {
   const [f] = await conn.execute('SELECT COUNT(*) AS n FROM documentos_fiscales WHERE cliente_id = ? AND subido_en >= ?', [clienteId, aSQLDatetime(inicioDiaMadridUTC(fechaMadrid().fecha))]);
   return Number(f[0].n) || 0;
@@ -4272,30 +4275,33 @@ app.post('/api/propuestas/:token/documentos-nuevo', async (req, res) => {
   const b = req.body || {};
   const nombre = String(b.nombre || '').trim().slice(0, 200);
   if (nombre.length < 4) return res.status(400).json({ error: 'Indica qué documento es' });
-  if (!b.archivo_cifrado || !b.iv || !b.clave_cifrada) return res.status(400).json({ error: 'Falta el archivo' });
-  if (!limiteTamanoOk(b.archivo_cifrado, 15 * 1024 * 1024)) return res.status(400).json({ error: 'El archivo no puede superar los 15 MB' });
+  if ((!b.archivo_cifrado && !b.archivo_ref) || !b.iv || !b.clave_cifrada) return res.status(400).json({ error: 'Falta el archivo' });
+  if (b.archivo_cifrado && !limiteTamanoOk(b.archivo_cifrado, 15 * 1024 * 1024)) return res.status(400).json({ error: 'El archivo no puede superar los 15 MB' });
   const conn = await pool.getConnection();
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const servicios = serviciosDePropuesta(p);
     const servicio = servicios.includes(b.servicio) ? b.servicio : 'general';
-    if (await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
-    const clave = `docs/${p.cliente_id}/${generarToken()}.enc`;
-    await subirAR2(clave, Buffer.from(b.archivo_cifrado, 'base64'), 'application/octet-stream');
+    if (!b.archivo_ref && await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
+    let clave;
+    if (b.archivo_ref) { clave = await tomarSubida(conn, b.archivo_ref, p.cliente_id); if (!clave) return res.status(400).json({ error: 'El archivo no llegó bien. Vuelve a subirlo.' }); }
+    else { clave = `docs/${p.cliente_id}/${generarToken()}.enc`; await subirAR2(clave, Buffer.from(b.archivo_cifrado, 'base64'), 'application/octet-stream'); }
+    const huella = huellaValida(b.huella_sha256), duplicado = await duplicadoDe(conn, p.cliente_id, huella, 0);
     const [r] = await conn.execute(
       "INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, estado, documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, subido_en, nombre_original) VALUES (?, ?, ?, ?, 'enviado', ?, ?, ?, ?, ?, ?)",
       [p.cliente_id, p.id, servicio, nombre, clave, b.iv, b.clave_cifrada, b.tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), String(b.nombre_original || '').slice(0, 255) || null]);
     avisarCliente(p.cliente_id, '📄', 'un cliente ha subido un documento', 'Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
-    res.status(201).json({ ok: true, id: r.insertId, subidas_hoy: await subidasDeHoy(conn, p.cliente_id), limite: LIMITE_SUBIDAS_DIA });
+    if (huella) await conn.execute('UPDATE documentos_fiscales SET huella_sha256 = ?, tamano_original = ? WHERE id = ?', [huella, Number(b.tamano_original) || null, r.insertId]);
+    res.status(201).json({ ok: true, id: r.insertId, subidas_hoy: await subidasDeHoy(conn, p.cliente_id), limite: LIMITE_SUBIDAS_DIA, duplicado });
   } finally { conn.release(); }
 });
 app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
   const { archivo_cifrado, iv, clave_cifrada, tipo_mime } = req.body;
-  if (!archivo_cifrado || !iv || !clave_cifrada) {
+  if ((!archivo_cifrado && !req.body.archivo_ref) || !iv || !clave_cifrada) {
     return res.status(400).json({ error: 'Faltan archivo_cifrado, iv o clave_cifrada' });
   }
-  if (!limiteTamanoOk(archivo_cifrado, 15 * 1024 * 1024)) {
+  if (archivo_cifrado && !limiteTamanoOk(archivo_cifrado, 15 * 1024 * 1024)) {
     return res.status(400).json({ error: 'El archivo no puede superar los 15 MB' });
   }
   const conn = await pool.getConnection();
@@ -4304,10 +4310,13 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [filas] = await conn.execute('SELECT * FROM documentos_fiscales WHERE id = ? AND propuesta_id = ?', [req.params.id, p.id]);
     if (!filas.length) return res.status(404).json({ error: 'Documento no encontrado' });
-    if (await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
+    if (!req.body.archivo_ref && await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
     if (req.body.nombre_original) await conn.execute('UPDATE documentos_fiscales SET nombre_original = ? WHERE id = ?', [String(req.body.nombre_original).slice(0, 255), req.params.id]);
-    const clave = `docs/${p.cliente_id}/${generarToken()}.enc`;
-    await subirAR2(clave, Buffer.from(archivo_cifrado, 'base64'), 'application/octet-stream');
+    let clave;
+    if (req.body.archivo_ref) { clave = await tomarSubida(conn, req.body.archivo_ref, p.cliente_id); if (!clave) return res.status(400).json({ error: 'El archivo no llegó bien. Vuelve a subirlo.' }); }
+    else { clave = `docs/${p.cliente_id}/${generarToken()}.enc`; await subirAR2(clave, Buffer.from(archivo_cifrado, 'base64'), 'application/octet-stream'); }
+    const huella = huellaValida(req.body.huella_sha256);
+    await conn.execute('UPDATE documentos_fiscales SET huella_sha256 = ?, tamano_original = ? WHERE id = ?', [huella, huella ? (Number(req.body.tamano_original) || null) : null, req.params.id]);
     // Re-subir tras un rechazo también vale — vuelve a "enviado" y borra
     // la razón anterior, para que el asesor lo revise de nuevo desde cero.
     await conn.execute(
@@ -4317,7 +4326,7 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
       [clave, iv, clave_cifrada, tipo_mime || 'application/octet-stream', aSQLDatetime(ahora()), req.params.id]
     );
     avisarCliente(p.cliente_id, '📄', 'un cliente ha subido un documento', 'Revísalo en «Documentos fiscales pendientes de revisión».', { etiqueta: 'page_facing_up' });
-    res.json({ ok: true, estado: 'enviado' });
+    res.json({ ok: true, estado: 'enviado', duplicado: await duplicadoDe(conn, p.cliente_id, huellaValida(req.body.huella_sha256), Number(req.params.id)) });
   } catch (err) {
     console.error('Error al subir un documento fiscal:', err);
     res.status(500).json({ error: 'No se pudo subir el documento' });
@@ -4331,12 +4340,12 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
 app.get('/api/admin/documentos/:id/descargar', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [filas] = await conn.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime FROM documentos_fiscales WHERE id = ?', [req.params.id]);
+    const [filas] = await conn.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, huella_sha256, subido_en FROM documentos_fiscales WHERE id = ?', [req.params.id]);
     if (!filas.length || !filas[0].documento_ref) return res.status(404).json({ error: 'Documento no encontrado' });
     const d = filas[0];
     const { buffer } = await bajarDeR2(d.documento_ref);
     res.json({
-      archivo_cifrado: buffer.toString('base64'),
+      archivo_cifrado: buffer.toString('base64'), huella_sha256: d.huella_sha256 || null, subido_en: d.subido_en,   // 12/11: el panel la comprueba
       iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada, tipo_mime: d.documento_tipo_mime,
       clave_asesor: await claveDeAsesor('fiscal', Number(req.params.id), req.asesor.id),
     });
@@ -7560,7 +7569,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-11-11.1';
+const VERSION_ACROS = '2026-11-11.3';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -8848,23 +8857,23 @@ const SEMILLA_FORMATOS = [
   ['Quantfury', 'exchange', [], 'pdf', '*quantfury*', 'PDF: solo por el nombre'],
 ];
 // ================================================================
-// SIMULADOR PÚBLICO «¿Y SI…?» (Acros 9, 05/11, Vikn) — embudo de captación
+// SIMULADOR PÚBLICO «SIMULACROS» (Acros 9, 05/11, Vikn) — embudo de captación
 // Lo que llega desde el simulador gratuito de la web:
 //  · usos anónimos (sin datos personales) para medir el embudo;
-//  · correos (ver escenarios, guardar la cartera, recordatorios) → «Simulador ¿Y si…?» del panel;
+//  · correos (ver escenarios, guardar la cartera, recordatorios) → «SimulAcros» del panel;
 //  · peticiones de revisión (o la casilla «quiero que un asesor me escriba») → una solicitud de presupuesto
-//    normal en «Solicitudes y llamadas», con origen «ysi» y el resumen de su cartera, lista para «Preparar propuesta».
+//    normal en «Solicitudes y llamadas», con origen «simulacros» y el resumen de su cartera, lista para «Preparar propuesta».
 // Nunca se habla al cliente de conversión ni de formato interno (regla de Vikn del 04/11).
 // Los archivos no se guardan aquí: el convertidor de la web aún no existe (pendiente); cuando exista, se adjuntarán
 // a la solicitud solo si la persona pide revisión.
 // ================================================================
-const YSI_SERVICIO = 'Revisión de cartera e informe de pérdidas y ganancias';   // «Preparar propuesta» marca el informe de PyG (la revisión lo incluye, Vikn 04/11)
-const YSI_MAX_CARTERA = 1500000;               // bytes de la cartera guardada (texto JSON)
+const SIMULACROS_SERVICIO = 'Revisión de cartera e informe de pérdidas y ganancias';   // «Preparar propuesta» marca el informe de PyG (la revisión lo incluye, Vikn 04/11)
+const SIMULACROS_MAX_CARTERA = 1500000;               // bytes de la cartera guardada (texto JSON)
 
 // Precio «Revisión a partir de» (Vikn, 04/11): (plataformas × 5 € + tramo de operaciones) × (1 + 0,5 × (años − 1)),
 // tramo 10/20/30 € (hasta 200, hasta 1.000, más), +10 € con operaciones complejas. La actividad en blockchain no
 // cambia el precio: avisa de que puede cambiar.
-function precioRevisionYsi(r) {
+function precioRevisionSimulacros(r) {
   const plataformas = Math.max(1, Math.min(100, Number(r && r.plataformas) || 1));
   const operaciones = Math.max(0, Number(r && r.operaciones) || 0);
   const anos = Math.max(1, Math.min(30, Number(r && r.anos) || 1));
@@ -8874,7 +8883,7 @@ function precioRevisionYsi(r) {
 }
 
 // Resumen que manda la web: solo cifras y nombres de plataformas, recortado y sin nada que no esperemos
-function limpiarResumenYsi(r) {
+function limpiarResumenSimulacros(r) {
   if (!r || typeof r !== 'object') return {};
   const num = (v, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : null; };
   const lista = Array.isArray(r.exchanges) ? r.exchanges : (Array.isArray(r.plataformas_nombres) ? r.plataformas_nombres : []);
@@ -8895,26 +8904,26 @@ function limpiarResumenYsi(r) {
     complejas: !!r.complejas,
     onchain: !!r.onchain,
   };
-  out.precio = precioRevisionYsi(out);
+  out.precio = precioRevisionSimulacros(out);
   out.aviso_721 = out.valor_cartera != null && out.valor_cartera > 50000;
   return out;
 }
-const eurosYsi = n => (n < 0 ? '−' : '') + String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ' €';
+const eurosSimulacros = n => (n < 0 ? '−' : '') + String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ' €';
 
 // Lo que ve el asesor en la solicitud (se pinta como un cuestionario: pregunta → respuesta)
-function cuestionarioYsi(res, extra = {}) {
-  const c = { 'Viene de': 'Simulador ¿Y si…? de la web' };
+function cuestionarioSimulacros(res, extra = {}) {
+  const c = { 'Viene de': 'SimulAcros (simulador de la web)' };
   if (extra.nombre) c['Nombre'] = extra.nombre;
   if (res.exchanges && res.exchanges.length) c['Plataformas'] = res.exchanges.join(', ');
   if (res.operaciones != null) c['Operaciones'] = res.operaciones.toLocaleString('es-ES');
   if (res.anos) c['Años con actividad'] = res.anos + (res.ano_desde ? ' (desde ' + res.ano_desde + ')' : '');
   if (res.salud != null) c['Salud de sus datos'] = res.salud + ' %';
   if (res.avisos && res.avisos.length) c['Avisos que vio'] = res.avisos.join(' · ');
-  if (res.resultado_ventas != null) c[res.resultado_ventas < 0 ? 'Pérdidas por ventas este año (sin revisar)' : 'Ganancias por ventas este año (sin revisar)'] = eurosYsi(res.resultado_ventas);
-  if (res.impuesto != null) c['Impuesto orientativo si el año acabara hoy'] = eurosYsi(res.impuesto);
-  if (res.no_realizado != null) c['PyG no realizado'] = eurosYsi(res.no_realizado);
-  if (res.valor_cartera != null) c['Valor de la cartera hoy'] = eurosYsi(res.valor_cartera);
-  c['Revisión a partir de (lo que vio)'] = eurosYsi(res.precio);
+  if (res.resultado_ventas != null) c[res.resultado_ventas < 0 ? 'Pérdidas por ventas este año (sin revisar)' : 'Ganancias por ventas este año (sin revisar)'] = eurosSimulacros(res.resultado_ventas);
+  if (res.impuesto != null) c['Impuesto orientativo si el año acabara hoy'] = eurosSimulacros(res.impuesto);
+  if (res.no_realizado != null) c['PyG no realizado'] = eurosSimulacros(res.no_realizado);
+  if (res.valor_cartera != null) c['Valor de la cartera hoy'] = eurosSimulacros(res.valor_cartera);
+  c['Revisión a partir de (lo que vio)'] = eurosSimulacros(res.precio);
   if (res.onchain) c['Actividad en blockchain'] = 'Sí: el presupuesto puede cambiar';
   if (res.complejas) c['Operaciones complejas'] = 'Sí (futuros, DeFi, staking o NFT)';
   if (res.aviso_721) c['Modelo 721'] = 'Supera 50.000 €: revisar si debe presentarlo';
@@ -8922,8 +8931,8 @@ function cuestionarioYsi(res, extra = {}) {
   return c;
 }
 
-async function prepararYsi() {
-  await pool.query(`CREATE TABLE IF NOT EXISTS ysi_contactos (
+async function prepararSimulacros() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS simulacros_contactos (
     id INT AUTO_INCREMENT PRIMARY KEY,
     correo VARCHAR(190) NOT NULL,
     nombre VARCHAR(120) NULL,
@@ -8939,9 +8948,9 @@ async function prepararYsi() {
     ultimo_aviso_en DATETIME NULL,
     creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_ysi_correo (correo), UNIQUE KEY uq_ysi_token (token)
+    UNIQUE KEY uq_simulacros_correo (correo), UNIQUE KEY uq_simulacros_token (token)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS ysi_usos (
+  await pool.query(`CREATE TABLE IF NOT EXISTS simulacros_usos (
     id INT AUTO_INCREMENT PRIMARY KEY,
     sesion CHAR(32) NULL,
     paso VARCHAR(12) NOT NULL,
@@ -8949,103 +8958,103 @@ async function prepararYsi() {
     plataformas SMALLINT NULL, operaciones INT NULL, anos SMALLINT NULL, salud TINYINT NULL, avisos SMALLINT NULL,
     onchain TINYINT(1) NOT NULL DEFAULT 0,
     creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_ysi_usos (paso, creado_en), INDEX idx_ysi_sesion (sesion)
+    INDEX idx_simulacros_usos (paso, creado_en), INDEX idx_simulacros_sesion (sesion)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 }
 
-const PASOS_YSI = ['analisis', 'resultado', 'correo', 'revision'];
-const sesionYsi = v => (/^[a-f0-9]{32}$/i.test(String(v || '')) ? String(v).toLowerCase() : null);
-async function anotarUsoYsi(sesion, paso, res) {
+const PASOS_SIMULACROS = ['analisis', 'resultado', 'correo', 'revision'];
+const sesionSimulacros = v => (/^[a-f0-9]{32}$/i.test(String(v || '')) ? String(v).toLowerCase() : null);
+async function anotarUsoSimulacros(sesion, paso, res) {
   try {
-    await pool.execute('INSERT INTO ysi_usos (sesion, paso, exchanges, plataformas, operaciones, anos, salud, avisos, onchain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    await pool.execute('INSERT INTO simulacros_usos (sesion, paso, exchanges, plataformas, operaciones, anos, salud, avisos, onchain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [sesion, paso, (res.exchanges || []).join(', ').slice(0, 400) || null, res.plataformas, res.operaciones, res.anos, res.salud, (res.avisos || []).length, res.onchain ? 1 : 0]);
   } catch (e) { console.error('Uso del simulador no anotado:', e.message); }
 }
-const correoValidoYsi = c => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(c || '').trim()) && String(c).trim().length <= 190;
+const correoValidoSimulacros = c => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(c || '').trim()) && String(c).trim().length <= 190;
 
 // Crea la solicitud de presupuesto (o la reutiliza si ya hay una pendiente de este correo desde el simulador)
-async function solicitudDesdeYsi({ correo, telefono, nombre, nota, res, motivo }) {
-  const [ya] = await pool.execute("SELECT id FROM solicitudes_presupuesto WHERE correo = ? AND origen = 'ysi' AND atendida = 0 ORDER BY id DESC LIMIT 1", [correo]);
-  const cuest = JSON.stringify(cuestionarioYsi(res, { nombre, motivo }));
+async function solicitudDesdeSimulacros({ correo, telefono, nombre, nota, res, motivo }) {
+  const [ya] = await pool.execute("SELECT id FROM solicitudes_presupuesto WHERE correo = ? AND origen = 'simulacros' AND atendida = 0 ORDER BY id DESC LIMIT 1", [correo]);
+  const cuest = JSON.stringify(cuestionarioSimulacros(res, { nombre, motivo }));
   if (ya.length) {
     await pool.execute('UPDATE solicitudes_presupuesto SET cuestionario = ?, detalle = COALESCE(?, detalle), telefono = IF(? <> \'\', ?, telefono) WHERE id = ?', [cuest, nota || null, telefono || '', telefono || '', ya[0].id]);
     return { id: ya[0].id, nueva: false };
   }
   const [ins] = await pool.execute(
     'INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, utm, origen, cuestionario, `cuestionario_en`) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())',
-    [JSON.stringify([YSI_SERVICIO]), nota || null, telefono || '', correo, null, 'ysi', cuest]);
-  avisarCaptacion('Nueva petición desde el simulador ¿Y si…?', 'Quiere que un asesor revise su cartera. Está en «Solicitudes y llamadas».', { etiqueta: 'memo' });
+    [JSON.stringify([SIMULACROS_SERVICIO]), nota || null, telefono || '', correo, null, 'simulacros', cuest]);
+  avisarCaptacion('Nueva petición desde SimulAcros, el simulador', 'Quiere que un asesor revise su cartera. Está en «Solicitudes y llamadas».', { etiqueta: 'memo' });
   return { id: ins.insertId, nueva: true };
 }
 
 // Alta o actualización del contacto (un registro por correo)
-async function guardarContactoYsi({ correo, nombre, telefono, quiereAsesor, novedades, res, cartera }) {
-  const [f] = await pool.execute('SELECT id, token FROM ysi_contactos WHERE correo = ?', [correo]);
+async function guardarContactoSimulacros({ correo, nombre, telefono, quiereAsesor, novedades, res, cartera }) {
+  const [f] = await pool.execute('SELECT id, token FROM simulacros_contactos WHERE correo = ?', [correo]);
   const resumen = JSON.stringify(res);
   if (f.length) {
-    await pool.execute('UPDATE ysi_contactos SET resumen = ?, cartera = COALESCE(?, cartera), nombre = COALESCE(?, nombre), telefono = COALESCE(?, telefono), quiere_asesor = GREATEST(quiere_asesor, ?), novedades = ?, usos = usos + 1, baja_en = NULL WHERE id = ?',
+    await pool.execute('UPDATE simulacros_contactos SET resumen = ?, cartera = COALESCE(?, cartera), nombre = COALESCE(?, nombre), telefono = COALESCE(?, telefono), quiere_asesor = GREATEST(quiere_asesor, ?), novedades = ?, usos = usos + 1, baja_en = NULL WHERE id = ?',
       [resumen, cartera, nombre || null, telefono || null, quiereAsesor ? 1 : 0, novedades ? 1 : 0, f[0].id]);
     return { id: f[0].id, token: f[0].token, nuevo: false };
   }
   const token = crypto.randomBytes(24).toString('hex');
-  const [ins] = await pool.execute('INSERT INTO ysi_contactos (correo, nombre, telefono, token, quiere_asesor, novedades, resumen, cartera) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  const [ins] = await pool.execute('INSERT INTO simulacros_contactos (correo, nombre, telefono, token, quiere_asesor, novedades, resumen, cartera) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [correo, nombre || null, telefono || null, token, quiereAsesor ? 1 : 0, novedades ? 1 : 0, resumen, cartera]);
   return { id: ins.insertId, token, nuevo: true };
 }
 
-function correoBienvenidaYsi(correo, token, quiereAsesor) {
+function correoBienvenidaSimulacros(correo, token, quiereAsesor) {
   if (!brevoActivo()) return;
   const volver = SITE_URL ? SITE_URL + '/simulador?volver=' + token : null;
   const baja = SITE_URL ? SITE_URL + '/simulador?baja=' + token : null;
   const c = plantillaCorreo({
     titulo: 'Tu cartera está guardada',
-    parrafos: ['Hola:', 'Ya puedes ver los escenarios de tu cartera en el simulador ¿Y si…? de Acros. La hemos guardado para que vuelvas cuando quieras sin subir nada otra vez.',
+    parrafos: ['Hola:', 'Ya puedes ver los escenarios de tu cartera en SimulAcros, el simulador fiscal de Acros. La hemos guardado para que vuelvas cuando quieras sin subir nada otra vez.',
       'Te avisaremos antes del 31 de diciembre y cada vez que haya novedades o maneras de optimizar tu resultado fiscal.',
       quiereAsesor ? 'Además, un asesor de Acros te escribirá para comentar tu cartera.' : 'Si algo no te cuadra, puedes pedir que un asesor revise tu cartera desde el mismo simulador.',
       'Recuerda que el resultado es orientativo: está calculado con tus datos sin revisar.'],
     boton: volver ? { texto: 'Volver a mi cartera', url: volver } : null,
     nota: baja ? 'Si no quieres recibir más correos del simulador, date de baja aquí: ' + baja : 'Si no has sido tú, ignora este correo.',
   });
-  enviarCorreo(correo, 'Tu cartera está guardada en el simulador ¿Y si…?', c.html, c.texto)
+  enviarCorreo(correo, 'Tu cartera está guardada en SimulAcros', c.html, c.texto)
     .catch(err => console.error('Correo del simulador no enviado:', err.message));
 }
 
 // --- Rutas públicas (las llama la página del simulador) ---
-app.post('/api/ysi/uso', async (req, res) => {
+app.post('/api/simulacros/uso', async (req, res) => {
   const b = req.body || {};
-  const paso = PASOS_YSI.includes(b.paso) ? b.paso : null;
+  const paso = PASOS_SIMULACROS.includes(b.paso) ? b.paso : null;
   if (!paso || paso === 'correo' || paso === 'revision') return res.status(400).json({ error: 'Paso no válido' });
-  await anotarUsoYsi(sesionYsi(b.sesion), paso, limpiarResumenYsi(b.resumen));
+  await anotarUsoSimulacros(sesionSimulacros(b.sesion), paso, limpiarResumenSimulacros(b.resumen));
   res.status(201).json({ ok: true });
 });
 
-app.post('/api/ysi/precio', (req, res) => {
-  const r = limpiarResumenYsi((req.body || {}).resumen || req.body);
+app.post('/api/simulacros/precio', (req, res) => {
+  const r = limpiarResumenSimulacros((req.body || {}).resumen || req.body);
   res.json({ precio: r.precio, onchain: r.onchain, aviso_721: r.aviso_721 });
 });
 
-app.post('/api/ysi/correo', async (req, res) => {
+app.post('/api/simulacros/correo', async (req, res) => {
   const b = req.body || {};
   if (esSpam(b)) return res.status(201).json({ ok: true });
   const correo = String(b.correo || '').trim().toLowerCase();
-  if (!correoValidoYsi(correo)) return res.status(400).json({ error: 'Escribe un correo válido' });
+  if (!correoValidoSimulacros(correo)) return res.status(400).json({ error: 'Escribe un correo válido' });
   let cartera = null;
   if (b.cartera != null) {
     cartera = typeof b.cartera === 'string' ? b.cartera : JSON.stringify(b.cartera);
-    if (cartera.length > YSI_MAX_CARTERA) return res.status(413).json({ error: 'La cartera es demasiado grande para guardarla' });
+    if (cartera.length > SIMULACROS_MAX_CARTERA) return res.status(413).json({ error: 'La cartera es demasiado grande para guardarla' });
   }
-  const r = limpiarResumenYsi(b.resumen);
+  const r = limpiarResumenSimulacros(b.resumen);
   const quiereAsesor = !!b.quiere_asesor;
   try {
-    const c = await guardarContactoYsi({ correo, quiereAsesor, novedades: b.novedades !== false, res: r, cartera });
-    await anotarUsoYsi(sesionYsi(b.sesion), 'correo', r);
+    const c = await guardarContactoSimulacros({ correo, quiereAsesor, novedades: b.novedades !== false, res: r, cartera });
+    await anotarUsoSimulacros(sesionSimulacros(b.sesion), 'correo', r);
     let solicitud = null;
     if (quiereAsesor) {
-      solicitud = await solicitudDesdeYsi({ correo, res: r, motivo: 'Dejó su correo y marcó «Quiero que un asesor de Acros me escriba»' });
-      await pool.execute('UPDATE ysi_contactos SET solicitud_id = ? WHERE id = ?', [solicitud.id, c.id]);
-      if (solicitud.nueva) await anotarUsoYsi(sesionYsi(b.sesion), 'revision', r);
+      solicitud = await solicitudDesdeSimulacros({ correo, res: r, motivo: 'Dejó su correo y marcó «Quiero que un asesor de Acros me escriba»' });
+      await pool.execute('UPDATE simulacros_contactos SET solicitud_id = ? WHERE id = ?', [solicitud.id, c.id]);
+      if (solicitud.nueva) await anotarUsoSimulacros(sesionSimulacros(b.sesion), 'revision', r);
     }
-    correoBienvenidaYsi(correo, c.token, quiereAsesor);
+    correoBienvenidaSimulacros(correo, c.token, quiereAsesor);
     res.status(201).json({ ok: true, token: c.token, precio: r.precio });
   } catch (err) {
     console.error('Error al guardar el correo del simulador:', err);
@@ -9053,22 +9062,22 @@ app.post('/api/ysi/correo', async (req, res) => {
   }
 });
 
-app.post('/api/ysi/revision', async (req, res) => {
+app.post('/api/simulacros/revision', async (req, res) => {
   const b = req.body || {};
   if (esSpam(b)) return res.status(201).json({ ok: true });
   const correo = String(b.correo || '').trim().toLowerCase();
   const nombre = String(b.nombre || '').trim().slice(0, 120);
   const telefono = String(b.telefono || '').trim().slice(0, 30);
   const nota = String(b.nota || '').trim().slice(0, 2000) || null;
-  if (!correoValidoYsi(correo)) return res.status(400).json({ error: 'Escribe un correo válido' });
+  if (!correoValidoSimulacros(correo)) return res.status(400).json({ error: 'Escribe un correo válido' });
   if (!nombre) return res.status(400).json({ error: 'Escribe tu nombre' });
   if (telefono && telefono.replace(/\D/g, '').length < 9) return res.status(400).json({ error: 'El teléfono no es válido' });
-  const r = limpiarResumenYsi(b.resumen);
+  const r = limpiarResumenSimulacros(b.resumen);
   try {
-    const sol = await solicitudDesdeYsi({ correo, telefono, nombre, nota, res: r, motivo: 'Pidió que un asesor revise su cartera' });
-    const c = await guardarContactoYsi({ correo, nombre, telefono, quiereAsesor: true, novedades: b.novedades !== false, res: r, cartera: null });
-    await pool.execute('UPDATE ysi_contactos SET solicitud_id = ? WHERE id = ?', [sol.id, c.id]);
-    if (sol.nueva) await anotarUsoYsi(sesionYsi(b.sesion), 'revision', r);
+    const sol = await solicitudDesdeSimulacros({ correo, telefono, nombre, nota, res: r, motivo: 'Pidió que un asesor revise su cartera' });
+    const c = await guardarContactoSimulacros({ correo, nombre, telefono, quiereAsesor: true, novedades: b.novedades !== false, res: r, cartera: null });
+    await pool.execute('UPDATE simulacros_contactos SET solicitud_id = ? WHERE id = ?', [sol.id, c.id]);
+    if (sol.nueva) await anotarUsoSimulacros(sesionSimulacros(b.sesion), 'revision', r);
     res.status(201).json({ ok: true, precio: r.precio });
   } catch (err) {
     console.error('Error al guardar la revisión del simulador:', err);
@@ -9077,8 +9086,8 @@ app.post('/api/ysi/revision', async (req, res) => {
 });
 
 // Volver a la cartera guardada desde el enlace del correo
-app.get('/api/ysi/volver/:token([a-f0-9]{48})', async (req, res) => {
-  const [f] = await pool.execute('SELECT resumen, cartera FROM ysi_contactos WHERE token = ? AND baja_en IS NULL', [req.params.token]);
+app.get('/api/simulacros/volver/:token([a-f0-9]{48})', async (req, res) => {
+  const [f] = await pool.execute('SELECT resumen, cartera FROM simulacros_contactos WHERE token = ? AND baja_en IS NULL', [req.params.token]);
   if (!f.length) return res.status(404).json({ error: 'Este enlace ya no es válido' });
   let resumen = {}; try { resumen = JSON.parse(f[0].resumen || '{}'); } catch (e) {}
   let cartera = null; try { cartera = f[0].cartera ? JSON.parse(f[0].cartera) : null; } catch (e) {}
@@ -9086,29 +9095,29 @@ app.get('/api/ysi/volver/:token([a-f0-9]{48})', async (req, res) => {
 });
 
 // Baja: deja de recibir correos y se borra la cartera guardada (el contacto se queda para no volver a escribirle)
-app.post('/api/ysi/baja/:token([a-f0-9]{48})', async (req, res) => {
-  const [r] = await pool.execute('UPDATE ysi_contactos SET baja_en = NOW(), novedades = 0, cartera = NULL WHERE token = ? AND baja_en IS NULL', [req.params.token]);
+app.post('/api/simulacros/baja/:token([a-f0-9]{48})', async (req, res) => {
+  const [r] = await pool.execute('UPDATE simulacros_contactos SET baja_en = NOW(), novedades = 0, cartera = NULL WHERE token = ? AND baja_en IS NULL', [req.params.token]);
   res.json({ ok: true, ya_estaba: r.affectedRows === 0 });
 });
 
-// --- Panel: «Simulador ¿Y si…?» (jefes, encargados y marketing; admin siempre) ---
-app.get('/api/admin/ysi/contactos', requiereSesionAsesor, requiereRol('jefe', 'encargado', 'marketing'), async (req, res) => {
+// --- Panel: «SimulAcros» (jefes, encargados y marketing; admin siempre) ---
+app.get('/api/admin/simulacros/contactos', requiereSesionAsesor, requiereRol('jefe', 'encargado', 'marketing'), async (req, res) => {
   const [filas] = await pool.query(`SELECT y.id, y.correo, y.nombre, y.telefono, y.quiere_asesor, y.novedades, y.resumen, y.solicitud_id, y.usos, y.baja_en, y.creado_en, y.actualizado_en,
       (y.cartera IS NOT NULL) AS cartera_guardada, s.atendida AS solicitud_atendida, s.atendida_motivo AS solicitud_motivo,
       (SELECT c.id FROM clientes c WHERE c.correo = y.correo LIMIT 1) AS cliente_id,
       (SELECT COUNT(*) FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE c.correo = y.correo AND p.estado = 'aceptada') AS contratado
-    FROM ysi_contactos y LEFT JOIN solicitudes_presupuesto s ON s.id = y.solicitud_id
+    FROM simulacros_contactos y LEFT JOIN solicitudes_presupuesto s ON s.id = y.solicitud_id
     ORDER BY y.actualizado_en DESC LIMIT 500`);
   res.json(filas.map(x => { let r = {}; try { r = JSON.parse(x.resumen || '{}'); } catch (e) {} return { ...x, resumen: r }; }));
 });
 
-app.get('/api/admin/ysi/metricas', requiereSesionAsesor, requiereRol('jefe', 'encargado', 'marketing'), async (req, res) => {
+app.get('/api/admin/simulacros/metricas', requiereSesionAsesor, requiereRol('jefe', 'encargado', 'marketing'), async (req, res) => {
   const dias = [7, 30, 365].includes(Number(req.query.dias)) ? Number(req.query.dias) : 30;
-  const [pasos] = await pool.query('SELECT paso, COUNT(*) n, COUNT(DISTINCT COALESCE(sesion, CONCAT(\'u\', id))) personas FROM ysi_usos WHERE creado_en >= NOW() - INTERVAL ? DAY GROUP BY paso', [dias]);
+  const [pasos] = await pool.query('SELECT paso, COUNT(*) n, COUNT(DISTINCT COALESCE(sesion, CONCAT(\'u\', id))) personas FROM simulacros_usos WHERE creado_en >= NOW() - INTERVAL ? DAY GROUP BY paso', [dias]);
   const de = p => { const x = pasos.find(y => y.paso === p); return x ? Number(x.personas || x.n) : 0; };
-  const [[cont]] = await pool.query(`SELECT COUNT(*) correos, SUM(quiere_asesor) asesor, SUM(baja_en IS NOT NULL) bajas FROM ysi_contactos WHERE creado_en >= NOW() - INTERVAL ? DAY`, [dias]);
-  const [[contr]] = await pool.query(`SELECT COUNT(DISTINCT y.id) n FROM ysi_contactos y JOIN clientes c ON c.correo = y.correo JOIN propuestas p ON p.cliente_id = c.id AND p.estado = 'aceptada' WHERE y.creado_en >= NOW() - INTERVAL ? DAY`, [dias]);
-  const [plat] = await pool.query("SELECT exchanges FROM ysi_usos WHERE paso = 'analisis' AND creado_en >= NOW() - INTERVAL ? DAY AND exchanges IS NOT NULL", [dias]);
+  const [[cont]] = await pool.query(`SELECT COUNT(*) correos, SUM(quiere_asesor) asesor, SUM(baja_en IS NOT NULL) bajas FROM simulacros_contactos WHERE creado_en >= NOW() - INTERVAL ? DAY`, [dias]);
+  const [[contr]] = await pool.query(`SELECT COUNT(DISTINCT y.id) n FROM simulacros_contactos y JOIN clientes c ON c.correo = y.correo JOIN propuestas p ON p.cliente_id = c.id AND p.estado = 'aceptada' WHERE y.creado_en >= NOW() - INTERVAL ? DAY`, [dias]);
+  const [plat] = await pool.query("SELECT exchanges FROM simulacros_usos WHERE paso = 'analisis' AND creado_en >= NOW() - INTERVAL ? DAY AND exchanges IS NOT NULL", [dias]);
   const cuenta = {}; plat.forEach(f => String(f.exchanges).split(',').map(s => s.trim()).filter(Boolean).forEach(e => { cuenta[e] = (cuenta[e] || 0) + 1; }));
   res.json({
     dias,
@@ -9116,6 +9125,788 @@ app.get('/api/admin/ysi/metricas', requiereSesionAsesor, requiereRol('jefe', 'en
     correos: Number(cont.correos || 0), quieren_asesor: Number(cont.asesor || 0), bajas: Number(cont.bajas || 0),
     exchanges: Object.entries(cuenta).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([nombre, n]) => ({ nombre, n })),
   });
+});
+
+// ================================================================
+// ARTÍCULOS Y GUÍAS (Acros 9, 11/11, Vikn)
+// · Cualquier persona del equipo escribe; solo un administrador publica (o devuelve con un comentario).
+// · Dos tipos: «articulo» (acrosfi.es/articulos/…) y «guia» de exchange (acrosfi.es/guias/…, con su vídeo de YouTube).
+// · Biblioteca de recuadros: se escriben una vez y se usan en cualquier artículo, dentro del texto (achatados) o en la
+//   columna (cuadrados). Cambiar uno lo cambia en todos.
+// · Las páginas públicas salen ya montadas desde aquí (las IA no ejecutan la programación de una página). En producción
+//   un Worker de Cloudflare sirve acrosfi.es/articulos* y acrosfi.es/guias* desde este servidor.
+// · Cada página tiene su versión en texto (….md) para las IA, datos estructurados (Article, FAQPage, VideoObject,
+//   BreadcrumbList) y un mapa del sitio (/articulos/sitemap.xml).
+// · Lo publicado es una copia fija: editar un artículo publicado no cambia la web hasta que un administrador lo vuelve
+//   a publicar.
+// ================================================================
+const ART_TIPOS = ['articulo', 'guia'];
+const ART_PUBLICOS = ['Particulares', 'Gestorías y asesorías', 'Empresas'];
+const ART_TEMAS = ['Renta', 'Modelo 721', 'Exchanges', 'Pérdidas', 'Staking y DeFi', 'Herencias y donaciones', 'Inspecciones', 'Empresas'];
+const ART_MAX_BLOQUES = 400, ART_MAX_TEXTO = 20000, ART_MAX_IMAGEN = 900 * 1024;
+const ART_RUTA = { articulo: '/articulos', guia: '/guias' };
+const artUrlBase = () => (process.env.SITE_URL || 'https://acrosfi.es').replace(/\/+$/, '');
+
+async function prepararArticulos() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS articulos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    tipo VARCHAR(10) NOT NULL DEFAULT 'articulo',
+    slug VARCHAR(120) NOT NULL,
+    estado VARCHAR(12) NOT NULL DEFAULT 'borrador',
+    autor_asesor_id INT NULL,
+    borrador MEDIUMTEXT NOT NULL,
+    publicado MEDIUMTEXT NULL,
+    comentario_revision TEXT NULL,
+    enviado_en DATETIME NULL,
+    revisado_por_asesor_id INT NULL, revisado_en DATETIME NULL,
+    publicado_en DATETIME NULL, actualizado_publico_en DATETIME NULL,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_articulos_slug (tipo, slug), INDEX idx_articulos_estado (estado)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS articulos_recuadros (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(80) NOT NULL,
+    titulo VARCHAR(160) NOT NULL,
+    texto VARCHAR(600) NULL,
+    boton_texto VARCHAR(60) NULL,
+    boton_url VARCHAR(300) NULL,
+    estilo VARCHAR(10) NOT NULL DEFAULT 'crema',
+    activo TINYINT(1) NOT NULL DEFAULT 1,
+    actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS articulos_imagenes (
+    id CHAR(32) PRIMARY KEY,
+    tipo VARCHAR(20) NOT NULL,
+    datos MEDIUMBLOB NOT NULL,
+    bytes INT NOT NULL,
+    ancho SMALLINT NULL, alto SMALLINT NULL,
+    subida_por_asesor_id INT NULL,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  const [[n]] = await pool.query('SELECT COUNT(*) n FROM articulos_recuadros');
+  if (!n.n) {
+    await pool.query(`INSERT INTO articulos_recuadros (nombre, titulo, texto, boton_texto, boton_url, estilo) VALUES
+      ('Calcula tu caso', 'Calcula tu caso en dos minutos', 'Sube los archivos de tu exchange a SimulAcros y mira cuánto pagarías.', 'Probar SimulAcros', '/simulador', 'crema'),
+      ('Hablar con un asesor', '¿Prefieres que lo hagamos nosotros?', 'Un asesor revisa tus datos y prepara tu declaración.', 'Hablar con un asesor', '/empieza-aqui', 'verde'),
+      ('Para gestorías', '¿Llevas una gestoría o asesoría?', 'Trabaja con Acros la parte cripto de tus clientes sin perder el resto de su declaración.', 'Colaborar con Acros', '/empieza-aqui', 'crema')`);
+  }
+}
+
+// ---------------- Limpieza de lo que llega del editor
+const artTxt = (v, max) => String(v == null ? '' : v).replace(/\r/g, '').slice(0, max).trim();
+function artSlug(v) {
+  return String(v || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ñ/g, 'n')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 100);
+}
+function artIdYoutube(v) {
+  const s = String(v || '').trim();
+  const m = s.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/|live\/))([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
+  return m ? m[1] : '';
+}
+function limpiarBloque(b) {
+  if (!b || typeof b !== 'object') return null;
+  const t = String(b.t || '');
+  switch (t) {
+    case 'p': case 'cita': return { t, texto: artTxt(b.texto, ART_MAX_TEXTO) };
+    case 'h2': case 'h3': return { t, texto: artTxt(b.texto, 200) };
+    case 'lista': return { t, numerada: !!b.numerada, items: (Array.isArray(b.items) ? b.items : []).map(x => artTxt(x, 2000)).filter(Boolean).slice(0, 60) };
+    case 'fuentes': return { t, items: (Array.isArray(b.items) ? b.items : []).map(x => artTxt(x, 600)).filter(Boolean).slice(0, 30) };
+    case 'img': return /^[a-f0-9]{32}$/.test(String(b.id || '')) ? { t, id: String(b.id), alt: artTxt(b.alt, 300), pie: artTxt(b.pie, 300) } : null;
+    case 'tabla': {
+      const filas = (Array.isArray(b.filas) ? b.filas : []).slice(0, 40).map(f => (Array.isArray(f) ? f : []).slice(0, 8).map(c => artTxt(c, 300)));
+      return { t, cabecera: b.cabecera !== false, filas: filas.filter(f => f.some(Boolean)) };
+    }
+    case 'faq': return { t, pregunta: artTxt(b.pregunta, 300), respuesta: artTxt(b.respuesta, 3000) };
+    case 'recuadro': return Number(b.id) > 0 ? { t, id: Number(b.id), forma: b.forma === 'cuadrado' ? 'cuadrado' : 'achatado' } : null;
+    default: return null;
+  }
+}
+function limpiarColumna(c) {
+  return (Array.isArray(c) ? c : []).slice(0, 8).map(x => {
+    if (!x || typeof x !== 'object') return null;
+    if (x.tipo === 'indice') return { tipo: 'indice' };
+    if (x.tipo === 'recuadro' && Number(x.id) > 0) return { tipo: 'recuadro', id: Number(x.id) };
+    if ((x.tipo === 'guia' || x.tipo === 'articulo') && artSlug(x.slug)) return { tipo: x.tipo, slug: artSlug(x.slug) };
+    return null;
+  }).filter(Boolean);
+}
+function limpiarBorrador(b, tipo) {
+  b = b && typeof b === 'object' ? b : {};
+  const r = {
+    titulo: artTxt(b.titulo, 160),
+    entradilla: artTxt(b.entradilla, 400),
+    descripcion: artTxt(b.descripcion, 200),
+    resumen: (Array.isArray(b.resumen) ? b.resumen : []).map(x => artTxt(x, 300)).filter(Boolean).slice(0, 6),
+    publico: (Array.isArray(b.publico) ? b.publico : []).filter(x => ART_PUBLICOS.includes(x)),
+    tema: ART_TEMAS.includes(b.tema) ? b.tema : '',
+    portada: /^[a-f0-9]{32}$/.test(String(b.portada || '')) ? String(b.portada) : '',
+    portada_alt: artTxt(b.portada_alt, 300),
+    cuerpo: (Array.isArray(b.cuerpo) ? b.cuerpo : []).slice(0, ART_MAX_BLOQUES).map(limpiarBloque).filter(Boolean),
+    columna: limpiarColumna(b.columna),
+  };
+  if (tipo === 'guia') {
+    r.exchange = artTxt(b.exchange, 60);
+    r.video = artIdYoutube(b.video);
+    r.transcripcion = artTxt(b.transcripcion, 30000);
+  }
+  return r;
+}
+// Comprobaciones que ve el administrador al revisar (no bloquean salvo título y dirección)
+function revisarBorrador(b, tipo) {
+  const avisos = [];
+  if (!b.titulo) avisos.push('Falta el título');
+  if (!b.descripcion) avisos.push('Falta la descripción para Google');
+  else if (b.descripcion.length > 160) avisos.push('La descripción para Google pasa de 160 caracteres');
+  if (!b.resumen.length) avisos.push('No tiene «En pocas palabras»');
+  if (!b.publico.length) avisos.push('No dice para quién es');
+  if (b.cuerpo.some(x => x.t === 'img' && !x.alt)) avisos.push('Hay imágenes sin descripción');
+  if (b.portada && !b.portada_alt) avisos.push('La imagen de portada no tiene descripción');
+  if (tipo === 'guia' && !b.video) avisos.push('La guía no tiene vídeo');
+  if (tipo === 'guia' && b.video && !b.transcripcion) avisos.push('El vídeo no tiene transcripción');
+  if (!b.cuerpo.length) avisos.push('El artículo está vacío');
+  return avisos;
+}
+
+// ---------------- Texto con formato mínimo: **negrita**, *cursiva*, [enlace](https://… o /…)
+function artInline(t) {
+  let s = ESC_HTML(t);
+  s = s.replace(/\[([^\]\n]{1,200})\]\(((?:https?:\/\/|\/)[^\s)]{0,400})\)/g, (m, txt, url) => {
+    const externo = /^https?:\/\//.test(url) && !url.startsWith(artUrlBase());
+    return '<a href="' + url.replace(/"/g, '%22') + '"' + (externo ? ' rel="noopener nofollow" target="_blank"' : '') + '>' + txt + '</a>';
+  });
+  s = s.replace(/\*\*([^*\n]{1,400})\*\*/g, '<strong>$1</strong>').replace(/(^|[^*])\*([^*\n]{1,400})\*(?!\*)/g, '$1<em>$2</em>');
+  return s;
+}
+const artPlano = t => String(t || '').replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+const artAncla = t => artSlug(t).slice(0, 60) || 'seccion';
+const artFecha = d => d ? new Date(d).toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' }) : '';
+const artIso = d => d ? new Date(d).toISOString() : undefined;
+
+// ---------------- Lecturas comunes
+async function recuadrosPorId() {
+  const [f] = await pool.query('SELECT * FROM articulos_recuadros WHERE activo = 1');
+  const m = {}; f.forEach(r => { m[r.id] = r; }); return m;
+}
+async function autorPublico(asesorId) {
+  if (!asesorId) return null;
+  const [f] = await pool.execute('SELECT a.nombre AS nombre_asesor, p.nombre, p.puesto_es, p.bio_es, p.foto FROM asesores a LEFT JOIN personas p ON p.asesor_id = a.id AND p.activa = 1 WHERE a.id = ?', [asesorId]);
+  if (!f.length) return null;
+  return { nombre: f[0].nombre || f[0].nombre_asesor, puesto: f[0].puesto_es || 'Asesor fiscal cripto en Acros', bio: f[0].bio_es || '', foto: f[0].foto || null };
+}
+async function enlacesPublicados(tipo) {
+  const [f] = await pool.execute("SELECT tipo, slug, publicado, publicado_en, actualizado_publico_en FROM articulos WHERE publicado IS NOT NULL" + (tipo ? ' AND tipo = ?' : '') + ' ORDER BY COALESCE(actualizado_publico_en, publicado_en) DESC', tipo ? [tipo] : []);
+  return f.map(x => { let d = {}; try { d = JSON.parse(x.publicado); } catch (e) {} return { tipo: x.tipo, slug: x.slug, d, publicado_en: x.publicado_en, actualizado: x.actualizado_publico_en || x.publicado_en }; });
+}
+
+// Logo del exchange de una guía, sacado del catálogo de plataformas (bloque_plataformas.js)
+async function logoDeExchange(nombre) {
+  if (!nombre || typeof plataformaDeNombre !== 'function') return null;
+  const p = await plataformaDeNombre(nombre);
+  return p ? { url: urlLogo(p), nombre: p.nombre } : null;
+}
+const imgLogo = (l, tam) => l ? '<img src="' + ESC_HTML(l.url) + '" alt="" width="' + tam + '" height="' + tam + '" style="width:' + tam + 'px;height:' + tam + 'px;object-fit:contain;border-radius:12px;background:#fff;border:1px solid var(--linea);padding:6px;box-sizing:border-box">' : '';
+// ---------------- Montaje de las páginas
+const ART_CSS = `
+:root{--fondo:#FBF8F2;--panel:#FFFFFF;--linea:#E6DCCD;--circulo:#F1E6D8;--titular:#23402F;--tinta:#335C47;--suave:#423F3A;--acento:#A84C18;--verde:#2E7A4E;--f-display:'IBM Plex Serif',Georgia,serif;--f-cuerpo:'IBM Plex Sans',-apple-system,'Segoe UI',sans-serif}
+html[data-tema="oscuro"]{--fondo:#24221F;--panel:#2E2B27;--linea:#47423B;--circulo:#3A3631;--titular:#F2EDE4;--tinta:#C9D8CC;--suave:#D8D2C8;--acento:#E9A87C;--verde:#8FCBA3}
+*{box-sizing:border-box}body{margin:0;background:var(--fondo);color:var(--suave);font-family:var(--f-cuerpo);font-size:17px;line-height:1.65}
+a{color:var(--acento)}img{max-width:100%;height:auto}
+.ar-cab{background:var(--circulo);border-bottom:1px solid var(--linea)}
+.ar-cab-in{max-width:1200px;margin:0 auto;padding:12px 24px;display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center;justify-content:space-between}
+.ar-logo{font-family:var(--f-display);font-weight:600;font-size:18px;letter-spacing:2px;color:var(--titular);text-decoration:none}
+.ar-nav{display:flex;flex-wrap:wrap;gap:6px 22px;align-items:center;font-size:15px;font-weight:600}
+.ar-nav a{text-decoration:none;color:var(--suave);padding:10px 0}.ar-nav a[aria-current]{color:var(--titular);border-bottom:2px solid var(--tinta)}
+.ar-nav a.ar-cta{display:inline-flex;align-items:center;min-height:44px;padding:0 18px;border-radius:14px;background:var(--tinta);color:var(--fondo);border:none}
+.ar-main{max-width:1200px;margin:0 auto;padding:32px 24px 64px}
+.ar-ruta{font-size:14px;margin-bottom:16px}.ar-ruta a{text-decoration:none}
+.ar-pills{display:flex;flex-wrap:wrap;gap:6px}.ar-pill{font-size:12px;font-weight:600;padding:4px 10px;border-radius:12px;background:#E7F0EA;color:#23402F;text-decoration:none}
+.ar-pill.tema{background:var(--circulo);color:var(--suave)}
+h1.ar-h1{font-family:var(--f-display);font-weight:600;font-size:clamp(30px,4.4vw,46px);line-height:1.12;color:var(--titular);margin:12px 0}
+.ar-entr{font-size:19px;line-height:1.6;margin:0 0 16px;max-width:820px}
+.ar-autor{display:flex;align-items:center;gap:12px;font-size:14px}.ar-autor img,.ar-autor .sin{width:44px;height:44px;border-radius:50%;object-fit:cover;background:var(--circulo);flex-shrink:0}
+.ar-dos{display:flex;flex-wrap:wrap;gap:48px;align-items:flex-start;margin-top:28px}
+.ar-cuerpo{flex:999 1 560px;min-width:0;max-width:760px;display:flex;flex-direction:column;gap:16px}
+.ar-col{flex:1 1 260px;min-width:0;max-width:320px;position:sticky;top:24px;display:flex;flex-direction:column;gap:16px}
+.ar-cuerpo h2{font-family:var(--f-display);font-weight:600;font-size:28px;line-height:1.25;color:var(--titular);margin:12px 0 0;scroll-margin-top:16px}
+.ar-cuerpo h3{font-size:20px;color:var(--titular);margin:8px 0 0}
+.ar-cuerpo p{margin:0}.ar-cuerpo ul,.ar-cuerpo ol{margin:0;padding-left:22px}
+.ar-cuerpo blockquote{margin:0;padding:4px 0 4px 18px;border-left:3px solid var(--linea);font-style:italic}
+.ar-resumen{border-top:1px solid var(--linea);border-bottom:1px solid var(--linea);padding:14px 0}
+.ar-resumen h2{font-family:var(--f-cuerpo)!important;font-size:14px!important;font-weight:600!important;color:var(--suave)!important;margin:0 0 6px!important}
+.ar-resumen ul{font-size:15px;line-height:1.55}
+figure{margin:0}figcaption{font-size:13px;margin-top:6px}
+.ar-tabla{overflow-x:auto;border:1px solid var(--linea);border-radius:14px;background:var(--panel)}
+.ar-tabla table{width:100%;border-collapse:collapse;font-size:15px}.ar-tabla th,.ar-tabla td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--linea)}
+.ar-faq{border:1px solid var(--linea);border-radius:14px;background:var(--panel);padding:2px 18px}
+.ar-faq summary{min-height:48px;display:flex;align-items:center;font-weight:700;color:var(--titular);cursor:pointer}.ar-faq p{margin:0 0 14px}
+.ar-rec{border-radius:16px;padding:18px 20px;display:flex;gap:12px;background:var(--circulo);color:var(--suave)}
+.ar-rec.achatado{flex-wrap:wrap;align-items:center;justify-content:space-between}.ar-rec.cuadrado{flex-direction:column}
+.ar-rec.verde{background:#23402F;color:#E9E2D6}.ar-rec.verde strong{color:#FBF8F2}
+.ar-rec strong{font-size:17px;color:var(--titular)}.ar-rec .txt{display:flex;flex-direction:column;gap:4px;flex:1 1 260px;font-size:15px;line-height:1.5}
+.ar-btn{display:inline-flex;align-items:center;justify-content:center;min-height:46px;padding:0 18px;border-radius:14px;background:var(--tinta);color:var(--fondo);font-weight:700;text-decoration:none;border:none}
+.ar-rec.verde .ar-btn{background:#BD561B;color:#fff}
+.ar-indice{background:var(--panel);border:1px solid var(--linea);border-radius:16px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;font-size:15px}
+.ar-indice a{text-decoration:none}
+.ar-ficha{display:flex;gap:16px;align-items:flex-start;border:1px solid var(--linea);border-radius:16px;background:var(--panel);padding:18px}
+.ar-video{position:relative;aspect-ratio:16/9;border-radius:14px;overflow:hidden;background:#000}
+.ar-video button,.ar-video iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.ar-video button{cursor:pointer;background:#000 center/cover no-repeat;padding:0}
+.ar-video button span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:72px;height:50px;border-radius:12px;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center}
+.ar-transc{border:1px solid var(--linea);border-radius:14px;background:var(--panel);padding:2px 18px}.ar-transc summary{min-height:44px;display:flex;align-items:center;font-weight:600;cursor:pointer}
+.ar-sigue{border-top:1px solid var(--linea);padding-top:20px;margin-top:32px}
+.ar-sigue div{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:6px 24px}.ar-sigue a{font-weight:600;padding:6px 0}
+.ar-franja{background:#23402F;border-radius:16px;padding:16px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-top:24px}
+.ar-franja span{color:#FBF8F2;font-weight:600}.ar-franja .ar-btn{min-height:44px;font-size:14px}.ar-franja .ar-btn.claro{background:#FBF8F2;color:#23402F}.ar-franja .ar-btn.nar{background:#BD561B;color:#fff}
+.ar-filtros{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}
+.ar-filtros a{min-height:40px;display:inline-flex;align-items:center;padding:0 16px;border-radius:20px;border:1.5px solid var(--tinta);color:var(--tinta);font-size:14px;font-weight:700;text-decoration:none}
+.ar-filtros a[aria-current]{background:var(--tinta);color:var(--fondo)}
+.ar-rejilla{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}
+.ar-tarj{background:var(--panel);border:1px solid var(--linea);border-radius:18px;padding:20px;display:flex;flex-direction:column;gap:10px}
+.ar-tarj h2,.ar-tarj h3{margin:0;font-family:var(--f-display);font-size:21px;line-height:1.3;color:var(--titular)}.ar-tarj h2 a,.ar-tarj h3 a{color:inherit;text-decoration:none}
+.ar-tarj p{margin:0;font-size:15px;line-height:1.55}.ar-tarj small{margin-top:auto;font-size:13px}
+.ar-pie{background:#23402F;color:#E9E2D6}.ar-pie div{max-width:1200px;margin:0 auto;padding:24px;display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;font-size:14px}.ar-pie a{color:#F1C9A8}
+.ar-oculto{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.ar-guias{display:flex;flex-direction:column;gap:12px;margin:28px 0}.ar-guias div.fila{display:flex;flex-wrap:wrap;gap:10px}
+.ar-guias a.g{display:flex;flex-direction:column;align-items:center;gap:8px;min-width:104px;padding:14px 12px;border-radius:14px;border:1px solid var(--linea);background:var(--panel);text-decoration:none;color:var(--titular);font-weight:700;font-size:14px}
+.ar-destacado{display:flex;flex-direction:column;gap:12px;background:var(--panel);border:1px solid var(--linea);border-radius:22px;padding:28px;margin-bottom:8px}
+.ar-destacado h2{margin:0;font-family:var(--f-display);font-size:clamp(24px,3vw,32px);line-height:1.2;color:var(--titular)}.ar-destacado h2 a{color:inherit;text-decoration:none}
+@media (max-width:760px){.ar-col{position:static;max-width:none}.ar-main{padding:20px 16px 48px}.ar-cuerpo h2{font-size:24px}}
+`;
+function marco({ titulo, descripcion, canonico, cuerpo, jsonld, md, actual, previa }) {
+  const base = artUrlBase();
+  const nav = [['/inicio#servicios', 'Servicios', ''], ['/simulador', 'SimulAcros', ''], ['/articulos', 'Artículos', 'articulo'], ['/guias', 'Guías por exchange', 'guia'], ['/inicio#equipo', 'Equipo', '']]
+    .map(([h, t, k]) => '<a href="' + h + '"' + (k && k === actual ? ' aria-current="page"' : '') + '>' + t + '</a>').join('') + '<a class="ar-cta" href="/empieza-aqui">Empieza aquí</a>';
+  return '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+    '<title>' + ESC_HTML(titulo) + '</title><meta name="description" content="' + ESC_HTML(descripcion || '') + '">' +
+    (previa ? '<meta name="robots" content="noindex">' : '<link rel="canonical" href="' + ESC_HTML(base + canonico) + '">') +
+    (md ? '<link rel="alternate" type="text/markdown" href="' + ESC_HTML(md) + '">' : '') +
+    '<meta property="og:type" content="article"><meta property="og:title" content="' + ESC_HTML(titulo) + '"><meta property="og:description" content="' + ESC_HTML(descripcion || '') + '"><meta property="og:url" content="' + ESC_HTML(base + canonico) + '"><meta property="og:locale" content="es_ES">' +
+    '<link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/marca/favicon.svg" type="image/svg+xml">' +
+    '<script>try{if(localStorage.getItem("acros_tema")==="oscuro")document.documentElement.dataset.tema="oscuro"}catch(e){}</script>' +
+    '<link rel="stylesheet" href="/acros_marca.css?v=20261008"><style>' + ART_CSS + '</style>' +
+    (jsonld || []).map(j => '<script type="application/ld+json">' + JSON.stringify(j).replace(/</g, '\\u003c') + '</script>').join('') +
+    '</head><body><header class="ar-cab"><div class="ar-cab-in"><a class="ar-logo" href="/inicio">ACROS</a><nav class="ar-nav" aria-label="Menú principal">' + nav + '</nav></div></header>' +
+    '<main class="ar-main">' + cuerpo + '</main>' +
+    '<footer class="ar-pie"><div><span>Acros, tu asesoría fiscal de criptoactivos.</span><span>acrosfi.es · <a href="tel:+34668170020">668 17 00 20</a></span></div></footer>' +
+    '<script>document.addEventListener("click",function(e){var b=e.target.closest("[data-yt]");if(!b)return;var f=document.createElement("iframe");f.src="https://www.youtube-nocookie.com/embed/"+b.dataset.yt+"?autoplay=1&rel=0";f.title=b.getAttribute("aria-label")||"Vídeo";f.allow="autoplay; encrypted-media; picture-in-picture";f.allowFullscreen=true;b.replaceWith(f);});</script>' +
+    '</body></html>';
+}
+function htmlRecuadro(r, forma) {
+  if (!r) return '';
+  const boton = r.boton_texto && r.boton_url ? '<a class="ar-btn" href="' + ESC_HTML(r.boton_url) + '">' + ESC_HTML(r.boton_texto) + '</a>' : '';
+  return '<aside class="ar-rec ' + (forma === 'cuadrado' ? 'cuadrado' : 'achatado') + (r.estilo === 'verde' ? ' verde' : '') + '"><div class="txt"><strong>' + ESC_HTML(r.titulo) + '</strong>' + (r.texto ? '<span>' + ESC_HTML(r.texto) + '</span>' : '') + '</div>' + boton + '</aside>';
+}
+function htmlCuerpo(d, recs) {
+  const h = [];
+  for (const b of d.cuerpo) {
+    if (b.t === 'p' && b.texto) h.push('<p>' + artInline(b.texto).replace(/\n/g, '<br>') + '</p>');
+    else if (b.t === 'h2' && b.texto) h.push('<h2 id="' + artAncla(b.texto) + '">' + ESC_HTML(b.texto) + '</h2>');
+    else if (b.t === 'h3' && b.texto) h.push('<h3>' + ESC_HTML(b.texto) + '</h3>');
+    else if (b.t === 'cita' && b.texto) h.push('<blockquote>' + artInline(b.texto) + '</blockquote>');
+    else if (b.t === 'lista' && b.items.length) h.push('<' + (b.numerada ? 'ol' : 'ul') + '>' + b.items.map(x => '<li>' + artInline(x) + '</li>').join('') + '</' + (b.numerada ? 'ol' : 'ul') + '>');
+    else if (b.t === 'img') h.push('<figure><img src="/articulos/img/' + b.id + '" alt="' + ESC_HTML(b.alt) + '" loading="lazy">' + (b.pie ? '<figcaption>' + ESC_HTML(b.pie) + '</figcaption>' : '') + '</figure>');
+    else if (b.t === 'tabla' && b.filas.length) {
+      const [primera, ...resto] = b.filas;
+      const filas = b.cabecera ? resto : b.filas;
+      h.push('<div class="ar-tabla"><table>' + (b.cabecera ? '<thead><tr>' + primera.map(c => '<th scope="col">' + artInline(c) + '</th>').join('') + '</tr></thead>' : '') +
+        '<tbody>' + filas.map(fila => '<tr>' + fila.map(c => '<td>' + artInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>');
+    }
+    else if (b.t === 'faq' && b.pregunta) h.push('<details class="ar-faq"><summary>' + ESC_HTML(b.pregunta) + '</summary><p>' + artInline(b.respuesta) + '</p></details>');
+    else if (b.t === 'recuadro') h.push(htmlRecuadro(recs[b.id], b.forma));
+    else if (b.t === 'fuentes' && b.items.length) h.push('<section><h2 id="fuentes">Fuentes</h2><ul>' + b.items.map(x => '<li>' + artInline(x) + '</li>').join('') + '</ul></section>');
+  }
+  return h.join('');
+}
+function htmlVideo(d) {
+  if (!d.video) return '';
+  const nombre = 'Vídeo: ' + d.titulo;
+  return '<div class="ar-video"><button type="button" data-yt="' + d.video + '" aria-label="Ver el vídeo: ' + ESC_HTML(d.titulo) + '" style="background-image:url(https://i.ytimg.com/vi/' + d.video + '/hqdefault.jpg)"><span><svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" fill="#fff"></path></svg></span></button></div>' +
+    '<p style="font-size:14px;margin:0">¿Prefieres verlo en YouTube? <a href="https://www.youtube.com/watch?v=' + d.video + '" rel="noopener" target="_blank">' + ESC_HTML(nombre) + '</a></p>' +
+    (d.transcripcion ? '<details class="ar-transc"><summary>Leer la transcripción del vídeo</summary><p style="white-space:pre-line;margin:0 0 14px">' + ESC_HTML(d.transcripcion) + '</p></details>' : '');
+}
+function htmlColumna(d, recs, enlaces) {
+  const h2s = d.cuerpo.filter(b => b.t === 'h2' && b.texto);
+  return (d.columna || []).map(c => {
+    if (c.tipo === 'indice') return h2s.length ? '<nav class="ar-indice" aria-label="En este artículo"><strong style="color:var(--titular)">En este artículo</strong>' + h2s.map(x => '<a href="#' + artAncla(x.texto) + '">' + ESC_HTML(x.texto) + '</a>').join('') + '</nav>' : '';
+    if (c.tipo === 'recuadro') return htmlRecuadro(recs[c.id], 'cuadrado');
+    const e = enlaces.find(x => x.tipo === c.tipo && x.slug === c.slug);
+    if (!e) return '';
+    return '<aside class="ar-rec cuadrado"><div class="txt"><strong>' + (c.tipo === 'guia' ? 'Guía paso a paso' : 'Te puede interesar') + '</strong><span>' + ESC_HTML(e.d.titulo) + '</span></div><a class="ar-btn" href="' + ART_RUTA[c.tipo] + '/' + e.slug + '">' + (c.tipo === 'guia' ? 'Ver la guía' : 'Leer el artículo') + '</a></aside>';
+  }).join('');
+}
+function jsonLdArticulo(tipo, slug, d, autor, fechas) {
+  const base = artUrlBase(), url = base + ART_RUTA[tipo] + '/' + slug;
+  const j = [{
+    '@context': 'https://schema.org', '@type': 'Article', headline: d.titulo, description: d.descripcion || d.entradilla, inLanguage: 'es-ES', url,
+    datePublished: artIso(fechas.publicado), dateModified: artIso(fechas.actualizado || fechas.publicado),
+    author: autor ? { '@type': 'Person', name: autor.nombre, jobTitle: autor.puesto, worksFor: { '@type': 'Organization', name: 'Acros' } } : { '@type': 'Organization', name: 'Acros' },
+    publisher: { '@type': 'Organization', name: 'Acros', url: base },
+    image: d.portada ? base + '/articulos/img/' + d.portada : undefined,
+  }, {
+    '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [
+      { '@type': 'ListItem', position: 1, name: tipo === 'guia' ? 'Guías por exchange' : 'Artículos', item: base + ART_RUTA[tipo] },
+      { '@type': 'ListItem', position: 2, name: d.titulo, item: url }],
+  }];
+  const faqs = d.cuerpo.filter(b => b.t === 'faq' && b.pregunta && b.respuesta);
+  if (faqs.length) j.push({ '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: faqs.map(f => ({ '@type': 'Question', name: f.pregunta, acceptedAnswer: { '@type': 'Answer', text: artPlano(f.respuesta) } })) });
+  if (tipo === 'guia' && d.video) j.push({ '@context': 'https://schema.org', '@type': 'VideoObject', name: d.titulo, description: d.descripcion || d.entradilla || d.titulo, thumbnailUrl: 'https://i.ytimg.com/vi/' + d.video + '/hqdefault.jpg', uploadDate: artIso(fechas.publicado || new Date()), embedUrl: 'https://www.youtube.com/embed/' + d.video, contentUrl: 'https://www.youtube.com/watch?v=' + d.video, transcript: d.transcripcion || undefined, inLanguage: 'es-ES' });
+  return j;
+}
+async function htmlPaginaArticulo(tipo, slug, d, autor, fechas, previa) {
+  const recs = await recuadrosPorId();
+  const enlaces = await enlacesPublicados(null);
+  const pills = d.publico.map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (d.tema ? '<span class="ar-pill tema">' + ESC_HTML(d.tema) + '</span>' : '') + (tipo === 'guia' && d.exchange ? '<span class="ar-pill tema">' + ESC_HTML(d.exchange) + '</span>' : '');
+  const foto = autor && autor.foto ? '<img src="/api/web/imagen/' + ESC_HTML(autor.foto) + '" alt="">' : '<span class="sin" aria-hidden="true"></span>';
+  const fechaTxt = fechas.publicado ? 'Publicado el ' + artFecha(fechas.publicado) + (fechas.actualizado && artFecha(fechas.actualizado) !== artFecha(fechas.publicado) ? ' · Actualizado el ' + artFecha(fechas.actualizado) : '') : 'Vista previa, sin publicar';
+  const logo = tipo === 'guia' ? await logoDeExchange(d.exchange) : null;
+  const cab = '<nav class="ar-ruta" aria-label="Ruta"><a href="' + ART_RUTA[tipo] + '">' + (tipo === 'guia' ? 'Guías por exchange' : 'Artículos') + '</a> <span aria-hidden="true">›</span> ' + ESC_HTML(d.titulo) + '</nav>' +
+    '<header style="max-width:820px"><div style="display:flex;align-items:center;gap:12px">' + imgLogo(logo, 48) + '<div class="ar-pills">' + pills + '</div></div><h1 class="ar-h1">' + ESC_HTML(d.titulo || 'Sin título') + '</h1>' + (d.entradilla ? '<p class="ar-entr">' + ESC_HTML(d.entradilla) + '</p>' : '') +
+    '<div class="ar-autor">' + foto + '<span>' + (autor ? '<strong style="color:var(--titular)">' + ESC_HTML(autor.nombre) + '</strong>, ' + ESC_HTML(autor.puesto) + '<br>' : '') + fechaTxt + '</span></div></header>';
+  const resumen = d.resumen.length ? '<section class="ar-resumen" aria-labelledby="en-pocas"><h2 id="en-pocas">En pocas palabras</h2><ul>' + d.resumen.map(x => '<li>' + artInline(x) + '</li>').join('') + '</ul></section>' : '';
+  const portada = d.portada ? '<figure><img src="/articulos/img/' + d.portada + '" alt="' + ESC_HTML(d.portada_alt) + '"></figure>' : '';
+  const ficha = autor ? '<section class="ar-ficha">' + foto.replace('<img ', '<img style="width:64px;height:64px;border-radius:50%;object-fit:cover" ') + '<div style="display:flex;flex-direction:column;gap:4px"><strong style="color:var(--titular)">' + ESC_HTML(autor.nombre) + '</strong><span style="font-size:14px">' + ESC_HTML(autor.puesto) + '</span>' + (autor.bio ? '<p style="margin:0;font-size:15px">' + ESC_HTML(autor.bio) + '</p>' : '') + '</div></section>' : '';
+  const otros = enlaces.filter(e => e.tipo === tipo && e.slug !== slug).slice(0, 3);
+  const sigue = otros.length ? '<section class="ar-sigue"><h2 style="margin:0 0 8px;font-size:17px;color:var(--titular)">Sigue leyendo</h2><div>' + otros.map(e => '<a href="' + ART_RUTA[e.tipo] + '/' + e.slug + '">' + ESC_HTML(e.d.titulo) + '</a>').join('') + '</div></section>' : '';
+  const franja = '<section class="ar-franja"><span>¿Cuánto pagarías tú si el año acabara hoy?</span><span style="display:flex;flex-wrap:wrap;gap:8px"><a class="ar-btn claro" href="/simulador' + (tipo === 'guia' && d.exchange ? '?exchange=' + encodeURIComponent(d.exchange) : '') + '">Probar SimulAcros</a><a class="ar-btn nar" href="/empieza-aqui">Hablar con un asesor</a></span></section>';
+  const columna = htmlColumna(d, recs, enlaces);
+  const cuerpo = cab + '<div class="ar-dos"><article class="ar-cuerpo">' + resumen + portada + (tipo === 'guia' ? htmlVideo(d) : '') + htmlCuerpo(d, recs) + ficha + '</article>' + (columna ? '<div class="ar-col">' + columna + '</div>' : '') + '</div>' + sigue + franja;
+  const ruta = ART_RUTA[tipo] + '/' + slug;
+  return marco({ titulo: d.titulo + ' · Acros', descripcion: d.descripcion || d.entradilla, canonico: ruta, cuerpo, jsonld: previa ? [] : jsonLdArticulo(tipo, slug, d, autor, fechas), md: previa ? null : ruta + '.md', actual: tipo, previa });
+}
+function mdArticulo(tipo, slug, d, autor, fechas) {
+  const L = ['# ' + d.titulo, ''];
+  if (d.entradilla) L.push(d.entradilla, '');
+  L.push('Fuente: ' + artUrlBase() + ART_RUTA[tipo] + '/' + slug + (autor ? ' · Autor: ' + autor.nombre + ', ' + autor.puesto : '') + (fechas.publicado ? ' · Publicado: ' + artFecha(fechas.publicado) : '') + (fechas.actualizado ? ' · Actualizado: ' + artFecha(fechas.actualizado) : ''), '');
+  if (d.resumen.length) { L.push('## En pocas palabras', ''); d.resumen.forEach(x => L.push('- ' + x)); L.push(''); }
+  if (tipo === 'guia' && d.video) { L.push('Vídeo: https://www.youtube.com/watch?v=' + d.video, ''); if (d.transcripcion) L.push('### Transcripción del vídeo', '', d.transcripcion, ''); }
+  for (const b of d.cuerpo) {
+    if (b.t === 'p') L.push(b.texto, '');
+    else if (b.t === 'h2') L.push('## ' + b.texto, '');
+    else if (b.t === 'h3') L.push('### ' + b.texto, '');
+    else if (b.t === 'cita') L.push('> ' + b.texto, '');
+    else if (b.t === 'lista') { b.items.forEach((x, i) => L.push((b.numerada ? (i + 1) + '. ' : '- ') + x)); L.push(''); }
+    else if (b.t === 'img' && b.alt) L.push('![' + b.alt + '](' + artUrlBase() + '/articulos/img/' + b.id + ')', '');
+    else if (b.t === 'tabla' && b.filas.length) { b.filas.forEach((f, i) => { L.push('| ' + f.join(' | ') + ' |'); if (i === 0 && b.cabecera) L.push('|' + f.map(() => ' --- |').join('')); }); L.push(''); }
+    else if (b.t === 'faq') L.push('**' + b.pregunta + '**', '', b.respuesta, '');
+    else if (b.t === 'fuentes') { L.push('## Fuentes', ''); b.items.forEach(x => L.push('- ' + x)); L.push(''); }
+  }
+  L.push('---', 'Acros, asesoría fiscal especializada en criptomonedas · ' + artUrlBase() + ' · Simulador gratuito: ' + artUrlBase() + '/simulador');
+  return L.join('\n');
+}
+async function htmlIndice(tipo, q) {
+  const todos = await enlacesPublicados(tipo);
+  const publico = ART_PUBLICOS.includes(q.publico) ? q.publico : '';
+  const tema = ART_TEMAS.includes(q.tema) ? q.tema : '';
+  const lista = todos.filter(e => (!publico || (e.d.publico || []).includes(publico)) && (!tema || e.d.tema === tema));
+  const base = ART_RUTA[tipo];
+  const esGuia = tipo === 'guia';
+  const filtro = (k, v, t) => '<a href="' + base + (v ? '?' + k + '=' + encodeURIComponent(v) : '') + '"' + ((k === 'publico' ? publico : tema) === v ? ' aria-current="page"' : '') + '>' + t + '</a>';
+  const filtros = esGuia ? '' : '<nav class="ar-filtros" aria-label="Para quién">' + filtro('publico', '', 'Todos') + ART_PUBLICOS.map(p => filtro('publico', p, p)).join('') + '</nav>' +
+    '<nav class="ar-filtros" aria-label="Temas" style="margin-top:0">' + ART_TEMAS.map(t => '<a href="' + base + '?tema=' + encodeURIComponent(t) + '"' + (tema === t ? ' aria-current="page"' : '') + ' style="border:none;background:var(--circulo);color:var(--suave);min-height:34px;font-size:13px">' + t + '</a>').join('') + '</nav>';
+  const guiasPub = esGuia ? lista : await enlacesPublicados('guia');
+  const logos = {}; for (const g of guiasPub) logos[g.slug] = await logoDeExchange(g.d.exchange);
+  const barraGuias = guiasPub.length ? '<section class="ar-guias" aria-labelledby="t-guias"><div style="display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;justify-content:space-between"><h2 id="t-guias" style="margin:0;font-size:20px;color:var(--titular)">Guías por exchange</h2><span style="font-size:14px">Qué archivo descargar y dónde está</span></div><div class="fila">' +
+    guiasPub.map(g => '<a class="g" href="/guias/' + g.slug + '">' + (imgLogo(logos[g.slug], 48) || '') + '<span>' + ESC_HTML(g.d.exchange || g.d.titulo) + '</span></a>').join('') + '</div></section>' : '';
+  if (esGuia) {
+    const cuerpoG = '<span style="font-size:16px;font-weight:600;color:var(--tinta)">Guías por exchange</span><h1 class="ar-h1">Guías por exchange: qué archivo descargar para tu renta</h1><p class="ar-entr">Paso a paso, con vídeo, para descargar el historial correcto de cada exchange y declarar tus criptomonedas en España.</p>' +
+      (lista.length ? '<div class="ar-guias" style="margin-top:8px"><div class="fila">' + lista.map(g => '<a class="g" href="/guias/' + g.slug + '">' + (imgLogo(logos[g.slug], 56) || '') + '<span>' + ESC_HTML(g.d.exchange || g.d.titulo) + '</span></a>').join('') + '</div></div>' : '<p>Muy pronto publicaremos aquí las primeras guías.</p>') +
+      '<section class="ar-franja"><span>¿Ya tienes tus archivos?</span><span style="display:flex;flex-wrap:wrap;gap:8px"><a class="ar-btn claro" href="/simulador">Probar SimulAcros</a><a class="ar-btn nar" href="/empieza-aqui">Hablar con un asesor</a></span></section>';
+    const jsonldG = [{ '@context': 'https://schema.org', '@type': 'CollectionPage', name: 'Guías por exchange', url: artUrlBase() + base, inLanguage: 'es-ES', hasPart: lista.slice(0, 50).map(e => ({ '@type': 'Article', headline: e.d.titulo, url: artUrlBase() + base + '/' + e.slug })) }];
+    return marco({ titulo: 'Guías por exchange: qué archivo descargar para tu renta · Acros', descripcion: 'Paso a paso, con vídeo, para descargar el historial correcto de cada exchange y declarar tus criptomonedas en España.', canonico: base, cuerpo: cuerpoG, jsonld: jsonldG, actual: tipo });
+  }
+  const destacado = !publico && !tema && lista.length ? lista[0] : null;
+  const resto = destacado ? lista.slice(1) : lista;
+  const htmlDestacado = destacado ? '<article class="ar-destacado"><div class="ar-pills"><span class="ar-pill" style="background:#23402F;color:#FBF8F2">Destacado</span>' + (destacado.d.publico || []).map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (destacado.d.tema ? '<span class="ar-pill tema">' + ESC_HTML(destacado.d.tema) + '</span>' : '') + '</div><h2><a href="' + base + '/' + destacado.slug + '">' + ESC_HTML(destacado.d.titulo) + '</a></h2>' + (destacado.d.entradilla ? '<p style="margin:0">' + ESC_HTML(destacado.d.entradilla) + '</p>' : '') + '<a class="ar-btn" href="' + base + '/' + destacado.slug + '" style="align-self:flex-start">Leer el artículo</a></article>' : '';
+  const tarjetas = resto.map(e => '<article class="ar-tarj"><div class="ar-pills">' + (e.d.publico || []).map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (e.d.tema ? '<span class="ar-pill tema">' + ESC_HTML(e.d.tema) + '</span>' : '') + (esGuia && e.d.exchange ? '<span class="ar-pill tema">' + ESC_HTML(e.d.exchange) + '</span>' : '') + '</div>' +
+    '<h2><a href="' + base + '/' + e.slug + '">' + ESC_HTML(e.d.titulo) + '</a></h2>' + (e.d.entradilla ? '<p>' + ESC_HTML(e.d.entradilla) + '</p>' : '') + '<small>' + (e.actualizado ? 'Actualizado el ' + artFecha(e.actualizado) : '') + '</small></article>').join('');
+  const titulo = esGuia ? 'Guías por exchange: qué archivo descargar para tu renta' : 'Fiscalidad de las criptomonedas, explicada por asesores';
+  const entr = esGuia ? 'Paso a paso, con vídeo, para descargar el historial correcto de cada exchange y declarar tus criptomonedas en España.' : 'Lo que necesitas saber para declarar tus criptomonedas en España, escrito y revisado por el equipo de Acros.';
+  const cuerpo = '<span style="font-size:16px;font-weight:600;color:var(--tinta)">' + (esGuia ? 'Guías por exchange' : 'Artículos') + '</span><h1 class="ar-h1">' + titulo + '</h1><p class="ar-entr">' + entr + '</p>' + filtros +
+    htmlDestacado + barraGuias +
+    (tarjetas ? '<div class="ar-rejilla">' + tarjetas + '</div>' : (destacado ? '' : '<p>' + (todos.length ? 'No hay nada con ese filtro todavía.' : 'Muy pronto publicaremos aquí los primeros artículos.') + '</p>')) +
+    '<section class="ar-franja"><span>¿Cuánto pagarías tú si el año acabara hoy?</span><span style="display:flex;flex-wrap:wrap;gap:8px"><a class="ar-btn claro" href="/simulador">Probar SimulAcros</a><a class="ar-btn nar" href="/empieza-aqui">Hablar con un asesor</a></span></section>';
+  const jsonld = [{ '@context': 'https://schema.org', '@type': 'CollectionPage', name: titulo, url: artUrlBase() + base, inLanguage: 'es-ES', hasPart: lista.slice(0, 50).map(e => ({ '@type': 'Article', headline: e.d.titulo, url: artUrlBase() + base + '/' + e.slug })) }];
+  return marco({ titulo: titulo + ' · Acros', descripcion: entr, canonico: base + (publico || tema ? '?' + (publico ? 'publico=' + encodeURIComponent(publico) : 'tema=' + encodeURIComponent(tema)) : ''), cuerpo, jsonld, actual: tipo });
+}
+const htmlNoEncontrado = tipo => marco({ titulo: 'No encontrado · Acros', descripcion: '', canonico: ART_RUTA[tipo], cuerpo: '<h1 class="ar-h1">Esta página no existe</h1><p>Puede que se haya movido. <a href="' + ART_RUTA[tipo] + '">Ver todos ' + (tipo === 'guia' ? 'las guías' : 'los artículos') + '</a>.</p>', actual: tipo, previa: true });
+
+// ---------------- Rutas públicas (las sirve el Worker de Cloudflare en acrosfi.es)
+function enviarHtml(res, html, estado = 200) { res.status(estado).set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(html); }
+for (const tipo of ART_TIPOS) {
+  const base = ART_RUTA[tipo];
+  app.get(base, async (req, res) => { try { enviarHtml(res, await htmlIndice(tipo, req.query || {})); } catch (e) { console.error('Índice de artículos:', e); res.status(500).send('Error'); } });
+  app.get(base + '/:slug([a-z0-9-]{1,100}).md', async (req, res) => {
+    const [f] = await pool.execute('SELECT * FROM articulos WHERE tipo = ? AND slug = ? AND publicado IS NOT NULL', [tipo, req.params.slug]);
+    if (!f.length) return res.status(404).type('text/plain').send('No encontrado');
+    const d = JSON.parse(f[0].publicado), autor = await autorPublico(f[0].autor_asesor_id);
+    res.set({ 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(mdArticulo(tipo, f[0].slug, d, autor, { publicado: f[0].publicado_en, actualizado: f[0].actualizado_publico_en }));
+  });
+  app.get(base + '/:slug([a-z0-9-]{1,100})', async (req, res) => {
+    try {
+      const [f] = await pool.execute('SELECT * FROM articulos WHERE tipo = ? AND slug = ? AND publicado IS NOT NULL', [tipo, req.params.slug]);
+      if (!f.length) return enviarHtml(res, htmlNoEncontrado(tipo), 404);
+      const d = JSON.parse(f[0].publicado), autor = await autorPublico(f[0].autor_asesor_id);
+      enviarHtml(res, await htmlPaginaArticulo(tipo, f[0].slug, d, autor, { publicado: f[0].publicado_en, actualizado: f[0].actualizado_publico_en }, false));
+    } catch (e) { console.error('Página de artículo:', e); res.status(500).send('Error'); }
+  });
+}
+app.get('/articulos/img/:id([a-f0-9]{32})', async (req, res) => {
+  const [f] = await pool.execute('SELECT tipo, datos FROM articulos_imagenes WHERE id = ?', [req.params.id]);
+  if (!f.length) return res.status(404).end();
+  res.set({ 'Content-Type': f[0].tipo, 'Cache-Control': 'public, max-age=31536000, immutable', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'", 'X-Content-Type-Options': 'nosniff' }).send(f[0].datos);
+});
+app.get('/articulos/sitemap.xml', async (req, res) => {
+  const todos = await enlacesPublicados(null), base = artUrlBase();
+  const urls = [[base + '/articulos', null], [base + '/guias', null], ...todos.map(e => [base + ART_RUTA[e.tipo] + '/' + e.slug, e.actualizado])];
+  res.set('Content-Type', 'application/xml; charset=utf-8').send('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls.map(([u, d]) => '<url><loc>' + ESC_HTML(u) + '</loc>' + (d ? '<lastmod>' + new Date(d).toISOString().slice(0, 10) + '</lastmod>' : '') + '</url>').join('') + '</urlset>');
+});
+
+// ---------------- Panel: artículos (todo el equipo escribe; publican los administradores)
+const artPuedeEditar = (req, fila) => req.asesor.esAdmin || fila.autor_asesor_id === req.asesor.id;
+function artFila(x, conBorrador) {
+  let d = {}; try { d = JSON.parse(x.borrador); } catch (e) {}
+  const o = { id: x.id, tipo: x.tipo, slug: x.slug, estado: x.estado, autor_asesor_id: x.autor_asesor_id, autor: x.autor_nombre || null, titulo: d.titulo || '', publico: d.publico || [], tema: d.tema || '', exchange: d.exchange || '',
+    publicado: !!x.publicado, comentario_revision: x.comentario_revision, enviado_en: x.enviado_en, publicado_en: x.publicado_en, actualizado_publico_en: x.actualizado_publico_en, actualizado_en: x.actualizado_en,
+    url: x.publicado ? ART_RUTA[x.tipo] + '/' + x.slug : null };
+  if (conBorrador) { o.borrador = d; o.avisos = revisarBorrador(limpiarBorrador(d, x.tipo), x.tipo); }
+  return o;
+}
+async function artCargar(id) {
+  const [f] = await pool.execute('SELECT a.*, s.nombre AS autor_nombre FROM articulos a LEFT JOIN asesores s ON s.id = a.autor_asesor_id WHERE a.id = ?', [Number(id)]);
+  return f[0] || null;
+}
+async function artSlugLibre(tipo, slug, idPropio) {
+  let s = slug || 'articulo', n = 1;
+  while (true) {
+    const [f] = await pool.execute('SELECT id FROM articulos WHERE tipo = ? AND slug = ? AND id <> ?', [tipo, s, idPropio || 0]);
+    if (!f.length) return s;
+    s = slug + '-' + (++n);
+  }
+}
+app.get('/api/admin/articulos', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.query('SELECT a.*, s.nombre AS autor_nombre FROM articulos a LEFT JOIN asesores s ON s.id = a.autor_asesor_id ORDER BY a.actualizado_en DESC');
+  res.json({ articulos: f.map(x => artFila(x, false)), es_admin: !!req.asesor.esAdmin, yo: req.asesor.id, publicos: ART_PUBLICOS, temas: ART_TEMAS });
+});
+app.post('/api/admin/articulos', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, tipo = ART_TIPOS.includes(b.tipo) ? b.tipo : 'articulo';
+  const borr = limpiarBorrador({ titulo: b.titulo || '', columna: [{ tipo: 'indice' }] }, tipo);
+  const slug = await artSlugLibre(tipo, artSlug(b.slug || b.titulo) || (tipo === 'guia' ? 'guia' : 'articulo'), 0);
+  const [ins] = await pool.execute('INSERT INTO articulos (tipo, slug, autor_asesor_id, borrador) VALUES (?, ?, ?, ?)', [tipo, slug, req.asesor.id, JSON.stringify(borr)]);
+  res.status(201).json(artFila(await artCargar(ins.insertId), true));
+});
+app.get('/api/admin/articulos/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  res.json(Object.assign(artFila(f, true), { puede_editar: artPuedeEditar(req, f) }));
+});
+app.put('/api/admin/articulos/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  if (!artPuedeEditar(req, f)) return res.status(403).json({ error: 'Solo su autor o un administrador pueden cambiarlo' });
+  if (f.estado === 'revision' && !req.asesor.esAdmin) return res.status(409).json({ error: 'Está en revisión: espera a que un administrador lo publique o te lo devuelva' });
+  const b = req.body || {};
+  const borr = limpiarBorrador(b.borrador, f.tipo);
+  let slug = f.slug;
+  if (b.slug !== undefined && artSlug(b.slug) && artSlug(b.slug) !== f.slug) {
+    if (f.publicado && !req.asesor.esAdmin) return res.status(409).json({ error: 'La dirección de un artículo publicado solo la cambia un administrador' });
+    slug = await artSlugLibre(f.tipo, artSlug(b.slug), f.id);
+  }
+  // Un artículo publicado que se edita vuelve a borrador; la web sigue enseñando lo publicado hasta que se publique de nuevo
+  const estado = f.estado === 'revision' ? 'revision' : (f.estado === 'devuelto' ? 'devuelto' : 'borrador');
+  await pool.execute('UPDATE articulos SET borrador = ?, slug = ?, estado = ? WHERE id = ?', [JSON.stringify(borr), slug, estado, f.id]);
+  res.json(Object.assign(artFila(await artCargar(f.id), true), { puede_editar: true }));
+});
+app.post('/api/admin/articulos/:id(\\d+)/enviar', requiereSesionAsesor, async (req, res) => {
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  if (!artPuedeEditar(req, f)) return res.status(403).json({ error: 'Solo su autor puede enviarlo' });
+  const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo);
+  if (!d.titulo || !d.cuerpo.length) return res.status(400).json({ error: 'Pon al menos el título y algo de texto antes de enviarlo' });
+  await pool.execute("UPDATE articulos SET estado = 'revision', enviado_en = NOW(), comentario_revision = NULL WHERE id = ?", [f.id]);
+  try { if (typeof avisarCaptacion === 'function') avisarCaptacion('Artículo pendiente de revisión', 'Hay un artículo esperando a que un administrador lo publique. Está en Web → Artículos.', { etiqueta: 'memo' }); } catch (e) {}
+  res.json(artFila(await artCargar(f.id), true));
+});
+app.post('/api/admin/articulos/:id(\\d+)/publicar', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador publica' });
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo);
+  if (!d.titulo || !d.cuerpo.length) return res.status(400).json({ error: 'Le falta el título o el texto' });
+  await pool.execute("UPDATE articulos SET publicado = ?, estado = 'publicado', comentario_revision = NULL, revisado_por_asesor_id = ?, revisado_en = NOW(), publicado_en = COALESCE(publicado_en, NOW()), actualizado_publico_en = NOW() WHERE id = ?",
+    [JSON.stringify(d), req.asesor.id, f.id]);
+  res.json(artFila(await artCargar(f.id), true));
+});
+app.post('/api/admin/articulos/:id(\\d+)/devolver', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador devuelve artículos' });
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  const com = artTxt((req.body || {}).comentario, 2000);
+  if (!com) return res.status(400).json({ error: 'Escribe al autor qué tiene que cambiar' });
+  await pool.execute("UPDATE articulos SET estado = 'devuelto', comentario_revision = ?, revisado_por_asesor_id = ?, revisado_en = NOW() WHERE id = ?", [com, req.asesor.id, f.id]);
+  res.json(artFila(await artCargar(f.id), true));
+});
+app.post('/api/admin/articulos/:id(\\d+)/despublicar', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador lo retira' });
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  await pool.execute("UPDATE articulos SET publicado = NULL, estado = 'borrador' WHERE id = ?", [f.id]);
+  res.json(artFila(await artCargar(f.id), true));
+});
+app.delete('/api/admin/articulos/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  if (!artPuedeEditar(req, f)) return res.status(403).json({ error: 'Solo su autor o un administrador pueden borrarlo' });
+  if (f.publicado && !req.asesor.esAdmin) return res.status(409).json({ error: 'Está publicado: solo un administrador puede retirarlo' });
+  await pool.execute('DELETE FROM articulos WHERE id = ?', [f.id]);
+  res.json({ ok: true });
+});
+app.get('/api/admin/articulos/:id(\\d+)/vista-previa', requiereSesionAsesor, async (req, res) => {
+  const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
+  const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo), autor = await autorPublico(f.autor_asesor_id);
+  res.json({ html: await htmlPaginaArticulo(f.tipo, f.slug, d, autor, { publicado: f.publicado_en, actualizado: f.actualizado_publico_en }, true) });
+});
+// Imagen ya reducida en el navegador (máx. 1.600 px). Se comprueba que sea de verdad JPG, PNG o WebP; el id es su huella.
+app.post('/api/admin/articulos/imagen', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, tipo = String(b.tipo || '');
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(tipo)) return res.status(400).json({ error: 'Usa una imagen JPG, PNG o WebP' });
+  let buf; try { buf = Buffer.from(String(b.datos_base64 || ''), 'base64'); } catch (e) { buf = null; }
+  if (!buf || !buf.length) return res.status(400).json({ error: 'La imagen llegó vacía' });
+  if (buf.length > ART_MAX_IMAGEN) return res.status(400).json({ error: 'La imagen pesa demasiado (máximo 900 KB tras reducirla)' });
+  const fi = buf.subarray(0, 12);
+  const ok = (tipo === 'image/jpeg' && fi[0] === 0xFF && fi[1] === 0xD8) || (tipo === 'image/png' && fi[0] === 0x89 && fi[1] === 0x50) || (tipo === 'image/webp' && fi.subarray(0, 4).toString('latin1') === 'RIFF' && fi.subarray(8, 12).toString('latin1') === 'WEBP');
+  if (!ok) return res.status(400).json({ error: 'El archivo no es la imagen que dice ser' });
+  const id = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 32);
+  await pool.execute('INSERT IGNORE INTO articulos_imagenes (id, tipo, datos, bytes, ancho, alto, subida_por_asesor_id) VALUES (?, ?, ?, ?, ?, ?, ?)', [id, tipo, buf, buf.length, Number(b.ancho) || null, Number(b.alto) || null, req.asesor.id]);
+  res.status(201).json({ id, bytes: buf.length, url: '/articulos/img/' + id });
+});
+// Biblioteca de recuadros: todos la ven; la editan los administradores
+app.get('/api/admin/articulos-recuadros', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.query('SELECT a.*, (SELECT COUNT(*) FROM articulos x WHERE x.borrador LIKE CONCAT(\'%"id":\', a.id, \'%\')) AS usos FROM articulos_recuadros a WHERE activo = 1 ORDER BY id');
+  res.json(f);
+});
+function limpiarRecuadro(b) {
+  b = b || {};
+  const url = String(b.boton_url || '').trim();
+  return { nombre: artTxt(b.nombre, 80), titulo: artTxt(b.titulo, 160), texto: artTxt(b.texto, 600), boton_texto: artTxt(b.boton_texto, 60), boton_url: /^(https?:\/\/|\/)[^\s"'<>]{0,290}$/.test(url) ? url : '', estilo: b.estilo === 'verde' ? 'verde' : 'crema' };
+}
+app.post('/api/admin/articulos-recuadros', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador cambia la biblioteca' });
+  const r = limpiarRecuadro(req.body); if (!r.nombre || !r.titulo) return res.status(400).json({ error: 'Pon un nombre y un título' });
+  const [ins] = await pool.execute('INSERT INTO articulos_recuadros (nombre, titulo, texto, boton_texto, boton_url, estilo) VALUES (?, ?, ?, ?, ?, ?)', [r.nombre, r.titulo, r.texto, r.boton_texto, r.boton_url, r.estilo]);
+  res.status(201).json({ id: ins.insertId, ...r });
+});
+app.put('/api/admin/articulos-recuadros/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador cambia la biblioteca' });
+  const r = limpiarRecuadro(req.body); if (!r.nombre || !r.titulo) return res.status(400).json({ error: 'Pon un nombre y un título' });
+  await pool.execute('UPDATE articulos_recuadros SET nombre = ?, titulo = ?, texto = ?, boton_texto = ?, boton_url = ?, estilo = ? WHERE id = ?', [r.nombre, r.titulo, r.texto, r.boton_texto, r.boton_url, r.estilo, Number(req.params.id)]);
+  res.json({ id: Number(req.params.id), ...r });
+});
+app.delete('/api/admin/articulos-recuadros/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador cambia la biblioteca' });
+  await pool.execute('UPDATE articulos_recuadros SET activo = 0 WHERE id = ?', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// ================================================================
+// CATÁLOGO DE PLATAFORMAS Y LOGOS (Acros 9, 11/11, Vikn)
+// Un logo por exchange, monedero y blockchain, guardado UNA vez y usado en toda Acros: guías por exchange, mapas de
+// burbujas del Área y del panel, SimulAcros, reconocer archivos…
+// · Cada plataforma tiene una clave fija (binance, kraken, bnb-chain…) y otros nombres con los que aparece (alias:
+//   «Binance Spain», «BSC», «BEP20»…), para que venga de donde venga se reconozca como la misma.
+// · Dirección fija de cada logo: /logos/<clave> (también /logos/<clave>.svg o .png). Si aún no tiene logo, sale uno
+//   provisional con sus iniciales, para que nada se rompa.
+// · Lista para quien la necesite (Área, panel, web): /logos/plataformas.json.
+// · El logo se guarda en la base de datos (como las fotos del equipo). Se cambia en un sitio y cambia en todos.
+// ================================================================
+const PLAT_TIPOS = ['exchange', 'monedero', 'blockchain', 'otro'];
+const PLAT_MAX_LOGO = 300 * 1024;
+const PLAT_SEMILLA = [
+  // exchanges y brókers (los de las guías y los conversores de DFPro)
+  ['binance', 'Binance', 'exchange', ['Binance Spain', 'Binance.com'], 'https://www.binance.com'],
+  ['bingx', 'BingX', 'exchange', [], 'https://bingx.com'],
+  ['bitstamp', 'Bitstamp', 'exchange', [], 'https://www.bitstamp.net'],
+  ['bitget', 'Bitget', 'exchange', [], 'https://www.bitget.com'],
+  ['bitunix', 'Bitunix', 'exchange', [], 'https://www.bitunix.com'],
+  ['bitvavo', 'Bitvavo', 'exchange', [], 'https://bitvavo.com'],
+  ['bit2me', 'Bit2Me', 'exchange', ['Bit2me', 'Bit 2 Me'], 'https://bit2me.com'],
+  ['blofin', 'BloFin', 'exchange', ['Blofin'], 'https://blofin.com'],
+  ['coinbase', 'Coinbase', 'exchange', ['Coinbase Pro', 'Coinbase Advanced'], 'https://www.coinbase.com'],
+  ['crypto-com', 'Crypto.com', 'exchange', ['Cryptocom', 'Crypto com'], 'https://crypto.com'],
+  ['etoro', 'eToro', 'exchange', [], 'https://www.etoro.com'],
+  ['kraken', 'Kraken', 'exchange', [], 'https://www.kraken.com'],
+  ['kucoin', 'KuCoin', 'exchange', ['Kucoin'], 'https://www.kucoin.com'],
+  ['mexc', 'MEXC', 'exchange', ['Mexc'], 'https://www.mexc.com'],
+  ['nexo', 'Nexo', 'exchange', [], 'https://nexo.com'],
+  ['okx', 'OKX', 'exchange', ['OKEx'], 'https://www.okx.com'],
+  ['pionex', 'Pionex', 'exchange', [], 'https://www.pionex.com'],
+  ['quantfury', 'Quantfury', 'exchange', [], 'https://quantfury.com'],
+  ['revolut', 'Revolut', 'exchange', [], 'https://www.revolut.com'],
+  ['weex', 'WEEX', 'exchange', ['Weex'], 'https://www.weex.com'],
+  ['cex-io', 'CEX.IO', 'exchange', ['CEXIO', 'Cex.io'], 'https://cex.io'],
+  ['trade-republic', 'Trade Republic', 'exchange', [], 'https://traderepublic.com'],
+  // monederos
+  ['ledger', 'Ledger', 'monedero', ['Ledger Live'], 'https://www.ledger.com'],
+  ['exodus', 'Exodus', 'monedero', [], 'https://www.exodus.com'],
+  ['sweat-wallet', 'Sweat Wallet', 'monedero', ['SWEAT Wallet', 'Sweatcoin'], 'https://sweateconomy.com'],
+  ['kaspium', 'Kaspium', 'monedero', [], 'https://kaspium.io'],
+  ['blockchain-com', 'Blockchain.com', 'monedero', ['Blockchain com'], 'https://www.blockchain.com'],
+  // blockchains (redes)
+  ['bitcoin', 'Bitcoin', 'blockchain', ['BTC'], 'https://bitcoin.org'],
+  ['ethereum', 'Ethereum', 'blockchain', ['ETH', 'ERC20', 'Ethereum Mainnet'], 'https://ethereum.org'],
+  ['bnb-chain', 'BNB Chain', 'blockchain', ['BSC', 'BEP20', 'Binance Smart Chain', 'BNB Smart Chain'], 'https://www.bnbchain.org'],
+  ['polygon', 'Polygon', 'blockchain', ['MATIC', 'POL', 'Polygon PoS'], 'https://polygon.technology'],
+  ['arbitrum', 'Arbitrum', 'blockchain', ['Arbitrum One', 'ARB'], 'https://arbitrum.io'],
+  ['optimism', 'Optimism', 'blockchain', ['OP Mainnet', 'OP'], 'https://www.optimism.io'],
+  ['base', 'Base', 'blockchain', [], 'https://www.base.org'],
+  ['solana', 'Solana', 'blockchain', ['SOL', 'SPL'], 'https://solana.com'],
+  ['tron', 'Tron', 'blockchain', ['TRX', 'TRC20'], 'https://tron.network'],
+  ['avalanche', 'Avalanche', 'blockchain', ['AVAX', 'Avalanche C-Chain'], 'https://www.avax.network'],
+  ['near', 'NEAR', 'blockchain', ['Near Protocol'], 'https://near.org'],
+  ['kaspa', 'Kaspa', 'blockchain', ['KAS'], 'https://kaspa.org'],
+  ['mode', 'Mode', 'blockchain', ['Mode Network'], 'https://www.mode.network'],
+  ['taiko', 'Taiko', 'blockchain', [], 'https://taiko.xyz'],
+  ['monad', 'Monad', 'blockchain', [], 'https://www.monad.xyz'],
+];
+const platClave = v => String(v || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+const platNorm = v => String(v || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '');
+
+async function prepararPlataformas() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS plataformas (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    clave VARCHAR(60) NOT NULL,
+    nombre VARCHAR(80) NOT NULL,
+    tipo VARCHAR(12) NOT NULL DEFAULT 'exchange',
+    alias TEXT NULL,
+    web VARCHAR(200) NULL,
+    logo_tipo VARCHAR(20) NULL,
+    logo_datos MEDIUMBLOB NULL,
+    logo_fuente VARCHAR(300) NULL,
+    logo_actualizado_en DATETIME NULL,
+    activa TINYINT(1) NOT NULL DEFAULT 1,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_plataformas_clave (clave)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  const [[n]] = await pool.query('SELECT COUNT(*) n FROM plataformas');
+  if (!n.n) {
+    for (const [clave, nombre, tipo, alias, web] of PLAT_SEMILLA)
+      await pool.execute('INSERT IGNORE INTO plataformas (clave, nombre, tipo, alias, web) VALUES (?, ?, ?, ?, ?)', [clave, nombre, tipo, JSON.stringify(alias), web]);
+  }
+}
+
+// Lista en memoria (se refresca al cambiar algo) para reconocer nombres sin consultar la base cada vez
+let PLAT_CACHE = null;
+async function plataformasActivas() {
+  if (PLAT_CACHE) return PLAT_CACHE;
+  const [f] = await pool.query("SELECT id, clave, nombre, tipo, alias, web, logo_tipo, logo_fuente, logo_actualizado_en, (logo_datos IS NOT NULL) AS tiene_logo FROM plataformas WHERE activa = 1 ORDER BY FIELD(tipo, 'exchange', 'monedero', 'blockchain', 'otro'), nombre");
+  PLAT_CACHE = f.map(x => { let a = []; try { a = JSON.parse(x.alias || '[]'); } catch (e) {} return { ...x, alias: a, tiene_logo: !!x.tiene_logo }; });
+  return PLAT_CACHE;
+}
+const platOlvidar = () => { PLAT_CACHE = null; };
+// «Binance Spain», «BSC», «kraken»… → su plataforma (o null)
+async function plataformaDeNombre(nombre) {
+  const n = platNorm(nombre); if (!n) return null;
+  const lista = await plataformasActivas();
+  return lista.find(p => platNorm(p.clave) === n || platNorm(p.nombre) === n || p.alias.some(a => platNorm(a) === n)) || null;
+}
+const urlLogo = p => '/logos/' + p.clave + (p.logo_actualizado_en ? '?v=' + new Date(p.logo_actualizado_en).getTime().toString(36) : '');
+
+// Logo provisional: iniciales sobre un círculo (para que nada se rompa mientras no haya logo)
+function logoProvisional(nombre) {
+  const ini = String(nombre || '?').replace(/[^A-Za-z0-9 ]/g, ' ').trim().split(/\s+/).map(x => x[0]).join('').slice(0, 2).toUpperCase() || '?';
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="' + ESC_HTML(nombre || '') + '"><circle cx="32" cy="32" r="31" fill="#F1E6D8" stroke="#CDBFA9" stroke-width="2"/><text x="32" y="40" text-anchor="middle" font-family="IBM Plex Sans, Arial, sans-serif" font-size="22" font-weight="700" fill="#23402F">' + ESC_HTML(ini) + '</text></svg>';
+}
+// SVG: solo dibujo. Fuera programas, eventos, enlaces externos y contenido incrustado.
+function svgSeguro(texto) {
+  const s = String(texto || '');
+  if (!/<svg[\s>]/i.test(s)) return 'No es un SVG';
+  if (/<script|<foreignObject|<iframe|<embed|<object|javascript:|data:text\/html|<!ENTITY|<\?xml-stylesheet/i.test(s)) return 'El SVG lleva código o contenido incrustado';
+  if (/\son[a-z]+\s*=/i.test(s)) return 'El SVG lleva programas';
+  if (/(?:xlink:)?href\s*=\s*["']\s*(?:https?:|\/\/)/i.test(s)) return 'El SVG enlaza a otra web';
+  return null;
+}
+
+// ---------------- Público
+app.get('/logos/plataformas.json', async (req, res) => {
+  const lista = await plataformasActivas();
+  res.set('Cache-Control', 'public, max-age=300').json(lista.map(p => ({ clave: p.clave, nombre: p.nombre, tipo: p.tipo, alias: p.alias, web: p.web, logo: urlLogo(p), tiene_logo: p.tiene_logo })));
+});
+app.get('/logos/:clave([a-z0-9-]{1,60})(.svg|.png|.webp|.jpg)?', async (req, res) => {
+  const [f] = await pool.execute('SELECT nombre, logo_tipo, logo_datos FROM plataformas WHERE clave = ? AND activa = 1', [req.params.clave]);
+  const cab = { 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'", 'Access-Control-Allow-Origin': '*' };
+  if (!f.length || !f[0].logo_datos) {
+    return res.status(f.length ? 200 : 404).set({ ...cab, 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(logoProvisional(f.length ? f[0].nombre : req.params.clave));
+  }
+  // con ?v= (la dirección cambia al subir otro logo) se puede guardar mucho tiempo; sin ella, 1 hora
+  res.set({ ...cab, 'Content-Type': f[0].logo_tipo, 'Cache-Control': req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=3600' }).send(f[0].logo_datos);
+});
+
+// ---------------- Panel: todos lo ven; cambian el catálogo los administradores y marketing
+const puedeCambiarPlataformas = req => !!req.asesor.esAdmin || tieneRol(req, 'marketing');
+app.get('/api/admin/plataformas', requiereSesionAsesor, async (req, res) => {
+  platOlvidar();
+  const lista = await plataformasActivas();
+  res.json({ plataformas: lista.map(p => ({ ...p, logo: urlLogo(p) })), puede_cambiar: puedeCambiarPlataformas(req), tipos: PLAT_TIPOS });
+});
+function limpiarPlataforma(b) {
+  b = b || {};
+  const web = String(b.web || '').trim();
+  return {
+    nombre: String(b.nombre || '').trim().slice(0, 80),
+    clave: platClave(b.clave || b.nombre),
+    tipo: PLAT_TIPOS.includes(b.tipo) ? b.tipo : 'exchange',
+    alias: (Array.isArray(b.alias) ? b.alias : String(b.alias || '').split(',')).map(x => String(x).trim().slice(0, 60)).filter(Boolean).slice(0, 30),
+    web: /^https?:\/\/[^\s"'<>]{1,190}$/.test(web) ? web : '',
+    logo_fuente: String(b.logo_fuente || '').trim().slice(0, 300),
+  };
+}
+app.post('/api/admin/plataformas', requiereSesionAsesor, async (req, res) => {
+  if (!puedeCambiarPlataformas(req)) return res.status(403).json({ error: 'Solo administradores y marketing cambian el catálogo' });
+  const p = limpiarPlataforma(req.body);
+  if (!p.nombre || !p.clave) return res.status(400).json({ error: 'Pon el nombre' });
+  try {
+    const [ins] = await pool.execute('INSERT INTO plataformas (clave, nombre, tipo, alias, web, logo_fuente) VALUES (?, ?, ?, ?, ?, ?)', [p.clave, p.nombre, p.tipo, JSON.stringify(p.alias), p.web || null, p.logo_fuente || null]);
+    platOlvidar(); res.status(201).json({ id: ins.insertId, ...p });
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Ya hay una plataforma con esa clave' });
+    throw e;
+  }
+});
+app.put('/api/admin/plataformas/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  if (!puedeCambiarPlataformas(req)) return res.status(403).json({ error: 'Solo administradores y marketing cambian el catálogo' });
+  const p = limpiarPlataforma(req.body);
+  if (!p.nombre) return res.status(400).json({ error: 'Pon el nombre' });
+  // la clave forma parte de la dirección del logo: no se cambia aquí, para no romper enlaces ya usados
+  await pool.execute('UPDATE plataformas SET nombre = ?, tipo = ?, alias = ?, web = ?, logo_fuente = ? WHERE id = ?', [p.nombre, p.tipo, JSON.stringify(p.alias), p.web || null, p.logo_fuente || null, Number(req.params.id)]);
+  platOlvidar(); res.json({ ok: true });
+});
+app.post('/api/admin/plataformas/:id(\\d+)/logo', requiereSesionAsesor, async (req, res) => {
+  if (!puedeCambiarPlataformas(req)) return res.status(403).json({ error: 'Solo administradores y marketing cambian los logos' });
+  const b = req.body || {}, tipo = String(b.tipo || '');
+  if (!['image/svg+xml', 'image/png', 'image/webp'].includes(tipo)) return res.status(400).json({ error: 'Usa un logo SVG (mejor) o PNG/WebP' });
+  let buf; try { buf = Buffer.from(String(b.datos_base64 || ''), 'base64'); } catch (e) { buf = null; }
+  if (!buf || !buf.length) return res.status(400).json({ error: 'El archivo llegó vacío' });
+  if (buf.length > PLAT_MAX_LOGO) return res.status(400).json({ error: 'El logo pesa demasiado (máximo 300 KB)' });
+  if (tipo === 'image/svg+xml') { const mal = svgSeguro(buf.toString('utf8')); if (mal) return res.status(400).json({ error: mal }); }
+  else {
+    const fi = buf.subarray(0, 12);
+    const ok = (tipo === 'image/png' && fi[0] === 0x89 && fi[1] === 0x50) || (tipo === 'image/webp' && fi.subarray(0, 4).toString('latin1') === 'RIFF' && fi.subarray(8, 12).toString('latin1') === 'WEBP');
+    if (!ok) return res.status(400).json({ error: 'El archivo no es la imagen que dice ser' });
+  }
+  const [r] = await pool.execute('UPDATE plataformas SET logo_tipo = ?, logo_datos = ?, logo_actualizado_en = NOW(), logo_fuente = COALESCE(?, logo_fuente) WHERE id = ?', [tipo, buf, String(b.logo_fuente || '').trim().slice(0, 300) || null, Number(req.params.id)]);
+  if (!r.affectedRows) return res.status(404).json({ error: 'No existe' });
+  platOlvidar();
+  const p = (await plataformasActivas()).find(x => x.id === Number(req.params.id));
+  res.json({ ok: true, logo: p ? urlLogo(p) : null });
+});
+app.delete('/api/admin/plataformas/:id(\\d+)/logo', requiereSesionAsesor, async (req, res) => {
+  if (!puedeCambiarPlataformas(req)) return res.status(403).json({ error: 'Solo administradores y marketing cambian los logos' });
+  await pool.execute('UPDATE plataformas SET logo_tipo = NULL, logo_datos = NULL, logo_actualizado_en = NOW() WHERE id = ?', [Number(req.params.id)]);
+  platOlvidar(); res.json({ ok: true });
+});
+app.delete('/api/admin/plataformas/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  if (!puedeCambiarPlataformas(req)) return res.status(403).json({ error: 'Solo administradores y marketing cambian el catálogo' });
+  await pool.execute('UPDATE plataformas SET activa = 0 WHERE id = ?', [Number(req.params.id)]);
+  platOlvidar(); res.json({ ok: true });
+});
+// Qué plataforma es este nombre (para quien solo tiene «Binance Spain», «BSC»…)
+app.get('/api/admin/plataformas/reconocer', requiereSesionAsesor, async (req, res) => {
+  const p = await plataformaDeNombre(req.query.nombre);
+  res.json(p ? { clave: p.clave, nombre: p.nombre, tipo: p.tipo, logo: urlLogo(p) } : null);
 });
 
 async function prepararFormatosArchivo() {
@@ -9668,6 +10459,87 @@ app.post('/api/admin/clientes/:id/cierre', requiereSesionAsesor, async (req, res
     res.json({ ok: true, enviada_b3: enviada });
   } catch (e) { console.error('Cierre del expediente:', e.message); res.status(500).json({ error: 'No se pudo guardar el cierre' }); }
 });
+
+// ================================================================
+// DOCUMENTOS ÍNTEGROS (12/11, decisión de Vikn sobre la nota del chat DFPro)
+// - El archivo cifrado viaja en binario (no en base64 dentro de JSON) y pasa por el servidor en flujo directo a R2, sin cargarse
+//   entero en memoria. Así el límite real es el que se anuncia: 100 MB por archivo.
+// - Tope diario por cliente: 60 archivos o 1 GB (lo que llegue antes), hora de Madrid.
+// - Huella SHA-256 del archivo ORIGINAL (la calcula el navegador antes de cifrar): cadena de custodia, duplicados y comprobación
+//   al abrirlo en el panel (solo avisa si NO coincide).
+// Flujo: 1) POST /api/propuestas/:token/subida-binaria (cuerpo = bytes cifrados) → { ref }
+//        2) las rutas de siempre (documentos-nuevo, documentos/:id/subir) con archivo_ref en vez de archivo_cifrado.
+// ================================================================
+const MAX_ARCHIVO = 100 * 1024 * 1024;
+const MAX_ARCHIVO_CIFRADO = MAX_ARCHIVO + 1024;            // AES-GCM añade 16 bytes de etiqueta
+const LIMITE_BYTES_DIA = 1024 * 1024 * 1024;
+const MSG_LIMITE_BYTES = 'Has llegado al límite de hoy (1 GB). Mañana podrás subir más; si te corre prisa, escribe a tu asesor.';
+async function prepararDocumentosIntegros() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS subidas_binarias (
+    ref CHAR(48) PRIMARY KEY, cliente_id INT NOT NULL, propuesta_id INT NOT NULL, clave_r2 VARCHAR(200) NOT NULL, bytes BIGINT NOT NULL,
+    usada TINYINT NOT NULL DEFAULT 0, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY ix_sb_cliente (cliente_id, creado_en)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await agregaColumnaSiFalta('documentos_fiscales', '`huella_sha256`', 'CHAR(64) NULL');
+  await agregaColumnaSiFalta('documentos_fiscales', '`tamano_original`', 'BIGINT NULL');
+}
+async function bytesDeHoy(conn, clienteId) {
+  const [f] = await conn.execute('SELECT COALESCE(SUM(bytes), 0) AS b FROM subidas_binarias WHERE cliente_id = ? AND creado_en >= ?', [clienteId, aSQLDatetime(inicioDiaMadridUTC(fechaMadrid().fecha))]);
+  return Number(f[0].b) || 0;
+}
+// Sube un flujo a R2 sin guardarlo entero en memoria (en pruebas, a la memoria simulada)
+async function subirFlujoAR2(clave, flujo, bytes) {
+  if (!R2_BUCKET && process.env.ACROS_PRUEBAS === '1') {
+    const trozos = []; let n = 0;
+    for await (const t of flujo) { n += t.length; if (n > bytes) throw Object.assign(new Error('Más grande de lo anunciado'), { codigo: 400 }); trozos.push(t); }
+    if (n !== bytes) throw Object.assign(new Error('El archivo llegó incompleto'), { codigo: 400 });
+    R2_MEMORIA.set(clave, { buffer: Buffer.concat(trozos), tipoMime: 'application/octet-stream' }); return;
+  }
+  await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: clave, Body: flujo, ContentLength: bytes, ContentType: 'application/octet-stream' }));
+}
+app.post('/api/propuestas/:token/subida-binaria', async (req, res) => {
+  const bytes = Number(req.headers['content-length']);
+  if (!/^application\/octet-stream/.test(req.headers['content-type'] || '')) return res.status(415).json({ error: 'Formato de subida no válido' });
+  if (!bytes) return res.status(411).json({ error: 'Falta el tamaño del archivo' });
+  if (bytes > MAX_ARCHIVO_CIFRADO) { req.resume(); return res.status(413).json({ error: 'El archivo no puede superar los 100 MB' }); }
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) { req.resume(); return res.status(404).json({ error: 'Propuesta no encontrada' }); }
+    if (await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) { req.resume(); return res.status(429).json({ error: MSG_LIMITE_SUBIDAS }); }
+    if (await bytesDeHoy(conn, p.cliente_id) + bytes > LIMITE_BYTES_DIA) { req.resume(); return res.status(429).json({ error: MSG_LIMITE_BYTES }); }
+    const ref = generarToken().slice(0, 48), clave = `docs/${p.cliente_id}/${generarToken()}.enc`;
+    await subirFlujoAR2(clave, req, bytes);
+    await conn.execute('INSERT INTO subidas_binarias (ref, cliente_id, propuesta_id, clave_r2, bytes) VALUES (?, ?, ?, ?, ?)', [ref, p.cliente_id, p.id, clave, bytes]);
+    res.status(201).json({ ok: true, ref });
+  } catch (e) {
+    console.error('Subida binaria:', e.message);
+    if (!res.headersSent) res.status(e.codigo || 500).json({ error: e.codigo ? e.message : 'No se pudo subir el archivo' });
+  } finally { conn.release(); }
+});
+// Las rutas de siempre: con archivo_ref, toman lo ya subido (del mismo cliente y sin usar)
+async function tomarSubida(conn, ref, clienteId) {
+  if (!/^[A-Za-z0-9_-]{16,48}$/.test(String(ref || ''))) return null;
+  const [f] = await conn.execute('SELECT clave_r2 FROM subidas_binarias WHERE ref = ? AND cliente_id = ? AND usada = 0', [ref, clienteId]);
+  if (!f.length) return null;
+  await conn.execute('UPDATE subidas_binarias SET usada = 1 WHERE ref = ?', [ref]);
+  return f[0].clave_r2;
+}
+const huellaValida = h => /^[0-9a-f]{64}$/.test(String(h || '')) ? String(h) : null;
+async function duplicadoDe(conn, clienteId, huella, excluirId) {
+  if (!huella) return null;
+  const [f] = await conn.execute('SELECT id, nombre FROM documentos_fiscales WHERE cliente_id = ? AND huella_sha256 = ? AND id <> ? ORDER BY id LIMIT 1', [clienteId, huella, excluirId || 0]);
+  return f.length ? { id: f[0].id, nombre: f[0].nombre } : null;
+}
+// Limpieza: subidas que nunca se asociaron a un documento (el cliente cerró la página a medias), pasadas 24 h
+async function limpiarSubidasHuerfanas() {
+  try {
+    const [f] = await pool.query('SELECT ref, clave_r2 FROM subidas_binarias WHERE usada = 0 AND creado_en < NOW() - INTERVAL 1 DAY LIMIT 200');
+    for (const s of f) {
+      try { if (R2_BUCKET) await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: s.clave_r2 })); else R2_MEMORIA.delete(s.clave_r2); } catch (e) { continue; }
+      await pool.query('UPDATE subidas_binarias SET usada = 2 WHERE ref = ?', [s.ref]);   // 2 = borrada (cuenta para el tope del día igualmente)
+    }
+  } catch (e) { console.error('Limpieza de subidas:', e.message); }
+}
+setInterval(limpiarSubidasHuerfanas, 6 * 60 * 60 * 1000).unref();
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
 // express.json() (15mb) llegaba antes como una página HTML cruda de
