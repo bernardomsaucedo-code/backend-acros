@@ -1,0 +1,1312 @@
+{
+  "version": "0.4",
+  "fecha_version": "2026-11-20",
+  "temas_validos": [
+    "permuta",
+    "venta_euros",
+    "staking",
+    "airdrop",
+    "mineria",
+    "nft",
+    "defi",
+    "prestamos_cripto",
+    "ganancia_perdida",
+    "valor_mercado",
+    "base_coste_fifo",
+    "compensacion_perdidas",
+    "gastos_comisiones",
+    "capital_mobiliario",
+    "renta_ahorro",
+    "renta_general",
+    "imputacion_temporal",
+    "insolvencia_plataforma",
+    "actividad_economica_iae",
+    "trading_habitual",
+    "tgss_autonomo",
+    "no_residente",
+    "cambio_residencia_95bis",
+    "impatriados",
+    "modelo_720",
+    "stablecoins",
+    "modelo_721",
+    "modelo_172_173",
+    "modelo_100",
+    "dac8",
+    "mica_prestadores",
+    "iva",
+    "itp",
+    "jurisprudencia"
+  ],
+  "fichas": [
+    {
+      "id": "AEAT-MPR-MV-A",
+      "referencia": "Manual práctico de Renta, cap. 11, «Compra y venta de monedas virtuales», apartado a)",
+      "organismo": "AEAT",
+      "tipo": "manual",
+      "vinculante": false,
+      "ambito": "IRPF",
+      "fecha": "[PENDIENTE] el PDF no indica edición ni fecha de actualización",
+      "temas": [
+        "venta_euros",
+        "ganancia_perdida",
+        "valor_mercado",
+        "base_coste_fifo",
+        "imputacion_temporal",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo tributa en el IRPF la venta de criptomonedas por euros u otra moneda de curso legal, fuera de una actividad económica?",
+      "criterio": "Genera una ganancia o pérdida patrimonial: importe obtenido en euros (o su valor normal de mercado, si es mayor) menos el valor de adquisición, teniendo en cuenta los gastos directamente relacionados con la operación. Las unidades vendidas se identifican por FIFO y la renta se imputa al ejercicio en que se entregan las monedas, aunque el precio se cobre después. Es renta del ahorro y se declara en el apartado específico de transmisión o permuta de monedas virtuales.",
+      "normas_citadas": [
+        "LIRPF art. 14",
+        "LIRPF art. 35",
+        "LIRPF art. 46.b)",
+        "LIRPF art. 49",
+        "Ley 10/2010 art. 1.6"
+      ],
+      "enlace_oficial": "https://sede.agenciatributaria.gob.es/Sede/ayuda/manuales-videos-folletos/manuales-practicos/irpf-2025/c11-ganancias-perdidas-patrimoniales/monedas-virtuales/compra-venta-monedas-virtuales-tributacion-inversor.html",
+      "vigencia": "[PENDIENTE] comprobar si hay edición posterior del manual",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de la página de la sede AEAT, guardado por Vikn el 18/11/2026 (6 páginas)",
+      "pendientes": [
+        "Confirmar a qué edición del manual corresponde el PDF: la URL impresa está cortada; el enlace es el de la edición 2025 que se pidió descargar"
+      ]
+    },
+    {
+      "id": "AEAT-MPR-MV-B",
+      "referencia": "Manual práctico de Renta, cap. 11, «Compra y venta de monedas virtuales», apartado b)",
+      "organismo": "AEAT",
+      "tipo": "manual",
+      "vinculante": false,
+      "ambito": "IRPF",
+      "fecha": "[PENDIENTE] el PDF no indica edición ni fecha de actualización",
+      "temas": [
+        "permuta",
+        "ganancia_perdida",
+        "valor_mercado",
+        "base_coste_fifo",
+        "imputacion_temporal",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Tributa el intercambio de una criptomoneda por otra distinta y cómo se calcula?",
+      "criterio": "Es una permuta (art. 1538 CC) y genera ganancia o pérdida patrimonial aunque no intervengan euros. Se calcula como la diferencia entre el valor de adquisición de la moneda entregada y el mayor entre el valor de mercado de la entregada y el de la recibida; ese valor pasa a ser el de adquisición de la recibida. Se aplica FIFO, se imputa en el momento del intercambio, es renta del ahorro y las pérdidas deben poder acreditarse si lo piden gestión o inspección.",
+      "normas_citadas": [
+        "LIRPF art. 14",
+        "LIRPF art. 37.1.h)",
+        "LIRPF art. 46.b)",
+        "LIRPF art. 49",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://sede.agenciatributaria.gob.es/Sede/ayuda/manuales-videos-folletos/manuales-practicos/irpf-2025/c11-ganancias-perdidas-patrimoniales/monedas-virtuales/compra-venta-monedas-virtuales-tributacion-inversor.html",
+      "vigencia": "[PENDIENTE] comprobar si hay edición posterior del manual",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de la página de la sede AEAT, guardado por Vikn el 18/11/2026 (6 páginas)",
+      "pendientes": [
+        "Confirmar a qué edición del manual corresponde el PDF (URL impresa cortada)"
+      ]
+    },
+    {
+      "id": "AEAT-MPR-MV-C",
+      "referencia": "Manual práctico de Renta, cap. 11, «Compra y venta de monedas virtuales», apartado c)",
+      "organismo": "AEAT",
+      "tipo": "manual",
+      "vinculante": false,
+      "ambito": "IRPF",
+      "fecha": "[PENDIENTE] el PDF no indica edición ni fecha de actualización",
+      "temas": [
+        "insolvencia_plataforma",
+        "ganancia_perdida",
+        "imputacion_temporal",
+        "renta_general"
+      ],
+      "pregunta": "¿Cuándo y cómo se declara la pérdida si una plataforma no devuelve las criptomonedas depositadas o quiebra?",
+      "criterio": "El impago no es automáticamente una pérdida, porque el cliente conserva su derecho de crédito. La pérdida solo se imputa cuando se da alguna de las circunstancias del art. 14.2.k) LIRPF: quita eficaz en un acuerdo de refinanciación o extrajudicial de pagos, convenio con quita o conclusión del concurso sin cobro, o un año desde el inicio de un procedimiento judicial de ejecución distinto del concurso; si después se cobra, se imputa ganancia por lo cobrado. Es renta general, no del ahorro.",
+      "normas_citadas": [
+        "LIRPF art. 14.2.k)",
+        "LIRPF art. 45",
+        "LIRPF art. 48",
+        "Ley 22/2003 Concursal arts. 71 bis, 133 y 176, DA 4.ª y Título X"
+      ],
+      "enlace_oficial": "https://sede.agenciatributaria.gob.es/Sede/ayuda/manuales-videos-folletos/manuales-practicos/irpf-2025/c11-ganancias-perdidas-patrimoniales/monedas-virtuales/compra-venta-monedas-virtuales-tributacion-inversor.html",
+      "vigencia": "[PENDIENTE] comprobar si hay edición posterior del manual",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de la página de la sede AEAT, guardado por Vikn el 18/11/2026 (6 páginas)",
+      "pendientes": [
+        "Confirmar a qué edición del manual corresponde el PDF (URL impresa cortada)",
+        "El texto remite a la Ley 22/2003 Concursal: comprobar en el BOE la redacción vigente del art. 14.2.k) LIRPF por si las remisiones están actualizadas"
+      ]
+    },
+    {
+      "id": "DGT-V0999-18",
+      "referencia": "V0999-18",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2018-04-18",
+      "temas": [
+        "permuta",
+        "ganancia_perdida",
+        "valor_mercado",
+        "compensacion_perdidas",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Canjear una criptomoneda por otra distinta genera renta en el IRPF y cómo se cuantifica?",
+      "criterio": "Cada criptomoneda es un bien distinto, así que el canje es una permuta que genera ganancia o pérdida patrimonial (art. 33.1). Se calcula por la diferencia entre el valor de adquisición de la entregada y el mayor entre el valor de mercado de la entregada y el de la recibida (art. 37.1.h), y ese valor pasa a ser el de adquisición de la recibida; fijar el valor de mercado es cuestión de hecho que se acredita con cualquier prueba admitida en Derecho. Es renta del ahorro, la pérdida debe poder justificarse y hay que conservar los justificantes durante el plazo de prescripción (art. 104.1).",
+      "normas_citadas": [
+        "LIRPF arts. 2, 33.1, 33.5.a), 34.1.a), 35, 37.1.h), 46.b), 49.1.b), 49.2 y 104.1",
+        "Código Civil art. 1538",
+        "LGT arts. 89.1, 93 y 106.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0999-18)",
+      "vigencia": "Criterio de permuta reiterado en V1149-18, V2520-22, V0648-24 y V1543-25",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 5 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": [
+        "La consulta transcribe el art. 49 LIRPF en su redacción de 2018: comprobar la vigente en el BOE antes de citar límites de compensación"
+      ]
+    },
+    {
+      "id": "DGT-V1543-25",
+      "referencia": "V1543-25",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF / IAE",
+      "fecha": "2025-08-26",
+      "temas": [
+        "actividad_economica_iae",
+        "venta_euros",
+        "permuta",
+        "base_coste_fifo",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Quien compra y vende criptomonedas con fondos propios y para sí mismo debe darse de alta en el IAE, y cómo tributan esas operaciones?",
+      "criterio": "La compraventa de criptomonedas para uno mismo no es actividad económica, por lo que no hay alta ni tributación en el IAE. Las ventas por euros y las permutas generan ganancias o pérdidas patrimoniales, que se calculan por separado para cada tipo de criptomoneda y aplicando FIFO, y las permutas se valoran con el art. 37.1.h). Todo se integra en la base del ahorro del periodo en que ocurre la operación.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 33.1, 34.1.a), 35, 37.1.h), 46 y 49",
+        "RDLeg 2/2004 (TRLRHL) arts. 78 y 79",
+        "Código Civil art. 1538",
+        "Reglamento (UE) 2023/1114 art. 3.1.5)",
+        "Ley 10/2010 art. 1.5"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1543-25)",
+      "vigencia": "Cita como antecedentes de FIFO V0525-25, V1604-18, V0975-22 y V0648-24",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": [
+        "Contestada bajo la hipótesis de que las operaciones son ajenas a una actividad económica y solo con criptomonedas"
+      ]
+    },
+    {
+      "id": "DGT-V0666-25",
+      "referencia": "V0666-25",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2025-04-14",
+      "temas": [
+        "cambio_residencia_95bis",
+        "no_residente"
+      ],
+      "pregunta": "¿El impuesto de salida del art. 95 bis LIRPF se aplica a quien traslada su residencia (a Andorra) siendo titular de criptomonedas tipo bitcoin?",
+      "criterio": "No: el art. 95 bis solo alcanza a acciones o participaciones en entidades, y bitcoin y criptomonedas similares que no dan derechos adicionales no lo son. Si se tienen otros criptoactivos, habrá que analizar sus características uno a uno para ver si entran en el régimen.",
+      "normas_citadas": [
+        "LIRPF art. 95 bis.1",
+        "Reglamento (UE) 2023/1114 art. 3.1.5)",
+        "Ley 10/2010 art. 1.5",
+        "LGT art. 89.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0666-25)",
+      "vigencia": "[PENDIENTE] sin pronunciamiento posterior revisado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 2 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V1766-22",
+      "referencia": "V1766-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2022-07-26",
+      "temas": [
+        "staking",
+        "capital_mobiliario",
+        "actividad_economica_iae",
+        "renta_ahorro",
+        "tgss_autonomo"
+      ],
+      "pregunta": "¿Cómo tributan las recompensas que obtiene quien actúa como validador mediante staking?",
+      "criterio": "No es actividad económica, porque se limita a bloquear criptoactivos y la validación es aleatoria, automática y con recursos mínimos, así que las recompensas son rendimiento del capital mobiliario en especie (art. 25.2). Se valoran a valor de mercado en euros el día en que se reciben (se puede usar el cambio medio del día), van a la base del ahorro, no son deducibles los gastos del art. 26.1.a) y no hay ingreso a cuenta si vienen del propio sistema. Si hay que darse de alta como autónomo en la Seguridad Social, la DGT no lo contesta porque excede de sus competencias.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 26.1.a), 27.1, 43.1, 46 y 49",
+        "RIRPF (RD 439/2007) arts. 75 y 76",
+        "LGT art. 89.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1766-22)",
+      "vigencia": "Vigente; reiterada en V0648-24 (11/04/2024) y V0612-26 (17/03/2026)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0648-24-1",
+      "referencia": "V0648-24 (apartado 1)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-04-11",
+      "temas": [
+        "venta_euros",
+        "permuta",
+        "base_coste_fifo",
+        "gastos_comisiones",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo tributan la compraventa y la permuta de criptomonedas y qué pasa con las comisiones de plataforma y de red?",
+      "criterio": "Ventas y permutas generan ganancias o pérdidas patrimoniales que se calculan por separado para cada tipo de criptomoneda, con FIFO y, en las permutas, con el art. 37.1.h). Las comisiones de la plataforma (trading fees) y las de red (gas fees) se computan en el valor de adquisición o de transmisión (art. 35) si se originan por la operación y las paga el contribuyente. Todo va a la base del ahorro.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34, 35, 37.1, 48 y 49 (cabecera de la consulta)",
+        "LIRPF arts. 34.1.a), 35, 37.1.h), 46 y 49",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0648-24)",
+      "vigencia": "Cita V0975-22 y V2520-22 para FIFO",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0648-24-2",
+      "referencia": "V0648-24 (apartado 2)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-04-11",
+      "temas": [
+        "defi",
+        "capital_mobiliario",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo tributan los rendimientos de depositar criptoactivos en reservas de liquidez (liquidity pools) y en plataformas DeFi de optimización de rendimientos?",
+      "criterio": "Son rendimientos del capital mobiliario por cesión a terceros de capitales propios (art. 25.2), se valoran a valor de mercado en euros el día en que se perciben si se cobran en criptoactivos y van a la base del ahorro. La DGT deja fuera expresamente la obtención y el reembolso de los LP tokens.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34, 35, 37.1, 48 y 49 (cabecera de la consulta)",
+        "LIRPF arts. 25.2, 43.1, 46 y 49"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0648-24)",
+      "vigencia": "[PENDIENTE] sin pronunciamiento posterior revisado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": [
+        "La tributación de la entrega y el reembolso de LP tokens no está resuelta en esta consulta"
+      ]
+    },
+    {
+      "id": "DGT-V0648-24-3",
+      "referencia": "V0648-24 (apartado 3)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-04-11",
+      "temas": [
+        "staking",
+        "capital_mobiliario",
+        "gastos_comisiones",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo tributa el staking cuando el inversor solo bloquea criptoactivos para un validador y qué pasa con la comisión de acuñación y la penalización por desbloqueo?",
+      "criterio": "Son rendimientos del capital mobiliario en especie (art. 25.2, criterio de V1766-22), a valor de mercado en euros del día de percepción y en la base del ahorro. La «comisión de acuñación» no es gasto deducible del rendimiento, pero sí forma parte del valor de adquisición de los nuevos criptoactivos recibidos si está directamente relacionada con su obtención. La penalización por desbloqueo anticipado reduce el rendimiento íntegro.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34, 35, 37.1, 48 y 49 (cabecera de la consulta)",
+        "LIRPF arts. 25.2, 26.1, 35.1, 43.1, 46 y 49"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0648-24)",
+      "vigencia": "Reiterada en V0612-26 (17/03/2026)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0648-24-4",
+      "referencia": "V0648-24 (apartado 4)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-04-11",
+      "temas": [
+        "airdrop",
+        "ganancia_perdida",
+        "renta_general"
+      ],
+      "pregunta": "¿Cómo tributan los criptoactivos recibidos gratis en un airdrop?",
+      "criterio": "Si las actividades promocionales no derivan de una relación laboral ni de una actividad económica, es una ganancia patrimonial por incorporación de bienes que no deriva de una transmisión (art. 37.1.l). Se computa el valor de mercado en euros de lo recibido, en el periodo en que se recibe, y va a la base general, no a la del ahorro.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34, 35, 37.1, 48 y 49 (cabecera de la consulta)",
+        "LIRPF arts. 33.1, 37.1.l), 45, 46 y 48"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0648-24)",
+      "vigencia": "[PENDIENTE] sin pronunciamiento posterior revisado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0648-24-5",
+      "referencia": "V0648-24 (apartado 5)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-04-11",
+      "temas": [
+        "prestamos_cripto",
+        "capital_mobiliario",
+        "gastos_comisiones",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo tributan los intereses por prestar criptoactivos en una plataforma y el rendimiento de la garantía aportada al tomar prestado?",
+      "criterio": "Ambos son rendimientos del capital mobiliario por cesión a terceros de capitales propios (art. 25.2) y van a la base del ahorro. Las comisiones (borrowing fees) y los intereses pagados por tomar prestado no son deducibles de esos rendimientos, porque no están entre los gastos del art. 26.1.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34, 35, 37.1, 48 y 49 (cabecera de la consulta)",
+        "LIRPF arts. 25.2, 26.1, 46 y 49"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0648-24)",
+      "vigencia": "[PENDIENTE] sin pronunciamiento posterior revisado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0648-24-6",
+      "referencia": "V0648-24 (apartado 6)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-04-11",
+      "temas": [
+        "gastos_comisiones",
+        "ganancia_perdida"
+      ],
+      "pregunta": "¿Qué tratamiento tienen las comisiones de retirada de plataformas y las de puentes entre blockchains (bridges)?",
+      "criterio": "Si la comisión de retirada va ligada a una venta o permuta y la paga el contribuyente, se computa en el valor de adquisición o de transmisión (art. 35). Si se paga por mover criptoactivos entre dos monederos propios de distintos proveedores, es irrelevante en el IRPF. Sobre las comisiones de bridges, la DGT no se pronuncia por falta de datos en la consulta.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34, 35, 37.1, 48 y 49 (cabecera de la consulta)",
+        "LIRPF art. 35"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0648-24)",
+      "vigencia": "[PENDIENTE] sin pronunciamiento posterior revisado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": [
+        "Comisiones de bridges y wrapped tokens: sin criterio en esta consulta"
+      ]
+    },
+    {
+      "id": "DGT-V0612-26-1",
+      "referencia": "V0612-26 (supuesto 1)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2026-03-17",
+      "temas": [
+        "staking",
+        "capital_mobiliario",
+        "renta_ahorro",
+        "modelo_172_173"
+      ],
+      "pregunta": "¿Cómo tributa el staking centralizado a través de un exchange?",
+      "criterio": "Las recompensas son rendimientos del capital mobiliario en especie (art. 25.2, criterio de V1766-22 y V0648-24), se valoran a valor de mercado en euros el día de percepción y van a la base del ahorro. A la pregunta de si, por los modelos 172 y 173 de las plataformas, el staking aparecerá en el borrador de la renta, la DGT no contesta porque no versa sobre régimen, clasificación ni calificación tributaria (art. 88 LGT).",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.a), 22, 25.2, 27.1, 33.1, 35 y 37.1.h) (cabecera de la consulta)",
+        "LIRPF arts. 43.1, 46 y 49",
+        "LGT arts. 88 y 89.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0612-26)",
+      "vigencia": "Vigente a la fecha de la consulta",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 5 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0612-26-2",
+      "referencia": "V0612-26 (supuesto 2)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2026-03-17",
+      "temas": [
+        "staking",
+        "capital_mobiliario",
+        "imputacion_temporal",
+        "actividad_economica_iae",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo y cuándo tributa el staking nativo (por ejemplo, de ETH mediante contrato inteligente) cuyas recompensas hay que reclamar?",
+      "criterio": "No es actividad económica, en línea con V1766-22, y las recompensas son rendimiento del capital mobiliario en especie (art. 25.2). Mientras sean solo una cifra calculada en el contrato inteligente de la que no se puede disponer, no son exigibles; se imputan cuando se acreditan en un monedero o cuenta disponible, que en el caso consultado es al reclamarlas (art. 14.1.a). Van a la base del ahorro.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.a), 22, 25.2, 27.1, 33.1, 35 y 37.1.h) (cabecera de la consulta)",
+        "LIRPF arts. 14.1.a), 25.2, 27.1, 46 y 49"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0612-26)",
+      "vigencia": "Vigente a la fecha de la consulta",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 5 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0612-26-3",
+      "referencia": "V0612-26 (supuesto 3)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2026-03-17",
+      "temas": [
+        "staking",
+        "permuta",
+        "ganancia_perdida",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo tributa el staking líquido (aportar ETH y recibir rETH)?",
+      "criterio": "ETH y rETH son criptoactivos distintos, así que tanto el cambio inicial de ETH por rETH como el posterior de rETH por ETH u otros criptoactivos son permutas que pueden generar ganancias o pérdidas patrimoniales, valoradas con el art. 37.1.h). Las recompensas se incorporan como mayor valor del rETH y tributan al permutarlo. Van a la base del ahorro del periodo de cada permuta.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.a), 22, 25.2, 27.1, 33.1, 35 y 37.1.h) (cabecera de la consulta)",
+        "LIRPF arts. 33.1, 34.1.a), 35, 37.1.h), 46 y 49",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0612-26)",
+      "vigencia": "Vigente a la fecha de la consulta",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 5 págs.), guardado por Vikn el 18/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V1604-18",
+      "referencia": "V1604-18",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2018-06-11",
+      "temas": [
+        "base_coste_fifo",
+        "gastos_comisiones",
+        "ganancia_perdida"
+      ],
+      "pregunta": "Si se compran bitcoins en varios exchanges y en distintas fechas, ¿se aplica FIFO exchange por exchange o sobre todos? ¿Cuentan las comisiones?",
+      "criterio": "Se aplica FIFO: en una venta parcial se consideran vendidos los bitcoins adquiridos en primer lugar, por analogía con los arts. 37.2 y 54.5 LIRPF. Operar en distintos exchanges no altera la homogeneidad, así que para la antigüedad y el coste se tienen en cuenta todos los bitcoins adquiridos, sin distinguir la casa de cambio. Las comisiones de compra y de venta cobradas por el exchange se computan en los valores de adquisición y de transmisión (art. 35) si se originan por la operación y las paga el contribuyente.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 33.1, 34, 35, 37.2 y 54.5",
+        "LGT art. 89.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1604-18)",
+      "vigencia": "Reiterada en V0975-22, V2520-22, V0648-24, V0525-25, V1550-25 (03/09/2025) y V5017-26 (05/06/2026)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 2 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V1149-18",
+      "referencia": "V1149-18",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2018-05-08",
+      "temas": [
+        "venta_euros",
+        "permuta",
+        "ganancia_perdida",
+        "cambio_residencia_95bis"
+      ],
+      "pregunta": "¿Cómo tributan la venta de bitcoins por euros y el canje de IOTA por bitcoin, y afecta el impuesto de salida si el contribuyente se va al extranjero?",
+      "criterio": "La venta por euros y el canje entre criptomonedas distintas, al margen de una actividad económica, generan ganancia o pérdida patrimonial; el canje es una permuta valorada con el art. 37.1.h). Las criptomonedas tipo bitcoin no son acciones ni participaciones, así que no entran en el impuesto de salida del art. 95 bis; para otras monedas virtuales habría que analizar sus características.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 33.1, 33.5.a), 34.1.a), 35, 37.1.h) y 95 bis",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1149-18)",
+      "vigencia": "Criterio sobre el art. 95 bis reiterado en V0666-25 (14/04/2025)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0975-22",
+      "referencia": "V0975-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2022-05-04",
+      "temas": [
+        "base_coste_fifo",
+        "venta_euros",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo se calcula la ganancia al vender criptomonedas de distintos tipos compradas en años diferentes?",
+      "criterio": "La ganancia o pérdida se calcula por separado para cada tipo de criptomoneda, y dentro de cada tipo se consideran vendidas las adquiridas en primer lugar (FIFO). Es renta del ahorro (arts. 46.b y 49). Quien hace valer un derecho debe probarlo con cualquier medio admitido en Derecho, y hay que conservar los justificantes durante el plazo de prescripción.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 33.1, 34.1.a), 35, 37.2, 46.b), 49, 54.5 y 104.1",
+        "LGT arts. 105.1 y 106.1",
+        "Ley 10/2010 art. 1.5"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0975-22)",
+      "vigencia": "Reiterada en V0525-25 (28/03/2025)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V2520-22",
+      "referencia": "V2520-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2022-12-07",
+      "temas": [
+        "permuta",
+        "imputacion_temporal",
+        "base_coste_fifo",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Tributan las ganancias de intercambiar criptomonedas entre sí si nunca se pasan a euros y se quedan en la plataforma?",
+      "criterio": "Sí: cada intercambio entre criptomonedas distintas es una permuta que genera ganancia o pérdida patrimonial, valorada con el art. 37.1.h), aunque no se convierta a euros. Se imputa al periodo en que se produce el intercambio (art. 14.1.c) y va a la base del ahorro. La compra inicial con euros solo fija el valor de adquisición, y se aplica FIFO dentro de cada tipo de criptomoneda.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.c), 33.1, 34.1.a), 35, 37.1.h), 46.b) y 49.1.b)",
+        "Código Civil art. 1538",
+        "LGT art. 106.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2520-22)",
+      "vigencia": "Vigente; criterio reiterado en V0648-24 y V1543-25",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0525-25",
+      "referencia": "V0525-25",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2025-03-28",
+      "temas": [
+        "base_coste_fifo",
+        "ganancia_perdida"
+      ],
+      "pregunta": "¿Son las criptomonedas «valores homogéneos» del art. 8 RIRPF y cómo se identifican las unidades vendidas?",
+      "criterio": "No son valores homogéneos del art. 8 RIRPF, que se refiere a instrumentos financieros, pero las unidades de un mismo tipo de criptomoneda son bienes inmateriales fungibles y, por tanto, homogéneos entre sí dentro de cada tipo o protocolo. Como la LIRPF no tiene regla expresa, se aplica el fundamento de los arts. 37.2 y 54.5: en ventas parciales se transmiten las adquiridas en primer lugar (FIFO). El criterio se limita a criptomonedas; otros criptoactivos requieren análisis específico.",
+      "normas_citadas": [
+        "LIRPF arts. 37.2 y 54.5",
+        "RIRPF art. 8",
+        "Reglamento (UE) 2023/1114 arts. 2.3 y 3.1.5)",
+        "Ley 10/2010 art. 1.5"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0525-25)",
+      "vigencia": "Vigente; citada en V1543-25 (26/08/2025)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 2 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V1948-21",
+      "referencia": "V1948-21",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2021-06-21",
+      "temas": [
+        "airdrop",
+        "renta_general",
+        "ganancia_perdida",
+        "permuta"
+      ],
+      "pregunta": "¿Cómo tributan los activos virtuales recibidos como recompensa por participar en acciones comerciales de un exchange (compartir enlaces, ver vídeos, tutoriales) y su venta posterior?",
+      "criterio": "Si esas tareas no derivan de una relación laboral ni de una actividad económica, es una ganancia patrimonial por incorporación de bienes que no deriva de una transmisión (art. 37.1.l): su valor de mercado en euros va a la base general del periodo en que se reciben. La venta o permuta posterior genera ganancia o pérdida patrimonial en la base del ahorro, partiendo de la hipótesis de que esos activos tienen una naturaleza similar a las monedas virtuales.",
+      "normas_citadas": [
+        "LIRPF arts. 14.1.c), 33.1, 34.1.a), 35, 37.1.h), 37.1.l), 45, 46, 48 y 49",
+        "Código Civil art. 1538",
+        "Ley 10/2010 art. 1.5"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1948-21)",
+      "vigencia": "Vigente; mismo criterio para airdrops en V0648-24 (11/04/2024)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0376-24",
+      "referencia": "V0376-24",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF / IRNR",
+      "fecha": "2024-03-12",
+      "temas": [
+        "impatriados",
+        "no_residente",
+        "staking",
+        "venta_euros"
+      ],
+      "pregunta": "Un acogido a la Ley Beckham que opera con criptomonedas en una plataforma de Chipre que las custodia, ¿debe declarar esas ganancias en el modelo 151?",
+      "criterio": "Bajo el régimen del art. 93 se tributa como no residente y solo por rentas obtenidas en España. Las criptomonedas custodiadas por un tercero se entienden situadas en España solo si el custodio es residente o tiene establecimiento permanente aquí; con una plataforma de Chipre en libre prestación sin establecimiento, las ganancias de su venta o permuta no se obtienen en España y no van en el modelo 151. Si hay recompensas de staking, son capital mobiliario y solo se obtienen en España si las paga un residente o un establecimiento permanente en España, o retribuyen capital utilizado aquí.",
+      "normas_citadas": [
+        "LIRPF art. 93",
+        "RIRPF arts. 113 a 120",
+        "TRLIRNR arts. 13.1.f).2.º, 13.1.i) y 13.3",
+        "LIRPF art. 25.2"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0376-24)",
+      "vigencia": "Cita como antecedentes V1069-19 y V1662-23 sobre dónde se sitúan las criptomonedas custodiadas",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 5 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre la Renta de las Personas Físicas",
+        "La segunda cuestión (declarar en el extranjero) no se contesta por exceder de las competencias de la DGT"
+      ]
+    },
+    {
+      "id": "DGT-V2290-23",
+      "referencia": "V2290-23",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "Obligaciones de información",
+      "fecha": "2023-07-28",
+      "temas": [
+        "modelo_721"
+      ],
+      "pregunta": "¿Hay que presentar el modelo 721 por criptomonedas guardadas en una cold wallet o en una hot wallet?",
+      "criterio": "Solo se informa de criptomonedas custodiadas por un tercero que presta servicios de salvaguarda de claves privadas y que no es residente en España ni tiene establecimiento permanente aquí. Las que están en monederos cuyas claves controla el propio titular, sea hot o cold wallet, no cuentan para el umbral ni se declaran. Hay obligación si el saldo conjunto a 31 de diciembre supera 50.000 €; se presenta del 1 de enero al 31 de marzo, en años sucesivos solo si el saldo sube más de 20.000 € desde la última declaración (o en los casos de extinción de la titularidad), y la primera declaración fue en 2024 sobre 2023.",
+      "normas_citadas": [
+        "LGT DA 18.ª.1.d)",
+        "RGAT (RD 1065/2007) art. 42 quater",
+        "LIRPF DA 13.ª.6",
+        "RD 249/2023 DT 1.ª.1",
+        "Reglamento (UE) 2023/1114 considerando 83 y art. 3.1.17)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2290-23)",
+      "vigencia": "Reiterada en V0941-24 (29/04/2024)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 5 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Las cifras salen del art. 42 quater RGAT transcrito en la consulta (2023): comprobar la redacción vigente en el BOE"
+      ]
+    },
+    {
+      "id": "DGT-V0941-24",
+      "referencia": "V0941-24",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "Obligaciones de información",
+      "fecha": "2024-04-29",
+      "temas": [
+        "modelo_721"
+      ],
+      "pregunta": "¿Hay que declarar en el modelo 721 las criptomonedas cuyas claves se guardan en un monedero de papel?",
+      "criterio": "No. Solo se declaran las criptomonedas cuyas claves privadas custodia un tercero no residente; si el titular controla sus claves, como en un paper wallet que conserva él mismo, no se computan en el saldo ni se informa de ellas, sea hot o cold wallet. Es concordante con V2290-23.",
+      "normas_citadas": [
+        "LGT DA 18.ª.1.d)",
+        "RGAT art. 42 quater",
+        "LIRPF DA 13.ª.6",
+        "Reglamento (UE) 2023/1114 considerando 83 y art. 3.1.17)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0941-24)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V2388-24-1",
+      "referencia": "V2388-24 (cuestión principal)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-11-21",
+      "temas": [
+        "nft",
+        "actividad_economica_iae",
+        "gastos_comisiones"
+      ],
+      "pregunta": "Un artista que vende ilustraciones digitales como NFT en plataformas blockchain (estimación directa simplificada), ¿puede deducir la comisión de acuñación y la amortización de su local?",
+      "criterio": "Sí. Como actividad económica, el gasto de acuñación de NFT que cobran las plataformas es deducible si se acredita su correlación con los ingresos. El local destinado exclusivamente a la actividad es elemento afecto y su amortización es deducible, aunque sea propiedad proindiviso con el cónyuge, aplicando en estimación directa simplificada la tabla de amortización simplificada.",
+      "normas_citadas": [
+        "LIRPF arts. 27, 28 y 29",
+        "RIRPF arts. 22 y 30",
+        "LIS art. 10.3"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2388-24)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre la Renta de las Personas Físicas"
+      ]
+    },
+    {
+      "id": "DGT-V2388-24-2",
+      "referencia": "V2388-24 (primera cuestión adicional)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-11-21",
+      "temas": [
+        "airdrop",
+        "actividad_economica_iae",
+        "nft"
+      ],
+      "pregunta": "¿Cómo tributan los airdrops que recibe un artista de NFT de las plataformas por su relevancia como artista o por ser de los primeros en registrarse?",
+      "criterio": "Al recibirse sin contraprestación pero en relación con la actividad profesional que desarrolla, son rendimientos en especie de esa actividad económica, no una ganancia patrimonial.",
+      "normas_citadas": [
+        "LIRPF art. 27"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2388-24)",
+      "vigencia": "Vigente; distinto del caso general de airdrop recibido al margen de una actividad (V0648-24 y V1948-21)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V2388-24-3",
+      "referencia": "V2388-24 (segunda cuestión adicional)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2024-11-21",
+      "temas": [
+        "staking",
+        "capital_mobiliario",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cambia la tributación del staking según se actúe como validador o como inversor?",
+      "criterio": "No: tanto si se actúa como validador propiamente dicho como si se participa como inversor, las recompensas del staking son rendimientos del capital mobiliario en los términos de V1766-22 y van a la base del ahorro.",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 26.1.a), 43.1, 46 y 49",
+        "RIRPF arts. 75 y 76"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2388-24)",
+      "vigencia": "Vigente; en línea con V0612-26 (17/03/2026)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V0486-22",
+      "referencia": "V0486-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA",
+      "fecha": "2022-03-10",
+      "temas": [
+        "nft",
+        "iva"
+      ],
+      "pregunta": "¿Cómo tributa en el IVA el creador que vende NFT de sus ilustraciones mediante subastas en plataformas online?",
+      "criterio": "La venta del NFT por su creador no es una entrega de bienes ni una operación con divisas (los NFT no son fungibles), sino un servicio prestado por vía electrónica al tipo general del 21 % cuando se entiende realizado en España. Es empresario a efectos de IVA quien ordena medios para intervenir en el mercado aunque sea de forma ocasional, pero no quien hace una venta puntual y aislada sin intención de continuidad. Para consumidores finales de otros Estados de la UE se aplica el umbral de 10.000 € o la ventanilla única (OSS), y para destinatarios en territorios terceros (incluidos Canarias, Ceuta y Melilla) no está sujeto, salvo la regla del art. 70.Dos; si la plataforma actúa en nombre ajeno, factura el creador.",
+      "normas_citadas": [
+        "LIVA arts. 4, 5, 8, 11, 69, 70, 73 y 163 unvicies a 163 quatervicies",
+        "Directiva 2006/112/CE art. 14 y anexo II",
+        "Reglamento de Ejecución (UE) 282/2011 arts. 7, 24 bis y 24 septies",
+        "RIVA art. 22"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0486-22)",
+      "vigencia": "[PENDIENTE] sin pronunciamiento posterior revisado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 12 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre el Consumo",
+        "Contestada bajo la hipótesis de que el consultante actúa como empresario y vende a consumidores finales"
+      ]
+    },
+    {
+      "id": "DGT-V2846-15",
+      "referencia": "V2846-15",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA",
+      "fecha": "2015-10-01",
+      "temas": [
+        "iva",
+        "actividad_economica_iae"
+      ],
+      "pregunta": "¿Está sujeta al IVA la actividad de compra y venta de bitcoins a cambio de euros (cajeros y máquinas de vending, con comisión)?",
+      "criterio": "Quien se dedica a ello ordenando medios es empresario a efectos del IVA. La transmisión de bitcoins se consideró sujeta y exenta por entender que el bitcoin es un medio de pago incluido en «otros efectos comerciales» (art. 20.Uno.18.º h) e i) LIVA). La DGT revisó después ese fundamento: tras la sentencia Hedqvist, el bitcoin se trata como divisa (V2407-23).",
+      "normas_citadas": [
+        "LIVA arts. 4, 5 y 20.Uno.18.º h) e i)",
+        "Directiva 2006/112/CE art. 135.1.d)",
+        "LGT arts. 88 y 89.1"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2846-15)",
+      "vigencia": "Matizada (en su fundamento) por V2407-23 (07/09/2023), que aplica la sentencia Hedqvist",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre el Consumo",
+        "No contesta sobre el límite de pagos en efectivo de la Ley 7/2012 por no ser materia tributaria"
+      ]
+    },
+    {
+      "id": "DGT-V2407-23",
+      "referencia": "V2407-23",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA",
+      "fecha": "2023-09-07",
+      "temas": [
+        "iva"
+      ],
+      "pregunta": "Si un restaurante acepta criptomonedas como pago, ¿cómo tributa en el IVA?",
+      "criterio": "El servicio de restauración sigue sujeto al IVA, que el restaurante debe repercutir y declarar como siempre. La entrega de criptomonedas por el cliente como pago no está sujeta, porque tras la sentencia Hedqvist la DGT considera que bitcoins, criptomonedas y demás monedas digitales son divisas y medios de pago, y la entrega de dinero como contraprestación no está sujeta (art. 7.12.º LIVA). Con esto revisa el fundamento de V2846-15.",
+      "normas_citadas": [
+        "LIVA arts. 7.12.º y 20.Uno.18.º j)",
+        "Directiva 2006/112/CE art. 135.1.d) y e)",
+        "TJUE C-264/14 (Hedqvist) apdos. 42, 43 y 53",
+        "RGAT art. 68.2"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2407-23)",
+      "vigencia": "Vigente; contrasta con V0935-25, que en el ITP trata las criptomonedas como bienes inmateriales",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 2 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre el Consumo",
+        "No vinculante para asociados con procedimiento abierto sobre la misma cuestión (art. 68.2 RGAT)",
+        "Criterio criticado por un Inspector de Hacienda (J. M. Gentil, No Sólo Impuestos, 19/11/2026): no es fuente oficial"
+      ]
+    },
+    {
+      "id": "DGT-V0935-25",
+      "referencia": "V0935-25",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF / ITP",
+      "fecha": "2025-05-27",
+      "temas": [
+        "itp",
+        "permuta",
+        "ganancia_perdida",
+        "renta_ahorro"
+      ],
+      "pregunta": "Un particular vende un inmueble y cobra en bitcoins, ¿cómo tributa en IRPF y en ITP?",
+      "criterio": "Al ser las criptomonedas bienes inmateriales, es una permuta: en el IRPF genera una ganancia o pérdida patrimonial valorada con el art. 37.1.h) que va a la base del ahorro. En el ITP cada permutante tributa por lo que adquiere (art. 23 RITPAJD), así que el vendedor del inmueble paga TPO por la adquisición de los bitcoins, como bienes muebles, al tipo autonómico de muebles y sobre su valor de mercado o el declarado si es mayor, siempre que quien entrega los bitcoins no actúe como empresario o profesional ni sea una operación sujeta a IVA.",
+      "normas_citadas": [
+        "LIRPF arts. 33.1, 34.1.a), 35, 37.1.h), 46.b) y 49",
+        "TRLITPAJD arts. 7, 8, 10 y 11",
+        "RITPAJD art. 23",
+        "Código Civil art. 1538",
+        "Ley 22/2009"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0935-25)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Criterio criticado por un Inspector de Hacienda (J. M. Gentil, No Sólo Impuestos, 19/11/2026) por no analizar la exención del art. 45.I.B).4.º TRLITPAJD: no es fuente oficial"
+      ]
+    },
+    {
+      "id": "TJUE-C-264-14",
+      "referencia": "TJUE C-264/14 (Hedqvist)",
+      "organismo": "TJUE",
+      "tipo": "sentencia",
+      "vinculante": true,
+      "ambito": "IVA (Directiva)",
+      "fecha": "2015-10-22",
+      "temas": [
+        "iva",
+        "jurisprudencia"
+      ],
+      "pregunta": "¿Está sujeto al IVA, y exento, el servicio de cambio de divisas tradicionales por bitcoins y viceversa a cambio de un margen?",
+      "criterio": "Sí, es una prestación de servicios a título oneroso, porque la retribución es el margen entre precio de compra y de venta. Está exenta por el art. 135.1.e) de la Directiva (divisas), porque el bitcoin no tiene otra finalidad que ser medio de pago y ciertos operadores lo aceptan como tal. No le son aplicables las letras d) (pagos, efectos comerciales) ni f) (valores).",
+      "normas_citadas": [
+        "Directiva 2006/112/CE arts. 2.1.c), 14 y 135.1.d), e) y f)"
+      ],
+      "enlace_oficial": "http://curia.europa.eu/juris/documents.jsf?num=C-264/14",
+      "vigencia": "Vigente; aplicada por la DGT en V2407-23",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de la sentencia en curia.europa.eu (texto completo en español, 9 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Tribunal de Justicia de la UE, Sala Quinta. Abogada General: J. Kokott"
+      ]
+    },
+    {
+      "id": "DGT-V1550-25",
+      "referencia": "V1550-25",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2025-09-03",
+      "temas": [
+        "base_coste_fifo",
+        "venta_euros",
+        "renta_ahorro"
+      ],
+      "pregunta": "Si se compra y vende la misma criptomoneda en dos plataformas, ¿se puede calcular el coste por separado en cada una?",
+      "criterio": "No. Las unidades de un mismo tipo de criptomoneda son bienes fungibles y homogéneos, y en ventas parciales se consideran transmitidas las adquiridas en primer lugar, sin distinguir por la plataforma a través de la que se efectúan las operaciones. El criterio se limita a criptomonedas; otros criptoactivos requieren análisis específico.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 33.1, 34.1.a), 35, 37.2, 46.b), 49 y 54.5",
+        "Reglamento (UE) 2023/1114 arts. 2.3 y 3.1.5)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1550-25)",
+      "vigencia": "Vigente; es la consulta más directa sobre FIFO global, junto con V1604-18",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 2 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V1551-25",
+      "referencia": "V1551-25",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2025-09-03",
+      "temas": [
+        "permuta",
+        "compensacion_perdidas",
+        "staking",
+        "capital_mobiliario",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Cómo se declaran las pérdidas de permutas entre criptomonedas y los rendimientos de staking como inversor?",
+      "criterio": "Las permutas generan ganancias o pérdidas patrimoniales valoradas con el art. 37.1.h), que son renta del ahorro y se integran y compensan según el art. 49. El staking como inversor, sin actuar como validador, da rendimientos del capital mobiliario en especie (art. 25.2), a valor de mercado en euros del día de percepción, en la base del ahorro y sin poder deducir los gastos del art. 26.1.a).",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.c), 25.2, 26.1.a), 33.1, 37.1.h), 43.1, 46, 49 y 104.1",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1551-25)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V2005-22",
+      "referencia": "V2005-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2022-09-20",
+      "temas": [
+        "permuta",
+        "imputacion_temporal",
+        "base_coste_fifo",
+        "renta_ahorro"
+      ],
+      "pregunta": "¿Tributa intercambiar altcoins por bitcoin aunque nunca se haya pasado a euros?",
+      "criterio": "Sí: la compra con euros solo fija el valor de adquisición, pero cada intercambio entre criptomonedas distintas es una permuta que genera ganancia o pérdida patrimonial (art. 37.1.h), se imputa al periodo en que se produce y va a la base del ahorro. Se aplica FIFO dentro de cada tipo. Sobre las «plataformas de ingresos pasivos» la DGT no contesta por falta de detalle.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.c), 33.1, 34.1.a), 35, 37.1.h), 46.b) y 49",
+        "LGT art. 106.1",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2005-22)",
+      "vigencia": "Vigente; mismo criterio en V2520-22",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V2179-22",
+      "referencia": "V2179-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2022-10-17",
+      "temas": [
+        "venta_euros",
+        "valor_mercado",
+        "imputacion_temporal",
+        "modelo_721",
+        "modelo_720"
+      ],
+      "pregunta": "Si se compran criptomonedas con divisas (no euros) desde una cuenta extranjera y se venden por euros, ¿cómo se calcula la ganancia?",
+      "criterio": "En cada venta, la ganancia es la diferencia entre los euros obtenidos (o el valor de mercado si es mayor) y el coste en euros calculado con el tipo de cambio de la divisa en la fecha de compra de la criptomoneda, con los gastos del art. 35. Además, en el periodo de la venta se imputa aparte la diferencia de cambio entre el precio en euros al que se compraron las divisas y su contravalor en la fecha de compra de la criptomoneda. Todo es renta del ahorro; según los saldos, puede haber obligación de declarar la cuenta extranjera y las criptomonedas custodiadas fuera (DA 18.ª LGT).",
+      "normas_citadas": [
+        "LIRPF arts. 14.1.c), 33.1, 34.1.a), 35, 46.b), 49 y 104.1",
+        "LGT arts. 105.1, 106.1 y DA 18.ª a) y d)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2179-22)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V2412-22",
+      "referencia": "V2412-22",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2022-11-22",
+      "temas": [
+        "imputacion_temporal",
+        "venta_euros",
+        "modelo_721"
+      ],
+      "pregunta": "¿A qué año se imputa la venta de criptomonedas si pasa tiempo entre la orden de venta y el cobro en la cuenta?",
+      "criterio": "La alteración patrimonial se produce cuando se entregan las criptomonedas en virtud de la compraventa (teoría del título y el modo, art. 609 CC), con independencia de cuándo se cobre el precio, salvo que se aplique la regla de operaciones a plazos del art. 14.2.d). No hay un modelo específico para comunicar estas operaciones más allá de declararlas en la renta, conservar los justificantes y las obligaciones de información generales y de criptomonedas en el extranjero.",
+      "normas_citadas": [
+        "LIRPF arts. 2, 14.1.c), 14.2.d), 33.1 y 104.1",
+        "Código Civil art. 609",
+        "LGT art. 93 y DA 18.ª.d)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2412-22)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "La consulta contesta además una cuestión ajena a criptomonedas (reparación de inmueble alquilado)"
+      ]
+    },
+    {
+      "id": "DGT-V5017-26-1",
+      "referencia": "V5017-26 (IRPF, cuestión 1)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2026-06-05",
+      "temas": [
+        "staking",
+        "capital_mobiliario",
+        "base_coste_fifo",
+        "permuta"
+      ],
+      "pregunta": "¿Cómo tributan las recompensas de staking y la venta posterior de las criptomonedas obtenidas?",
+      "criterio": "Las recompensas son rendimientos del capital mobiliario en especie (art. 25.2, criterio de V1766-22 y V0648-24), a valor de mercado en euros del día de percepción y en la base del ahorro. Su venta o permuta posterior genera ganancia o pérdida patrimonial, calculada por separado para cada tipo de criptomoneda y con FIFO (V1604-18, V0975-22 y V0525-25).",
+      "normas_citadas": [
+        "LIRPF arts. 25.2, 33.1, 34.1.a), 35, 37.1.h), 43.1, 46 y 49",
+        "Código Civil art. 1538"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V5017-26)",
+      "vigencia": "Vigente (la más reciente leída)",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": []
+    },
+    {
+      "id": "DGT-V5017-26-2",
+      "referencia": "V5017-26 (IRPF, cuestión 2)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IRPF",
+      "fecha": "2026-06-05",
+      "temas": [
+        "airdrop",
+        "renta_general",
+        "valor_mercado"
+      ],
+      "pregunta": "¿Cómo tributan las unidades de una criptomoneda recibidas por ver anuncios en una app, si esa criptomoneda aún no cotiza ni tiene red pública?",
+      "criterio": "Ver un anuncio en el móvil no es actividad económica, así que, salvo relación laboral, es ganancia patrimonial por incorporación de bienes (art. 37.1.l): en la medida en que lo recibido sea valorable y pueda determinarse su valor de mercado en euros, se integra en la base general del periodo en que se recibe. Fijar ese valor es cuestión de prueba, y el valor integrado será el de adquisición para la venta posterior.",
+      "normas_citadas": [
+        "LIRPF arts. 27.1, 33.1, 37.1.l), 45, 46 y 48"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V5017-26)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "La consulta no dice qué hacer si el valor de mercado no puede determinarse: solo condiciona la integración a que sea valorable"
+      ]
+    },
+    {
+      "id": "DGT-V5017-26-3",
+      "referencia": "V5017-26 (IVA)",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA",
+      "fecha": "2026-06-05",
+      "temas": [
+        "iva",
+        "mineria",
+        "staking"
+      ],
+      "pregunta": "¿Están sujetos al IVA el minado, el staking y la obtención de criptomonedas por ver anuncios?",
+      "criterio": "El minado no está sujeto al IVA porque no hay un destinatario identificable ni relación directa entre servicio y contraprestación (cita V3625-16). Quien ve anuncios no es empresario a efectos del IVA. El intercambio de criptomonedas entre sí o por divisas está no sujeto (cita V1657-22), y la rentabilidad del staking está sujeta y exenta si la obtiene un empresario (art. 20.Uno.18.º), y no sujeta si no lo es, como el consultante.",
+      "normas_citadas": [
+        "LIVA arts. 4, 5 y 20.Uno.18.º h), i) y j)",
+        "Directiva 2006/112/CE art. 135.1.d) y e)",
+        "TJUE C-264/14 (Hedqvist) y C-16/93 (Tolsma)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V5017-26)",
+      "vigencia": "Vigente; reitera V3625-16 sobre minado",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Leer V1657-22 (intercambio de criptomonedas e IVA)"
+      ]
+    },
+    {
+      "id": "DGT-V2679-21",
+      "referencia": "V2679-21",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA",
+      "fecha": "2021-11-05",
+      "temas": [
+        "iva",
+        "staking"
+      ],
+      "pregunta": "¿Cómo tributan en el IVA la compraventa OTC de criptomonedas, su custodia y el servicio de proveedor de staking?",
+      "criterio": "La compraventa de criptomonedas OTC son operaciones con divisas, sujetas y exentas (art. 20.Uno.18.º j), porque tras Hedqvist bitcoins y criptomonedas son divisas. La custodia, en especial en plataformas desconectadas de internet, es un servicio de depósito sin naturaleza financiera, similar al alquiler de cajas de seguridad: sujeta y no exenta. La rentabilidad del staking para el titular empresario está sujeta y exenta, pero el servicio del proveedor de staking que cobra un porcentaje de la rentabilidad está sujeto y no exento.",
+      "normas_citadas": [
+        "LIVA art. 20.Uno.18.º j) y k)",
+        "Directiva 2006/112/CE art. 135.1.d), e) y l) y 135.2.d)",
+        "TJUE C-264/14 (Hedqvist)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V2679-21)",
+      "vigencia": "Vigente; citada en V0486-22",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 3 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre el Consumo"
+      ]
+    },
+    {
+      "id": "DGT-V0915-19",
+      "referencia": "V0915-19",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA / IAE",
+      "fecha": "2019-04-29",
+      "temas": [
+        "iva",
+        "mineria",
+        "actividad_economica_iae"
+      ],
+      "pregunta": "¿Cómo tributa en IVA e IAE una sociedad que subarrienda servidores a clientes que los usan para minar criptomonedas?",
+      "criterio": "El minado no está sujeto al IVA y quien solo mina no es empresario a efectos del IVA (cita V3625-16). En cambio, el arrendamiento de servidores es un servicio prestado por vía electrónica, sujeto según las reglas de localización (art. 70.Uno.4.º y 70.Dos). En el IAE, el subarrendamiento de servidores cloud va en el grupo 859 («alquiler de otros bienes muebles n.c.o.p.») o, si en realidad es un servicio de conexión, en el epígrafe 769.9.",
+      "normas_citadas": [
+        "LIVA arts. 4, 5, 11, 69, 70 y 72",
+        "TRLRHL arts. 78 y 79",
+        "RDLeg 1175/1990 regla 8.ª",
+        "Reglamento de Ejecución (UE) 282/2011 art. 7"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0915-19)",
+      "vigencia": "Vigente",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 7 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre el Consumo",
+        "No trata el IRPF ni el IAE del propio minero"
+      ]
+    },
+    {
+      "id": "DGT-V0315-24",
+      "referencia": "V0315-24",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "Obligaciones de información",
+      "fecha": "2024-03-05",
+      "temas": [
+        "modelo_721",
+        "modelo_720",
+        "stablecoins"
+      ],
+      "pregunta": "Varias dudas del 721: ¿se suman wallets propias? ¿cuentan las stablecoins? ¿y el saldo en euros dentro de un exchange extranjero o español? ¿importan los saldos medios?",
+      "criterio": "Para el umbral de 50.000 € solo cuentan los saldos a 31 de diciembre en custodios no residentes; los saldos medios de trimestres son irrelevantes y las wallets con claves propias no se suman. Una stablecoin puede ser moneda virtual a estos efectos si cumple la definición legal, aunque su valor dependa de una moneda de curso legal. Los euros u otra moneda fiduciaria en un exchange extranjero son una cuenta instrumental que va en el modelo 720 (art. 42 bis RGAT) si se superan sus umbrales, identificando solo al proveedor; en exchanges residentes en España no hay obligación ni de 721 ni de 720 por esos saldos.",
+      "normas_citadas": [
+        "LGT DA 18.ª a) y d)",
+        "RGAT arts. 42 bis y 42 quater",
+        "LIRPF DA 13.ª.6",
+        "Ley 10/2010 art. 1.5",
+        "Reglamento (UE) 2023/1114 considerandos 41 y 83 y art. 3.1.17)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V0315-24)",
+      "vigencia": "Vigente; concordante con V2290-23 y V2185-23",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 6 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Tributos"
+      ]
+    },
+    {
+      "id": "DGT-V1950-24",
+      "referencia": "V1950-24",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "Obligaciones de información",
+      "fecha": "2024-09-11",
+      "temas": [
+        "modelo_720"
+      ],
+      "pregunta": "Matrimonio en gananciales con una cuenta en una plataforma de inversión de Chipre (CFD, derivados, criptoactivos) sin BIC: ¿cómo se declara en el modelo 720?",
+      "criterio": "La cuenta en la plataforma es una cuenta instrumental de efectivo que va en el modelo 720 (art. 42 bis RGAT) si se superan los umbrales, con clave C y subclave 5 e identificando a la empresa de servicios de inversión. En gananciales, si la titularidad formal es de un cónyuge, los dos deben declararla, el otro como titular real, indicando el porcentaje de participación.",
+      "normas_citadas": [
+        "LGT DA 18.ª",
+        "RGAT art. 42 bis",
+        "Ley 10/2010 art. 4.2"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V1950-24)",
+      "vigencia": "Vigente; cita V1421-13, V0508-19, V2911-20, V1525-13, V1682-13 y V5306-16",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Tributos"
+      ]
+    },
+    {
+      "id": "DGT-V3625-16",
+      "referencia": "V3625-16",
+      "organismo": "DGT",
+      "tipo": "consulta_vinculante",
+      "vinculante": true,
+      "ambito": "IVA / IAE",
+      "fecha": "2016-08-31",
+      "temas": [
+        "mineria",
+        "iva",
+        "actividad_economica_iae"
+      ],
+      "pregunta": "¿Está sujeto al IVA el minado de bitcoins, se puede deducir el IVA soportado y hay que darse de alta en el IAE?",
+      "criterio": "El minado no está sujeto al IVA: los nuevos bitcoins los genera la red automáticamente, no hay un destinatario identificable ni relación directa entre servicio y contraprestación (caso Tolsma). Como el minado no está sujeto y la venta de bitcoins está sujeta y exenta, el IVA soportado no se puede deducir. En cambio, es una actividad económica sujeta al IAE, que se clasifica provisionalmente en el epígrafe 831.9 «Otros servicios financieros n.c.o.p.».",
+      "normas_citadas": [
+        "LIVA arts. 4, 5, 20.Uno.18.º h), i) y j) y 94.Uno",
+        "Directiva 2006/112/CE art. 135.1.d) y e)",
+        "TRLRHL arts. 78 y 79",
+        "RDLeg 1175/1990 reglas 2.ª, 4.ª y 8.ª",
+        "TJUE C-154/80 y C-16/93 (Tolsma)"
+      ],
+      "enlace_oficial": "https://petete.tributos.hacienda.gob.es/consultas/ (buscar por número V3625-16)",
+      "vigencia": "Vigente; reiterada en V0915-19 (29/04/2019) y V5017-26 (05/06/2026). La parte de la venta de bitcoins se apoya en V2846-15, cuyo fundamento revisó V2407-23 tras Hedqvist",
+      "texto_completo_comprobado": true,
+      "fuente_consultada": "PDF de Petete (texto completo, 4 págs.), guardado por Vikn el 20/11/2026",
+      "pendientes": [
+        "Órgano: SG de Impuestos sobre el Consumo",
+        "No trata el IRPF del minero (rendimiento de actividad, base general, gastos)"
+      ]
+    }
+  ]
+}

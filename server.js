@@ -289,8 +289,42 @@ const r2 = new S3Client({
   },
 });
 const R2_BUCKET = process.env.R2_BUCKET;
+// ================================================================
+// CANDADO DE LA IA (13/11, Vikn; rehecho el 16/11 tras perderse)
+// Mientras el Asistente atiende una de sus herramientas sobre el panel, el servidor no deja hacer nada que cambie algo:
+//  - base de datos: solo lecturas (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN); cualquier otra orden falla;
+//  - R2: solo leer y listar; subir o borrar falla;
+//  - no sale ningún correo ni WhatsApp.
+// Además, la IA solo puede usar las herramientas que se le han declarado en esa petición (IA_HERRAMIENTAS_PANEL).
+// «Programar o tocar el sistema» no existe como herramienta: la IA nunca puede hacerlo.
+// ================================================================
+const { AsyncLocalStorage } = require('async_hooks');
+const iaCandado = new AsyncLocalStorage();
+const iaEnCandado = () => iaCandado.getStore() === true;
+const IA_SQL_LECTURA = /^\s*\(?\s*(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN)\b/i;
+function iaComprobarSQL(sql) {
+  const texto = typeof sql === 'string' ? sql : (sql && sql.sql) || '';
+  if (iaEnCandado() && (!IA_SQL_LECTURA.test(texto) || /;\s*\S/.test(texto) || /\bFOR\s+UPDATE\b|\bINTO\s+(OUT|DUMP)FILE\b/i.test(texto))) {
+    const e = new Error('La IA solo puede leer: se ha bloqueado una escritura en la base de datos'); e.candado = true; throw e;
+  }
+}
+function iaEnvolverConexion(c) {
+  if (!c || c.__candado) return c;
+  for (const m of ['query', 'execute']) { const orig = c[m].bind(c); c[m] = (sql, ...r) => { iaComprobarSQL(sql); return orig(sql, ...r); }; }
+  c.__candado = true; return c;
+}
+for (const m of ['query', 'execute']) { const orig = pool[m].bind(pool); pool[m] = (sql, ...r) => { iaComprobarSQL(sql); return orig(sql, ...r); }; }
+{ const orig = pool.getConnection.bind(pool); pool.getConnection = async (...r) => iaEnvolverConexion(await orig(...r)); }
+{ const orig = r2.send.bind(r2); r2.send = (cmd, ...r) => {
+  const nombre = cmd && cmd.constructor && cmd.constructor.name;
+  if (iaEnCandado() && !['GetObjectCommand', 'ListObjectsV2Command', 'HeadObjectCommand'].includes(nombre)) { const e = new Error('La IA solo puede leer: se ha bloqueado una escritura en el almacenamiento'); e.candado = true; throw e; }
+  return orig(cmd, ...r);
+}; }
+function iaSinEnvios(que) { if (iaEnCandado()) { const e = new Error('La IA no puede ' + que); e.candado = true; throw e; } }
+
 
 async function subirAR2(clave, buffer, tipoMime) {
+  iaSinEnvios('guardar archivos');   // 13/11: candado de la IA
   if (!R2_BUCKET && process.env.ACROS_PRUEBAS === '1') { R2_MEMORIA.set(clave, { buffer, tipoMime }); return; }   // solo pruebas
   await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: clave, Body: buffer, ContentType: tipoMime }));
 }
@@ -325,6 +359,7 @@ const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ''; // p.ej. 'w
 const twilioActivo = () => !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_WHATSAPP_FROM);
 
 async function enviarWhatsApp(telefono, mensaje) {
+  iaSinEnvios('enviar WhatsApp');   // 13/11: candado de la IA
   // Twilio exige el prefijo "whatsapp:" en origen y destino, y el
   // teléfono en formato E.164 (con "+" y prefijo de país) — los
   // clientes lo dan como '600111222', así que si no trae "+" se asume
@@ -350,6 +385,7 @@ const brevoActivo = () => !!(BREVO_API_KEY && BREVO_REMITENTE);
 const BREVO_REMITENTE_SOPORTE = (process.env.BREVO_REMITENTE_SOPORTE || '').trim();   // 04/11: soporte@ para lo automático
 
 async function enviarCorreo(destinatario, asunto, html, texto, opciones = {}) {
+  iaSinEnvios('enviar correos');   // 13/11: candado de la IA
   [asunto, html, texto] = await ajustarGeneroCorreo(asunto, html, texto);   // 29/10: «tu asesora» si es ella; sin nombre, «tu equipo»
   const url = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
   const cuerpo = {
@@ -899,8 +935,16 @@ async function asegurarEsquema() {
         "`origen` ENUM('importado','manual') NOT NULL, `nota` VARCHAR(300) NULL, `sustituye_id` INT NULL, `anulado` TINYINT(1) NOT NULL DEFAULT 0, `anulado_motivo` VARCHAR(300) NULL, `anulado_por` INT NULL, `anulado_en` DATETIME NULL, `creado_por` INT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY k_cliente (`cliente_id`, `anulado`, `fecha`))");
       await pool.execute("CREATE TABLE IF NOT EXISTS cartera_estado (`cliente_id` INT PRIMARY KEY, `fuente_nombre` VARCHAR(200) NULL, `importado_en` DATETIME NULL, `importado_por` INT NULL, `publicado_en` DATETIME NULL, `publicado_por` INT NULL, `ritmo` VARCHAR(20) NOT NULL DEFAULT 'mensual', `simulador` TINYINT(1) NOT NULL DEFAULT 0, `perdidas_pendientes` TEXT NULL)");
       await pool.execute('CREATE TABLE IF NOT EXISTS cartera_otras (`id` INT AUTO_INCREMENT PRIMARY KEY, `cliente_id` INT NOT NULL, `anio` INT NOT NULL, `plataforma` VARCHAR(80) NOT NULL, `tipo` VARCHAR(80) NULL, `ganancias` DOUBLE NOT NULL DEFAULT 0, `perdidas` DOUBLE NOT NULL DEFAULT 0, `rendimientos` DOUBLE NOT NULL DEFAULT 0, `latente` DOUBLE NULL, `fuente` VARCHAR(120) NULL, `creado_por` INT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
-      await pool.execute("CREATE TABLE IF NOT EXISTS activos_catalogo (`simbolo` VARCHAR(30) PRIMARY KEY, `nombre` VARCHAR(80) NULL, `coingecko_id` VARCHAR(120) NULL, `red` VARCHAR(80) NULL, `sector` VARCHAR(80) NULL, `tipo` VARCHAR(20) NULL, `tamano` VARCHAR(20) NULL, `grupo` VARCHAR(80) NULL, `origen` ENUM('sin','coingecko','manual') NOT NULL DEFAULT 'sin', `editado_por` INT NULL, `precio_eur` DOUBLE NULL, `precio_en` DATETIME NULL, `intento_en` DATETIME NULL, `actualizado_en` DATETIME NULL)");
-      setTimeout(() => resolverActivosPendientes().then(actualizarPrecios).catch(() => {}), 5000);
+      await pool.execute("CREATE TABLE IF NOT EXISTS activos_catalogo (`simbolo` VARCHAR(30) PRIMARY KEY, `nombre` VARCHAR(80) NULL, `red` VARCHAR(80) NULL, `sector` VARCHAR(80) NULL, `tipo` VARCHAR(20) NULL, `tamano` VARCHAR(20) NULL, `grupo` VARCHAR(80) NULL, `origen` ENUM('sin','auto','manual') NOT NULL DEFAULT 'sin', `editado_por` INT NULL, `precio_eur` DOUBLE NULL, `precio_en` DATETIME NULL, `intento_en` DATETIME NULL, `actualizado_en` DATETIME NULL)");
+      // 17/11: precios a mano (origen y autor). Los precios del proveedor anterior se borran (sus condiciones lo piden al dejar de
+      // usarlo): son los que tienen precio y no tienen origen. Idempotente: los manuales llevan origen.
+      // (en segundo plano: no retrasa el resto del arranque)
+      (async () => {
+        await pool.execute("ALTER TABLE activos_catalogo ADD COLUMN `precio_origen` ENUM('manual','coinranking') NULL").catch(() => {});
+        await pool.execute('ALTER TABLE activos_catalogo ADD COLUMN `precio_por` INT NULL').catch(() => {});
+        await pool.execute('UPDATE activos_catalogo SET precio_eur = NULL, precio_en = NULL WHERE precio_origen IS NULL AND (precio_eur IS NOT NULL OR precio_en IS NOT NULL)');
+        for (const m of MONEDAS_PAGO) await pool.execute("INSERT IGNORE INTO activos_catalogo (simbolo, origen) VALUES (?, 'sin')", [m]);
+      })().catch(e => console.error('Precios (arranque):', e.message));
       // 15/10: roles y equipos
       await agregaColumnaSiFalta('asesores', '`roles`', 'VARCHAR(120) NULL');
       await agregaColumnaSiFalta('personas', '`equipo_id`', 'INT NULL');
@@ -915,6 +959,7 @@ async function asegurarEsquema() {
       await prepararFormulariosCliente();  // 11/11: baterías del Área
       await prepararMapas();  // 11/11: mapa cripto (inicial, final y diferencias)
       await prepararCierre();  // 11/11: cierre del expediente
+      await prepararMedioCamino();  // 12/11: solicitudes a medio camino (fase, nombre, apellidos…)
       await prepararDocumentosIntegros();  // 12/11: documentos íntegros   // 03/11: formatos de archivo conocidos (semilla) y columnas de renombrado   // 15/10: nombre del archivo tal cual lo subió el cliente
       await pool.execute('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');   // 15/10
       setTimeout(cargarCanales, 500);
@@ -1670,6 +1715,8 @@ app.post('/api/presupuesto', async (req, res) => {
   }
   if (esSpam(req.body)) return res.status(201).json({ ok: true }); // honeypot: no se guarda, pero no se delata
   const { servicios, detalle, telefono, correo } = req.body;
+  // 12/11: con la batería 1 de las preguntas dinámicas, el correo es obligatorio (sigue «a medio camino» hasta su Área)
+  if (req.body.cuestionario && req.body.cuestionario._v2 && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(req.body.correo || '').trim())) return res.status(400).json({ error: 'Falta tu correo' });
   const cuestionario = await cuestionarioConFormulario(req.body.cuestionario).catch(() => null);   // 11/11: batería 1 (forma {_v2})
   const { utm, origen } = resolverAtribucion(req.body);
   const conCuestionario = !!(cuestionario && Object.keys(cuestionario).length);
@@ -1690,6 +1737,9 @@ app.post('/api/presupuesto', async (req, res) => {
         codigoPromoValido(req.body.codigo_promo),   // 06/11: solo códigos conocidos (PIZZA22)
       ]
     );
+    // 12/11: nombre y apellidos (la ficha «Tus datos»); y si es nuevo con la batería 1, «a medio camino» (aún sin aviso al equipo)
+    await pool.execute('UPDATE solicitudes_presupuesto SET nombre = ?, apellidos = ? WHERE id = ?', [String(req.body.nombre || '').trim().slice(0, 80) || null, String(req.body.apellidos || '').trim().slice(0, 120) || null, ins.insertId]);
+    if (conCuestionario && await iniciarMedioCamino(ins.insertId, req.body, cuestionario)) return res.status(201).json({ ok: true, a_medio_camino: true });
     avisarCaptacion('📝 Nueva solicitud de presupuesto', conCuestionario ? 'Está en «Nuevas solicitudes» del panel.' : 'Está en «Nuevas solicitudes» (sin cuestionario por ahora).', { etiqueta: 'memo' });
     // 09/10: confirmación al cliente si dejó su correo; si no rellenó el
     // cuestionario, con un botón para completarlo cuando quiera
@@ -1791,7 +1841,7 @@ app.get('/api/admin/solicitudes-presupuesto', requiereSesionAsesor, requiereRol(
   const conn = await pool.getConnection();
   try {
     let filas;
-    if (req.query.atendida === '0') [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto WHERE atendida = 0 ORDER BY creado_en');
+    if (req.query.atendida === '0') [filas] = await conn.execute("SELECT * FROM solicitudes_presupuesto WHERE atendida = 0 AND (fase IS NULL OR fase = 'lista') ORDER BY creado_en");   // 12/11: sin las que están a medio camino
     else if (req.query.atendida === '1') [filas] = await conn.execute('SELECT s.*, a.nombre AS atendida_por FROM solicitudes_presupuesto s LEFT JOIN asesores a ON a.id = s.atendida_por_asesor_id WHERE s.atendida = 1 ORDER BY s.creado_en DESC');
     else [filas] = await conn.execute('SELECT * FROM solicitudes_presupuesto ORDER BY creado_en DESC LIMIT 100');
     res.json(filas);
@@ -2256,7 +2306,7 @@ app.post('/api/admin/login/2fa', async (req, res) => {
 // Expediente de movimientos por cliente (importado del Excel de
 // movimientos en formato de importación de CoinTracking/DFPro + lo añadido
 // o corregido a mano) → FIFO por activo (criterio español) → posiciones,
-// lotes, ganancias realizadas por año e ingresos. Precios de CoinGecko
+// lotes, ganancias realizadas por año e ingresos. Precios del catálogo (a mano hasta contratar Coinranking)
 // cacheados. El cliente ve «Mi cartera» en su Área (opción C: resumen y
 // posiciones para todos; simulador para la asesoría continuada).
 // Son cálculos orientativos de escenarios, nunca recomendaciones.
@@ -2336,62 +2386,15 @@ function calcularFifo(movs) {
   return { posiciones, realizado, ingresos, avisos };
 }
 
-// --- CoinGecko (precios y catálogo). Sin clave funciona con límites; con COINGECKO_API_KEY (demo) va mejor.
-const COINGECKO_URL = (process.env.COINGECKO_API_URL || 'https://api.coingecko.com/api/v3').replace(/\/+$/, '');
-const cgCabeceras = () => process.env.COINGECKO_API_KEY ? { 'x-cg-demo-api-key': process.env.COINGECKO_API_KEY } : {};
-const cg = (ruta) => axios.get(COINGECKO_URL + ruta, { headers: cgCabeceras(), timeout: 15000 }).then(r => r.data);
-const FIAT_A_COINGECKO = { USD: 'usd-coin' };
-const RED_DE_PLATAFORMA = { ethereum: 'Ethereum', solana: 'Solana', 'binance-smart-chain': 'BNB Chain', 'polygon-pos': 'Polygon', 'arbitrum-one': 'Arbitrum', base: 'Base', 'optimistic-ethereum': 'Optimism', avalanche: 'Avalanche', tron: 'Tron', 'the-open-network': 'TON', sui: 'Sui', cardano: 'Cardano' };
-function sectorDe(cats, simbolo) {
-  const c = (cats || []).join(' | ').toLowerCase();
-  if (/stablecoin/.test(c)) return 'Estables';
-  if (/meme/.test(c)) return 'Memes';
-  if (/privacy/.test(c)) return 'Privacidad';
-  if (/artificial intelligence|\bai\b/.test(c)) return 'IA';
-  if (/decentralized finance|defi|decentralized exchange/.test(c)) return 'DeFi';
-  if (['BTC'].includes(simbolo) || /store of value/.test(c)) return 'Reserva de valor';
-  if (/layer 1|smart contract platform|layer 2/.test(c)) return 'Plataformas';
-  if (/gaming|metaverse|nft/.test(c)) return 'Juegos y NFT';
-  return 'Otros';
-}
-let RESOLVIENDO = false;
-async function resolverActivosPendientes() {
-  if (RESOLVIENDO) return; RESOLVIENDO = true;
-  try {
-    const [f] = await pool.execute("SELECT simbolo FROM activos_catalogo WHERE coingecko_id IS NULL AND origen <> 'manual' AND (intento_en IS NULL OR intento_en < NOW() - INTERVAL 1 DAY) LIMIT 20");
-    for (const { simbolo } of f) {
-      await pool.execute('UPDATE activos_catalogo SET intento_en = NOW() WHERE simbolo = ?', [simbolo]);
-      try {
-        if (FIAT_A_COINGECKO[simbolo]) { await pool.execute("UPDATE activos_catalogo SET coingecko_id = ?, nombre = COALESCE(nombre, ?), sector = COALESCE(sector, 'Estables'), tipo = 'estable', origen = 'coingecko' WHERE simbolo = ?", [FIAT_A_COINGECKO[simbolo], simbolo, simbolo]); continue; }
-        const s = await cg('/search?query=' + encodeURIComponent(simbolo));
-        const c = (s.coins || []).find(x => String(x.symbol).toUpperCase() === simbolo);
-        if (!c) continue;
-        await new Promise(r => setTimeout(r, Number(process.env.COINGECKO_PAUSA_MS) || 2500));   // límite de la API gratuita
-        const d = await cg('/coins/' + encodeURIComponent(c.id) + '?localization=false&tickers=false&market_data=false&community_data=false&developer_data=false');
-        const plat = d.asset_platform_id, cats = d.categories || [];
-        const red = plat ? (RED_DE_PLATAFORMA[plat] || plat) : (d.name || simbolo);
-        const rank = d.market_cap_rank || c.market_cap_rank || null;
-        const sector = sectorDe(cats, simbolo);
-        await pool.execute("UPDATE activos_catalogo SET coingecko_id = ?, nombre = ?, red = COALESCE(red, ?), sector = COALESCE(sector, ?), tipo = COALESCE(tipo, ?), tamano = COALESCE(tamano, ?), origen = IF(origen = 'manual', 'manual', 'coingecko'), actualizado_en = NOW() WHERE simbolo = ?",
-          [c.id, d.name || c.name, red, sector, sector === 'Estables' ? 'estable' : plat ? 'token' : 'nativa', rank && rank <= 20 ? 'grande' : rank && rank <= 200 ? 'mediana' : 'pequena', simbolo]);
-        await new Promise(r => setTimeout(r, Number(process.env.COINGECKO_PAUSA_MS) || 2500));   // límite de la API gratuita
-      } catch (e) { console.error('CoinGecko (' + simbolo + '):', e.message); }
-    }
-  } finally { RESOLVIENDO = false; }
-}
-async function actualizarPrecios() {
-  try {
-    const [f] = await pool.execute('SELECT DISTINCT a.simbolo, a.coingecko_id FROM activos_catalogo a WHERE a.coingecko_id IS NOT NULL AND EXISTS (SELECT 1 FROM cartera_movimientos m WHERE m.anulado = 0 AND (m.buy_cur = a.simbolo OR m.sell_cur = a.simbolo))');
-    for (let i = 0; i < f.length; i += 200) {
-      const trozo = f.slice(i, i + 200);
-      const d = await cg('/simple/price?vs_currencies=eur&ids=' + encodeURIComponent([...new Set(trozo.map(x => x.coingecko_id))].join(',')));
-      for (const x of trozo) if (d[x.coingecko_id] && d[x.coingecko_id].eur != null) await pool.execute('UPDATE activos_catalogo SET precio_eur = ?, precio_en = NOW() WHERE simbolo = ?', [d[x.coingecko_id].eur, x.simbolo]);
-    }
-  } catch (e) { console.error('Precios de CoinGecko:', e.message); }
-}
+// --- Precios (17/11): fuera el proveedor gratuito anterior (no permitía uso comercial). Hasta contratar Coinranking los precios se ponen a
+// mano en el catálogo (Sistema → Catálogo de activos). Las monedas nuevas entran «Sin clasificar» y el asesor las completa.
+const MONEDAS_PAGO = ['BTC', 'ETH', 'SOL', 'USDC', 'USDT'];   // las del pago en cripto del Área: tienen fila aunque nadie las tenga
+const DIAS_PRECIO_VIEJO = 7;
+// Cuando se contrate Coinranking (COINRANKING_API_KEY): rellenar precio_eur, precio_en y precio_origen = 'coinranking' en las filas
+// que NO son manuales. Es la única función que hay que escribir.
+async function traerPreciosActuales() { /* pendiente de contratar Coinranking */ }
 async function asegurarCatalogo(simbolos) {
   for (const s of new Set(simbolos.filter(x => x && !esEUR(x)).map(x => x.toUpperCase()))) await pool.execute("INSERT IGNORE INTO activos_catalogo (simbolo, origen) VALUES (?, 'sin')", [s]);
-  setTimeout(() => resolverActivosPendientes().then(actualizarPrecios), 200);
 }
 
 // --- Datos de la cartera de un cliente
@@ -2411,11 +2414,14 @@ async function datosCartera(clienteId, { conLotes = true } = {}) {
   const posiciones = syms.map(s => {
     const p = r.posiciones[s], c = C[s] || {}, precio = c.precio_eur != null ? Number(c.precio_eur) : null;
     return { simbolo: s, nombre: c.nombre || s, red: c.red || null, sector: c.sector || null, tipo: c.tipo || null, tamano: c.tamano || null, grupo: c.grupo || null,
-      cantidad: p.cantidad, coste: p.coste, precio, valor: precio != null ? p.cantidad * precio : null, precio_en: c.precio_en || null, lotes: conLotes ? p.lotes : undefined };
+      cantidad: p.cantidad, coste: p.coste, precio, valor: precio != null ? p.cantidad * precio : null, precio_en: c.precio_en || null, precio_origen: precio != null ? (c.precio_origen || null) : null, lotes: conLotes ? p.lotes : undefined };
   }).sort((a, b) => (b.valor || 0) - (a.valor || 0));
   const e = est[0] || {};
   return {
     anio, posiciones, avisos: r.avisos, n_movimientos: movs.length,
+    // 17/11: 'coinranking' solo si todas las posiciones con precio vienen de Coinranking; si no, 'manual'
+    precios_fuente: (() => { const con = posiciones.filter(p => p.precio != null); return con.length && con.every(p => p.precio_origen === 'coinranking') ? 'coinranking' : 'manual'; })(),
+    precios_a: (() => { const f = posiciones.filter(p => p.precio != null && p.precio_en).map(p => new Date(p.precio_en).getTime()); return f.length ? new Date(Math.min(...f)).toISOString() : null; })(),
     realizado: r.realizado[anio] || { ganancias: 0, perdidas: 0, por_activo: {} },
     ingresos: r.ingresos[anio] || { ahorro: 0, otros: 0 },
     otras: otras.map(o => ({ id: o.id, plataforma: o.plataforma, tipo: o.tipo, ganancias: Number(o.ganancias) || 0, perdidas: Number(o.perdidas) || 0, rendimientos: Number(o.rendimientos) || 0, latente: o.latente == null ? null : Number(o.latente), fuente: o.fuente })),
@@ -2545,17 +2551,23 @@ app.post(ruta('/publicar'), requiereSesionAsesor, async (req, res) => {
   const id = Number(req.params.id);
   await guardarEstadoCartera(id, { publicado_en: aSQLDatetime(ahora()), publicado_por: req.asesor.id });
   // aviso al cliente (por correo, según sus preferencias de «informes»)
+  // 13/11: se devuelve qué ha pasado con el aviso, para enseñarlo en el panel (correo al que salió, o por qué no salió)
+  const aviso = { correo: null, motivo: null, ve_cartera: false };
   const conn = await pool.getConnection();
   try {
-    await notificarCliente(conn, id, 'informes', async () => {
+    aviso.ve_cartera = !!(await clienteConPagoConfirmado(conn, id));   // sin pago confirmado no puede abrir «Mi cartera»
+    const porCorreo = await notificarCliente(conn, id, 'informes', async () => {
       const [c] = await conn.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [id]);
       const [p] = await conn.execute("SELECT token FROM propuestas WHERE cliente_id = ? AND estado = 'aceptada' ORDER BY id DESC LIMIT 1", [id]);
-      if (!c.length || !brevoActivo()) return;
-      const t = plantillaCorreo({ titulo: 'Tu cartera está al día', parrafos: ['Hola' + (c[0].nombre ? ', ' + ESC_HTML(c[0].nombre) : '') + ':', 'Tu asesor ha revisado tus posiciones. Entra en «Mi cartera» para ver tu situación fiscal de este año con los precios de hoy.'], boton: p.length ? { texto: 'Ver mi cartera', url: enlaceArea('area', p[0].token) + '&vista=cartera' } : undefined });
+      if (!c.length || !c[0].correo) { aviso.motivo = 'El cliente no tiene correo.'; return; }
+      if (!brevoActivo()) { aviso.motivo = 'El envío de correos no está activo.'; return; }
+      const t = plantillaCorreo({ titulo: 'Tu cartera está al día', parrafos: ['Hola' + (c[0].nombre ? ', ' + ESC_HTML(c[0].nombre) : '') + ':', 'Tu asesor ha revisado tus posiciones. Entra en «Mi cartera» para ver tu situación fiscal de este año con los precios más recientes.'], boton: p.length ? { texto: 'Ver mi cartera', url: enlaceArea('area', p[0].token) + '&vista=cartera' } : undefined });
       await enviarCorreo(c[0].correo, 'Tu cartera está al día', t.html, t.texto, { desde: 'asesor' });
+      aviso.correo = c[0].correo;
     }, 'Tu asesor ha revisado tu cartera. Entra en tu área de Acros para verla.');
-  } catch (e) { console.error('Aviso de cartera publicada:', e.message); } finally { conn.release(); }
-  res.json({ ok: true });
+    if (!porCorreo && !aviso.motivo) aviso.motivo = 'Ha elegido no recibir por correo los avisos de informes.';
+  } catch (e) { console.error('Aviso de cartera publicada:', e.message); aviso.motivo = aviso.motivo || 'No se pudo enviar el aviso.'; } finally { conn.release(); }
+  res.json({ ok: true, aviso });
 });
 // Otras inversiones (acciones, ETF, fondos…), por año
 app.post(ruta('/otras'), requiereSesionAsesor, async (req, res) => {
@@ -2572,16 +2584,58 @@ app.delete(ruta('/otras/:oid'), requiereSesionAsesor, async (req, res) => {
 });
 // Catálogo de activos (Sistema): encargados y admins
 app.get('/api/admin/activos', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
-  const [f] = await pool.execute("SELECT a.*, (SELECT COUNT(DISTINCT m.cliente_id) FROM cartera_movimientos m WHERE m.anulado = 0 AND (m.buy_cur = a.simbolo OR m.sell_cur = a.simbolo)) AS clientes FROM activos_catalogo a ORDER BY (a.origen = 'sin') DESC, clientes DESC, a.simbolo");
+  const [f] = await pool.execute("SELECT a.*, pp.nombre AS precio_por_nombre, (SELECT COUNT(DISTINCT m.cliente_id) FROM cartera_movimientos m WHERE m.anulado = 0 AND (m.buy_cur = a.simbolo OR m.sell_cur = a.simbolo)) AS clientes FROM activos_catalogo a LEFT JOIN asesores pp ON pp.id = a.precio_por ORDER BY (a.origen = 'sin') DESC, clientes DESC, a.simbolo");
   res.json(f);
 });
 app.put('/api/admin/activos/:simbolo', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
   const b = req.body || {}, s = String(req.params.simbolo).toUpperCase();
-  const vals = ['nombre', 'coingecko_id', 'red', 'sector', 'tipo', 'tamano', 'grupo'].map(k => b[k] === undefined ? undefined : (String(b[k] || '').trim().slice(0, 80) || null));
-  await pool.execute("UPDATE activos_catalogo SET nombre = COALESCE(?, nombre), coingecko_id = COALESCE(?, coingecko_id), red = ?, sector = ?, tipo = ?, tamano = ?, grupo = ?, origen = 'manual', editado_por = ?, actualizado_en = NOW() WHERE simbolo = ?",
-    [vals[0] ?? null, vals[1] ?? null, vals[2] ?? null, vals[3] ?? null, vals[4] ?? null, vals[5] ?? null, vals[6] ?? null, req.asesor.id, s]);
-  if (vals[1]) setTimeout(actualizarPrecios, 100);
+  const [ex] = await pool.execute('SELECT simbolo FROM activos_catalogo WHERE simbolo = ?', [s]);
+  if (!ex.length) return res.status(404).json({ error: 'Esa moneda no está en el catálogo' });
+  const soloPrecio = Object.keys(b).every(k => k === 'precio_eur');
+  if (!soloPrecio) {
+    const vals = ['nombre', 'red', 'sector', 'tipo', 'tamano', 'grupo'].map(k => b[k] === undefined ? undefined : (String(b[k] || '').trim().slice(0, 80) || null));
+    await pool.execute("UPDATE activos_catalogo SET nombre = COALESCE(?, nombre), red = ?, sector = ?, tipo = ?, tamano = ?, grupo = ?, origen = 'manual', editado_por = ?, actualizado_en = NOW() WHERE simbolo = ?",
+      [vals[0] ?? null, vals[1] ?? null, vals[2] ?? null, vals[3] ?? null, vals[4] ?? null, vals[5] ?? null, req.asesor.id, s]);
+  }
+  if (b.precio_eur !== undefined) {   // 17/11: precio a mano (vacío = quitarlo)
+    const r = await ponerPrecioManual(s, b.precio_eur, req.asesor.id);
+    if (r === 'mal') return res.status(400).json({ error: 'El precio tiene que ser un número mayor que 0' });
+    req.body = Object.assign({}, req.body, { accion: r === 'quitado' ? 'Quitó el precio de ' + s : 'Puso el precio de ' + s + ' a mano' });   // registro de actividad
+  }
   res.json({ ok: true });
+});
+// 17/11: precio a mano. Admite coma decimal; vacío o null lo quita. Devuelve 'puesto' | 'quitado' | 'mal'
+function leerPrecio(v) { if (v === null || v === undefined || String(v).trim() === '') return null; const t = String(v).trim().replace(/\s/g, ''); const n = Number(/,\d+$/.test(t) ? t.replace(/\./g, '').replace(',', '.') : t.replace(/,/g, '')); return isFinite(n) && n > 0 ? n : NaN; }
+async function ponerPrecioManual(simbolo, valor, asesorId) {
+  const n = leerPrecio(valor);
+  if (n === null) { await pool.execute('UPDATE activos_catalogo SET precio_eur = NULL, precio_en = NULL, precio_origen = NULL, precio_por = NULL WHERE simbolo = ?', [simbolo]); return 'quitado'; }
+  if (isNaN(n)) return 'mal';
+  await pool.execute("UPDATE activos_catalogo SET precio_eur = ?, precio_en = NOW(), precio_origen = 'manual', precio_por = ? WHERE simbolo = ?", [n, asesorId, simbolo]);
+  return 'puesto';
+}
+// Varios precios de golpe: { filas: [{ simbolo, precio }] }. No crea monedas: devuelve las que no están en el catálogo
+app.post('/api/admin/activos/precios', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const filas = Array.isArray((req.body || {}).filas) ? req.body.filas.slice(0, 2000) : null;
+  if (!filas) return res.status(400).json({ error: 'Faltan las filas' });
+  const [cat] = await pool.query('SELECT simbolo FROM activos_catalogo'); const hay = new Set(cat.map(x => x.simbolo));
+  let guardados = 0; const desconocidos = [], malos = [];
+  for (const f of filas) {
+    const s = String((f && f.simbolo) || '').trim().toUpperCase().slice(0, 30); if (!s) continue;
+    if (!hay.has(s)) { desconocidos.push(s); continue; }
+    const n = leerPrecio(f.precio); if (n === null || isNaN(n)) { malos.push(s); continue; }
+    await ponerPrecioManual(s, f.precio, req.asesor.id); guardados++;
+  }
+  req.body = { accion: 'Cargó ' + guardados + (guardados === 1 ? ' precio' : ' precios') };   // registro de actividad
+  res.json({ ok: true, guardados, desconocidos, malos });
+});
+// Pago en cripto del Área: precio del catálogo (sin consultas a terceros desde el navegador)
+app.get('/api/precios/pago', async (req, res) => {
+  const m = String(req.query.moneda || '').toUpperCase();
+  if (!MONEDAS_PAGO.includes(m)) return res.status(400).json({ error: 'Moneda no admitida' });
+  const [f] = await pool.execute('SELECT precio_eur, precio_en FROM activos_catalogo WHERE simbolo = ?', [m]);
+  const x = f[0];
+  if (!x || x.precio_eur == null || !x.precio_en || (Date.now() - new Date(x.precio_en).getTime()) > DIAS_PRECIO_VIEJO * 864e5) return res.json({ precio_eur: null });
+  res.json({ precio_eur: Number(x.precio_eur), precio_en: x.precio_en });
 });
 // Cliente: su cartera (si su asesor la ha publicado)
 app.get('/api/propuestas/:token/cartera', exigirAlgunPagoConfirmado, async (req, res) => {
@@ -2608,7 +2662,6 @@ async function avisarRevisionesDeCartera() {
     if (g.correo && brevoActivo()) { const c = plantillaCorreo({ titulo: 'Carteras por revisar', parrafos: ['Hola, ' + ESC_HTML(g.asesor) + ':', 'Según su ritmo de revisión, toca actualizar la cartera de:', '<ul>' + g.clientes.map(n => '<li>' + ESC_HTML(n) + '</li>').join('') + '</ul>'] }); enviarCorreo(g.correo, 'Carteras por revisar', c.html, c.texto).catch(() => {}); }
   }
 }
-setInterval(() => { resolverActivosPendientes().then(actualizarPrecios).catch(() => {}); }, 10 * 60 * 1000).unref();
 setInterval(() => { const h = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Madrid' })); if (h.getHours() === 9 && h.getMinutes() < 10) avisarRevisionesDeCartera().catch(e => console.error('Revisiones de cartera:', e.message)); }, 10 * 60 * 1000).unref();
 
 // 15/10: EQUIPOS, ROLES Y «MIS CANALES»
@@ -3404,6 +3457,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       asesor: personaPublica(asesorCli),
       asesores_disponibles: dispoTodas.filter(x => !asesorCli || !asesorCli.equipo_id || x.equipo_id === asesorCli.equipo_id || x.id === asesorCli.id || (camb[0] && camb[0].a_persona_id === x.id)).map(personaPublica),   // 29/10: los de su equipo
       cambio_asesor_pendiente: camb[0] || null,
+      cambio_discreto: !(asesorCli && asesorCli.asesor_id && ((await conn.execute('SELECT es_admin, roles FROM asesores WHERE id = ?', [asesorCli.asesor_id]))[0].some(x => x.es_admin || /admin/.test(String(x.roles || ''))))),   // 21/11: el asesor actual no recibe el aviso salvo que sea administrador
       valoracion: valor[0] ? valor[0].estado : null,
       dos_pasos_activo: !!(await conn.execute('SELECT totp_activo FROM clientes WHERE id = ?', [p.cliente_id]))[0][0].totp_activo,
       colaboradores: (await conn.execute("SELECT q.nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id WHERE co.propuesta_id = ? AND co.estado = 'confirmada' ORDER BY co.id", [p.id]))[0].map(x => x.nombre),
@@ -3411,6 +3465,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       informes_bloqueados: pagos.some(g => g.estado === 'confirmado') ? 0 : entregasCli.filter(e => e.propuesta_id === p.id).length,
       entregas_anteriores: entregasCli.filter(e => e.propuesta_id !== p.id),
       cobro: p.cobro || 'antes', pago_confirmado: pagos.some(g => g.estado === 'confirmado'), plazo_pago: plazoPagoDe(p),
+      correccion: await correccionPendiente(conn, p),   // 18/11
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en, inicio_inmediato_en: p.inicio_inmediato_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
@@ -3515,7 +3570,7 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
     if (!(hash_transaccion || '').trim()) return res.status(400).json({ error: 'Falta el hash de la transacción, obligatorio para cripto' });
     if (!REDES_CRIPTO.includes(red)) return res.status(400).json({ error: `Falta o no es válida la red. Debe ser una de: ${REDES_CRIPTO.join(', ')}` });
     if (!MONEDAS_CRIPTO.includes(moneda_cripto)) return res.status(400).json({ error: `Falta o no es válida la moneda. Debe ser una de: ${MONEDAS_CRIPTO.join(', ')}` });
-    // El importe en cripto es solo orientativo (viene de CoinGecko en el
+    // El importe en cripto es solo orientativo (17/11: sale del catálogo, en el
     // navegador del cliente) — si esa consulta falló, no hay por qué
     // bloquear el pago por eso; simplemente no se podrá intentar la
     // verificación automática después, y quedará para revisión manual
@@ -3529,6 +3584,7 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'aceptada') return res.status(409).json({ error: `No se puede declarar el pago: la propuesta está "${p.estado}", no "aceptada"` });
+    if (p.importe_corregido_en && !p.importe_aceptado_en) return res.status(409).json({ error: 'Antes de pagar, acepta el importe corregido', codigo: 'importe_sin_aceptar' });   // 18/11
     const [r] = await conn.execute(
       'INSERT INTO pagos (propuesta_id, metodo, hash_transaccion, red, moneda_cripto, importe_cripto) VALUES (?, ?, ?, ?, ?, ?)',
       [p.id, metodo, (hash_transaccion || '').trim() || null, metodo === 'cripto' ? red : null,
@@ -4122,7 +4178,8 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
     if (!cli.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     const cliente = cli[0];
     const [propuestas] = await conn.execute(
-      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en, cobro, amplia_a
+      `SELECT id, servicios, importe_centimos, estado, motivo_rechazo, creado_en, token_expira_en, inicio_inmediato_en, cobro, amplia_a, importe_corregido_en, importe_aceptado_en,
+         (SELECT JSON_OBJECT('antes', c.importe_antes, 'despues', c.importe_despues, 'motivo', c.motivo, 'en', c.creado_en, 'aceptada_en', c.aceptada_en) FROM propuestas_correcciones c WHERE c.propuesta_id = propuestas.id ORDER BY c.id DESC LIMIT 1) AS correccion
        FROM propuestas WHERE cliente_id = ? ORDER BY creado_en DESC`, [id]);
     const ids = propuestas.map(p => p.id);
     let pagos = [], diligencias = [], documentos = [], entregasF = [];
@@ -4529,6 +4586,7 @@ app.get('/api/acceso/:token', async (req, res) => {
     if (t.usado) return res.status(410).json({ error: 'Este enlace ya se ha usado' });
     if (new Date(t.expira_en) < ahora()) return res.status(410).json({ error: 'Este enlace ha caducado' });
     await conn.execute('UPDATE tokens_acceso SET usado = 1 WHERE id = ?', [t.id]);
+    await marcarEntradaMedioCamino(t.cliente_id);   // 12/11: si venía de una solicitud a medio camino, ya ha entrado
     const [cliente] = await conn.execute('SELECT id, correo, nombre, apellidos, totp_activo FROM clientes WHERE id = ?', [t.cliente_id]);
     const r = await sesionClienteTrasEntrar(conn, cliente[0], req.get('x-dispositivo-2fa'));
     res.json({ ok: true, cliente: { id: cliente[0].id, correo: cliente[0].correo, nombre: cliente[0].nombre, apellidos: cliente[0].apellidos }, sesion: r.sesion, requiere_2fa: !!r.requiere_2fa });
@@ -5175,14 +5233,15 @@ const IA_TOPE_POR_DEFECTO = 60;   // USD/mes; los créditos del plan Max son 100
 let iaUltimaAlerta = 0;
 
 async function iaAjustes() {
-  const a = { activa: true, borradores: true, asistente: true, web: true, tope_usd: IA_TOPE_POR_DEFECTO, conocimiento: '', conocimiento_anterior: null };
+  const a = { activa: true, borradores: true, asistente: true, web: true, web_fiscal: true, tope_usd: IA_TOPE_POR_DEFECTO, conocimiento: '', conocimiento_anterior: null };
   try {
-    const [f] = await pool.execute("SELECT clave, valor FROM ajustes WHERE clave IN ('ia_activa','ia_borradores','ia_asistente','ia_web','ia_tope_usd','ia_conocimiento','ia_conocimiento_anterior')");
+    const [f] = await pool.execute("SELECT clave, valor FROM ajustes WHERE clave IN ('ia_activa','ia_borradores','ia_asistente','ia_web','ia_web_fiscal','ia_tope_usd','ia_conocimiento','ia_conocimiento_anterior')");
     f.forEach(x => {
       if (x.clave === 'ia_activa') a.activa = x.valor !== '0';
       if (x.clave === 'ia_borradores') a.borradores = x.valor !== '0';
       if (x.clave === 'ia_asistente') a.asistente = x.valor !== '0';
       if (x.clave === 'ia_web') a.web = x.valor !== '0';
+      if (x.clave === 'ia_web_fiscal') a.web_fiscal = x.valor !== '0';
       if (x.clave === 'ia_conocimiento') a.conocimiento = x.valor || '';
       if (x.clave === 'ia_conocimiento_anterior') a.conocimiento_anterior = x.valor;
       if (x.clave === 'ia_tope_usd') { const n = Number(x.valor); if (Number.isFinite(n) && n >= 0) a.tope_usd = n; }
@@ -5281,6 +5340,38 @@ app.get('/api/admin/ia/estado', requiereSesionAsesor, async (req, res) => {
   const motivo = await iaMotivoNo('borrador'), motivoAs = await iaMotivoNo('asistente');
   res.json({ configurada: !!IA_CLAVE, borradores: !motivo, asistente: !motivoAs, motivo: motivo || null, motivo_asistente: motivoAs || null });
 });
+// 19/11 (Vikn): Facturación. El emisor es editable (hoy, Bernardo); la numeración va por serie y año.
+// Quipu y Stripe se conectan con variables de entorno; hasta entonces no se emite nada.
+const FAC_EMISOR = ['nombre', 'nif', 'direccion', 'cp_ciudad', 'correo'];
+async function ajustesFacturacion() {
+  const [f] = await pool.query("SELECT clave, valor FROM ajustes WHERE clave LIKE 'fac\\_%'");
+  const a = {}; f.forEach(x => { a[x.clave.slice(4)] = x.valor; });
+  let emisor = {}; try { emisor = JSON.parse(a.emisor || '{}') || {}; } catch (e) {}
+  if (!a.emisor) emisor.nombre = 'Bernardo';
+  return { emisor: Object.fromEntries(FAC_EMISOR.map(k => [k, String(emisor[k] || '')])), serie: a.serie || 'A', serie_rect: a.serie_rect || 'R', siguiente: Math.max(1, parseInt(a.siguiente, 10) || 1) };
+}
+app.get('/api/admin/facturacion', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
+  try {
+    const d = await ajustesFacturacion(), clave = process.env.STRIPE_SECRET_KEY || '';
+    res.json(Object.assign(d, { quipu: { conectado: !!(process.env.QUIPU_APP_ID && process.env.QUIPU_APP_SECRET) }, stripe: { conectado: !!clave, modo: clave.startsWith('sk_live') ? 'real' : 'pruebas' }, facturas: [] }));
+  } catch (e) { console.error('Facturación:', e.message); res.status(500).json({ error: 'No se pudieron leer los ajustes de facturación' }); }
+});
+app.put('/api/admin/facturacion', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
+  const b = req.body || {}, serie = v => String(v || '').trim().toUpperCase();
+  const emisor = Object.fromEntries(FAC_EMISOR.map(k => [k, textoWeb(String((b.emisor || {})[k] || ''), k === 'direccion' ? 200 : 120)]));
+  if (emisor.nif && !/^[A-Z0-9]{8,10}$/i.test(emisor.nif.replace(/[\s-]/g, ''))) return res.status(400).json({ error: 'El NIF no parece válido' });
+  if (emisor.correo && !correoValido(emisor.correo)) return res.status(400).json({ error: 'El correo no es válido' });
+  const s1 = serie(b.serie), s2 = serie(b.serie_rect), n = Number(b.siguiente);
+  if (!/^[A-Z0-9]{1,10}$/.test(s1) || !/^[A-Z0-9]{1,10}$/.test(s2)) return res.status(400).json({ error: 'La serie solo lleva letras y números (hasta 10)' });
+  if (s1 === s2) return res.status(400).json({ error: 'Las rectificativas necesitan una serie distinta' });
+  if (!Number.isInteger(n) || n < 1 || n > 999999) return res.status(400).json({ error: 'El próximo número no es válido' });
+  emisor.nif = emisor.nif.replace(/[\s-]/g, '').toUpperCase();
+  try {
+    for (const [k, v] of [['fac_emisor', JSON.stringify(emisor)], ['fac_serie', s1], ['fac_serie_rect', s2], ['fac_siguiente', String(n)]])
+      await pool.execute('INSERT INTO ajustes (clave, valor) VALUES (?, ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)', [k, v]);
+    res.json(Object.assign({ ok: true }, await ajustesFacturacion()));
+  } catch (e) { console.error('Facturación:', e.message); res.status(500).json({ error: 'No se pudo guardar' }); }
+});
 app.get('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
   const a = await iaAjustes(), g = await iaGastoMes();
   let porFuncion = [], ultimos = [];
@@ -5288,7 +5379,7 @@ app.get('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), asy
     [porFuncion] = await pool.execute("SELECT `funcion`, COUNT(*) AS llamadas, COALESCE(SUM(`coste_micro_usd`),0) AS coste, COALESCE(SUM(`ok`=0),0) AS errores FROM ia_uso WHERE `creado_en` >= DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-01') GROUP BY `funcion`");
     [ultimos] = await pool.execute('SELECT u.`creado_en`, u.`funcion`, u.`modelo`, u.`tokens_entrada`, u.`tokens_salida`, u.`coste_micro_usd`, u.`ok`, u.`error`, p.`nombre` AS persona FROM ia_uso u LEFT JOIN asesores p ON p.`id` = u.`persona_id` ORDER BY u.`id` DESC LIMIT 15');
   } catch (e) { /* tabla aún vacía */ }
-  res.json({ configurada: !!IA_CLAVE, modelo_borrador: IA_MODELO_BORRADOR, modelo_asistente: IA_MODELO_ASISTENTE, activa: a.activa, borradores: a.borradores, asistente: a.asistente, web: a.web, tope_usd: a.tope_usd,
+  res.json({ configurada: !!IA_CLAVE, modelo_borrador: IA_MODELO_BORRADOR, modelo_asistente: IA_MODELO_ASISTENTE, activa: a.activa, borradores: a.borradores, asistente: a.asistente, web: a.web, web_fiscal: a.web_fiscal, dominios_fiscales: IA_DOMINIOS_FISCALES, tope_usd: a.tope_usd,
     conocimiento: a.conocimiento, hay_conocimiento_anterior: a.conocimiento_anterior !== null, max_conocimiento: IA_MAX_CONOCIMIENTO,
     mes: { gasto_usd: g.usd, llamadas: g.llamadas, errores: g.errores, por_funcion: porFuncion.map(x => ({ funcion: x.funcion, llamadas: Number(x.llamadas), gasto_usd: Number(x.coste) / 1e6, errores: Number(x.errores) })) },
     ultimos: ultimos.map(x => ({ creado_en: x.creado_en, funcion: x.funcion, modelo: x.modelo, tokens_entrada: x.tokens_entrada, tokens_salida: x.tokens_salida, gasto_usd: Number(x.coste_micro_usd) / 1e6, ok: !!x.ok, error: x.error, persona: x.persona })) });
@@ -5299,6 +5390,7 @@ app.put('/api/admin/ia/ajustes', requiereSesionAsesor, requiereRol('admin'), asy
   if (typeof b.borradores === 'boolean') filas.push(['ia_borradores', b.borradores ? '1' : '0']);
   if (typeof b.asistente === 'boolean') filas.push(['ia_asistente', b.asistente ? '1' : '0']);
   if (typeof b.web === 'boolean') filas.push(['ia_web', b.web ? '1' : '0']);
+  if (typeof b.web_fiscal === 'boolean') filas.push(['ia_web_fiscal', b.web_fiscal ? '1' : '0']);   // 13/11
   // 19/10: «Instrucciones y conocimiento de Acros». Se guarda la versión anterior para poder deshacer.
   if (typeof b.conocimiento === 'string' || b.deshacer_conocimiento) {
     const a = await iaAjustes();
@@ -5338,6 +5430,10 @@ const IA_ASISTENTE_CON_WEB = [
   'Di de dónde sale cada dato importante. No busques información sobre personas concretas.'
 ].join(' ');
 const IA_HERRAMIENTA_WEB = { type: 'web_search_20250305', name: 'web_search', max_uses: 5, user_location: { type: 'approximate', country: 'ES', city: 'Madrid', region: 'Madrid', timezone: 'Europe/Madrid' } };
+// 13/11: con «solo fiscalidad», la búsqueda se limita a estas webs (la API acepta también sus subdominios)
+const IA_DOMINIOS_FISCALES = ['agenciatributaria.gob.es', 'agenciatributaria.es', 'boe.es', 'hacienda.gob.es', 'petete.tributos.hacienda.gob.es', 'poderjudicial.es', 'eur-lex.europa.eu', 'cnmv.es', 'bde.es'];
+const iaHerramientaWeb = soloFiscal => soloFiscal ? Object.assign({}, IA_HERRAMIENTA_WEB, { allowed_domains: IA_DOMINIOS_FISCALES }) : IA_HERRAMIENTA_WEB;
+const IA_ASISTENTE_WEB_FISCAL = 'Tu búsqueda en internet está limitada a fuentes oficiales de fiscalidad (Agencia Tributaria, BOE, Hacienda y consultas de la DGT, CENDOJ, EUR-Lex, CNMV y Banco de España). Si lo que te piden no está en ellas, dilo.';
 // Fuentes citadas en la respuesta (enlaces únicos, como mucho 8)
 function iaFuentes(cuerpo) {
   const vistas = new Map();
@@ -5438,6 +5534,68 @@ async function iaEjecutarHerramienta(nombre, entrada, req, usados) {
 const IA_ASISTENTE_CON_PANEL = 'Tienes herramientas para consultar el panel de Acros (chats, equipo, servicios con sus plazos y si su año está sin confirmar, propuestas sin respuesta, pagos por confirmar, documentos y altas). Si para contestar te falta algo que no está en ellas, dilo claramente en vez de suponerlo. Úsalas cuando te pregunten por clientes, conversaciones o asesores; no te lo inventes. Los clientes aparecen con un código (por ejemplo LF19J6Z8XE): menciónalos siempre por ese código exacto, tal cual, sin añadir nombres; el panel lo cambiará por el nombre al enseñárselo a la persona. Solo ves los clientes que puede ver quien pregunta: si algo no aparece, puede ser por eso. Las fechas vienen en UTC; habla en hora de España.';
 const IA_ASISTENTE_LIMITE_HORA = 60;
 const iaAsistenteUso = new Map();   // asesor id → marcas de tiempo (última hora)
+// 13/11: SOLO PRUEBAS (ACROS_PRUEBAS=1): comprueba el candado intentando, con él puesto, lo que la IA nunca debe poder hacer
+if (process.env.ACROS_PRUEBAS === '1') app.post('/api/pruebas/ia-candado', async (req, res) => {
+  const intenta = async f => { try { await f(); return 'hecho'; } catch (e) { return e.candado ? 'bloqueado' : 'error: ' + e.message; } };
+  const r = await iaCandado.run(true, async () => ({
+    leer: await intenta(() => pool.query('SELECT 1')),
+    leer_conexion: await intenta(async () => { const c = await pool.getConnection(); try { await c.execute('SELECT 1'); } finally { c.release(); } }),
+    escribir: await intenta(() => pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('ia_prueba_candado', '1')")),
+    escribir_conexion: await intenta(async () => { const c = await pool.getConnection(); try { await c.query("UPDATE ajustes SET valor = '2' WHERE clave = 'ia_activa'"); } finally { c.release(); } }),
+    dos_ordenes: await intenta(() => pool.query("SELECT 1; DELETE FROM ajustes")),
+    correo: await intenta(() => enviarCorreo('x@prueba.es', 'IA', '<p>no</p>', 'no')),
+    whatsapp: await intenta(() => enviarWhatsApp('+34600000000', 'no')),
+    archivo: await intenta(() => subirAR2('ia/prueba', Buffer.from('x'), 'text/plain')),
+  }));
+  r.fuera_del_candado = await intenta(() => pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('ia_prueba_fuera', '1') ON DUPLICATE KEY UPDATE valor = '1'"));
+  res.json(r);
+});
+// =====================================================================
+// 21/11 (Acros 10): BASE DE DOCTRINA OFICIAL. Fichas de la DGT, la AEAT, el TJUE… comprobadas contra el texto oficial.
+// Se lee una vez al arrancar (conocimiento/fichas.json, o la ruta de ACROS_DOCTRINA). Si falta, el Asistente funciona como antes.
+// Para actualizarla: sustituir el archivo entero y reiniciar el servidor.
+// =====================================================================
+let DOCTRINA = null;
+(function cargarDoctrina() {
+  const ruta = process.env.ACROS_DOCTRINA || require('path').join(__dirname, 'conocimiento', 'fichas.json');
+  try {
+    const d = JSON.parse(require('fs').readFileSync(ruta, 'utf8'));
+    if (!d || !Array.isArray(d.fichas) || !d.fichas.length) throw new Error('sin fichas');
+    const n = x => sinAcentos(Array.isArray(x) ? x.join(' ') : x);
+    DOCTRINA = { version: d.version, temas: Array.isArray(d.temas_validos) ? d.temas_validos : [], fichas: d.fichas.map(f => Object.assign({}, f, {
+      _ref: n(f.referencia), _pregunta: n(f.pregunta), _criterio: n(f.criterio), _normas: n(f.normas_citadas) })) };
+    console.log('Base de doctrina cargada: versión ' + d.version + ', ' + d.fichas.length + ' fichas');
+  } catch (e) { console.warn('Base de doctrina no cargada (' + ruta + '): ' + e.message + '. El Asistente sigue sin ella.'); }
+})();
+const DOCTRINA_VACIAS = new Set('de la el los las un una unos unas y o a en por para con sin que se su sus mi mis me lo le les al del es son como cual cuando donde hay si no mas muy ya pero este esta esto estos estas ese esa eso tengo tiene tributa tributan'.split(' '));
+const DOCTRINA_GENERICAS = new Set('base coste valor mercado renta ganancia perdida actividad economica modelo cambio residencia capital venta euros'.split(' '));
+function buscarDoctrina(entrada) {
+  if (!DOCTRINA) return { sin_resultados: true, motivo: 'La base de doctrina no está cargada' };
+  const e = entrada || {}, consulta = sinAcentos(e.consulta || ''), temas = (Array.isArray(e.temas) ? e.temas : []).map(String);
+  const palabras = [...new Set(consulta.split(/[^a-z0-9]+/).filter(p => p.length > 2 && !DOCTRINA_VACIAS.has(p)))];
+  const refs = (String(e.consulta || '').match(/\b(V\d{4}-\d{2}|C-\d{1,4}\/\d{2})\b/gi) || []).map(r => sinAcentos(r));
+  const implicitos = DOCTRINA.temas.filter(t => t.split('_').some(x => x.length > 2 && !DOCTRINA_GENERICAS.has(x) && palabras.includes(x)));
+  const puntos = DOCTRINA.fichas.map(f => {
+    let p = 0;
+    for (const w of palabras) {
+      if (f._pregunta.includes(w)) p += 3;
+      if (f._criterio.includes(w)) p += 2;
+      if (f._normas.includes(w)) p += 1;
+      if (f._ref.includes(w)) p += 2;
+    }
+    p += 4 * temas.filter(t => (f.temas || []).includes(t)).length;
+    p += 3 * implicitos.filter(t => !temas.includes(t) && (f.temas || []).includes(t)).length;   // temas que se deducen de la pregunta («fifo», «721», «staking»…)
+    if (refs.some(r => f._ref.includes(r))) p += 1000;   // una referencia exacta va la primera
+    return { f, p };
+  }).filter(x => x.p > 0).sort((a, b) => b.p - a.p).slice(0, 8);
+  if (!puntos.length) return { sin_resultados: true };
+  return { version_base: DOCTRINA.version, fichas: puntos.map(({ f }) => { const o = {}; for (const k of Object.keys(f)) if (!k.startsWith('_') && k !== 'fuente_consultada') o[k] = f[k]; return o; }) };
+}
+const doctrinaHerramienta = () => DOCTRINA ? [{ name: 'buscar_doctrina', description: 'Busca en la base de doctrina oficial de Acros (consultas vinculantes de la DGT, manual de la AEAT, sentencias del TJUE…), comprobada contra el texto oficial. Úsala primero para cualquier duda de fiscalidad. Devuelve como mucho 8 fichas con su referencia, criterio, normas, vigencia y enlace oficial, o sin_resultados. Temas válidos: ' + DOCTRINA.temas.join(', ') + '.',
+  input_schema: { type: 'object', properties: { consulta: { type: 'string', description: 'La duda en texto libre (puede incluir una referencia exacta, por ejemplo V1604-18)' }, temas: { type: 'array', items: { type: 'string', enum: DOCTRINA.temas }, description: 'Opcional: temas de la lista' } }, required: ['consulta'] } }] : [];
+const IA_ASISTENTE_DOCTRINA = 'Para dudas de fiscalidad usa primero la herramienta buscar_doctrina, que consulta la base de doctrina oficial de Acros. Si una ficha responde, básate en ella y cita su referencia y su enlace oficial; busca en internet solo si la base no lo cubre o hace falta confirmar algo posterior a la fecha de la ficha. Las fichas con texto_completo_comprobado=false son orientativas: dilo y no las presentes como criterio. No completes de memoria un campo marcado [PENDIENTE]. Distingue lo vinculante (consultas de la DGT, sentencias) de lo que no lo es (manual de la AEAT). Si la vigencia dice «matizada por» o «superada por», tenlo en cuenta y cita también la otra. Si la base no tiene nada sobre la duda, dilo claramente.';
+// Las fichas usadas, como fuentes bajo la respuesta (sin el paréntesis del enlace de Petete; una por referencia)
+const fuentesDoctrina = salida => ((salida && salida.fichas) || []).map(f => ({ url: String(f.enlace_oficial || '').replace(/\s*\(.*\)\s*$/, '').trim(), titulo: f.referencia })).filter(x => /^https?:\/\//.test(x.url));
 app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
   const motivo = await iaMotivoNo('asistente');
   if (motivo) return res.status(503).json({ error: motivo, sin_ia: true });
@@ -5456,9 +5614,9 @@ app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
   const usados = new Map();   // código → id de cliente de lo que ha consultado (para poner nombres en el panel)
   const conPanel = !!(req.asesor && req.asesor.roles && ['asesor', 'jefe', 'encargado', 'admin'].some(x => req.asesor.roles.has(x)));
   const llamar = async conWeb => {
-    const sistema = iaSistemaCon(base + (conWeb ? IA_ASISTENTE_CON_WEB : IA_ASISTENTE_SIN_WEB) + (conPanel ? '\n' + IA_ASISTENTE_CON_PANEL + '\n' + await iaTextoAlcance(req) : ''), a.conocimiento);   // 31/10: su alcance según el rango
+    const sistema = iaSistemaCon(base + (DOCTRINA ? IA_ASISTENTE_DOCTRINA + '\n' : '') + (conWeb ? IA_ASISTENTE_CON_WEB + (a.web_fiscal ? ' ' + IA_ASISTENTE_WEB_FISCAL : '') : IA_ASISTENTE_SIN_WEB) + (conPanel ? '\n' + IA_ASISTENTE_CON_PANEL + '\n' + await iaTextoAlcance(req) : ''), a.conocimiento);   // 31/10: su alcance según el rango
     let conv = mensajes, textos = [], fuentes = [], busquedas = 0, consultas = [];
-    const herramientas = (conWeb ? [IA_HERRAMIENTA_WEB] : []).concat(conPanel ? IA_HERRAMIENTAS_PANEL.filter(h => h.name !== 'registro' || (req && req.asesor && req.asesor.esAdmin)) : []);   // 30/10: el registro, solo para administradores
+    const herramientas = (conWeb ? [iaHerramientaWeb(a.web_fiscal)] : []).concat(doctrinaHerramienta()).concat(conPanel ? IA_HERRAMIENTAS_PANEL.filter(h => h.name !== 'registro' || (req && req.asesor && req.asesor.esAdmin)) : []);   // 30/10: el registro, solo para administradores
     // Vueltas: «pause_turn» (búsquedas largas) o «tool_use» (consultas al panel). Máx. 8.
     for (let vuelta = 0; vuelta < 8; vuelta++) {
       const r = await iaLlamar({ funcion: 'asistente', modelo: IA_MODELO_ASISTENTE, sistema, mensajes: conv, maxTokens: 1500, personaId: yo, clienteId: null, herramientas: herramientas.length ? herramientas : null, completo: true });
@@ -5470,13 +5628,18 @@ app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
       const resultados = [];
       for (const b of (r.cuerpo.content || []).filter(x => x.type === 'tool_use')) {
         let salida;
-        try { salida = await iaEjecutarHerramienta(b.name, b.input, req, usados); consultas.push(b.name); }
+        // 13/11: solo las herramientas declaradas en esta petición, y siempre con el candado puesto (solo lectura, sin envíos)
+        try {
+          if (!herramientas.some(h => h.name === b.name) || b.name === 'web_search') salida = { error: 'Herramienta no permitida' };
+          else if (b.name === 'buscar_doctrina') { salida = buscarDoctrina(b.input); fuentes = fuentes.concat(fuentesDoctrina(salida)); consultas.push(b.name); }
+          else { salida = await iaCandado.run(true, () => iaEjecutarHerramienta(b.name, b.input, req, usados)); consultas.push(b.name); }
+        }
         catch (err) { console.error('Herramienta IA', b.name, err.message); salida = { error: 'No se pudo consultar: ' + err.message }; }
         resultados.push({ type: 'tool_result', tool_use_id: b.id, content: JSON.stringify(salida).slice(0, 60000) });
       }
       conv = conv.concat([{ role: 'assistant', content: r.cuerpo.content }, { role: 'user', content: resultados }]);
     }
-    const unicas = []; fuentes.forEach(f => { if (!unicas.some(x => x.url === f.url)) unicas.push(f); });
+    const unicas = []; fuentes.forEach(f => { if (!unicas.some(x => x.url === f.url && x.titulo === f.titulo)) unicas.push(f); });
     return { texto: textos.join('').trim(), fuentes: unicas.slice(0, 8), busquedas, consultas };
   };
   try {
@@ -5497,7 +5660,7 @@ app.post('/api/admin/ia/asistente', requiereSesionAsesor, async (req, res) => {
       const [cs] = await pool.query('SELECT id, codigo, nombre, apellidos, correo FROM clientes WHERE id IN (?)', [codigos.map(c => usados.get(c))]);
       cs.forEach(c => { const cod = c.codigo || ('C' + c.id); clientes[cod] = { id: c.id, nombre: [c.nombre, c.apellidos].filter(Boolean).join(' ') || c.correo }; });
     }
-    res.json({ texto: r.texto, fuentes: r.fuentes, busquedas: r.busquedas, consultas: r.consultas, clientes, sin_web: sinWeb || undefined });
+    res.json({ texto: r.texto, fuentes: r.fuentes, busquedas: r.busquedas, consultas: r.consultas, clientes, sin_web: sinWeb || undefined, web_fiscal: a.web && !sinWeb ? a.web_fiscal : undefined });
   } catch (e) {
     const det = req.asesor && req.asesor.esAdmin && e.message && e.message !== e.publico ? ' (Motivo: ' + String(e.message).slice(0, 160) + ')' : '';
     res.status(503).json({ error: (e.publico || 'La IA no está disponible ahora mismo.') + det, sin_ia: true });
@@ -7201,6 +7364,72 @@ app.get('/api/admin/clientes/:id(\\d+)/servicios/historial', requiereSesionAseso
 
 // 26/10 (Vikn): «Recordar el pago». Un correo al cliente con el enlace a su área; desde entonces, en
 // «Te toca a ti» su botón «Pagar» sale en teja (lo urgente o pedido por el asesor), no en verde.
+// 18/11 (Vikn): corregir el importe de un encargo aceptado y sin pagar
+async function correccionPendiente(conn, p) {
+  if (!p.importe_corregido_en || p.importe_aceptado_en) return null;
+  const [c] = await conn.execute('SELECT importe_antes, importe_despues, motivo, creado_en FROM propuestas_correcciones WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
+  return c.length ? { antes: c[0].importe_antes, despues: c[0].importe_despues, motivo: c[0].motivo, en: c[0].creado_en } : null;
+}
+app.post('/api/admin/propuestas/:id(\\d+)/corregir-importe', requiereSesionAsesor, async (req, res) => {
+  const motivo = String((req.body || {}).motivo || '').trim().slice(0, 500);
+  if (motivo.length < 5) return res.status(400).json({ error: 'Explica al cliente por qué cambia el importe' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [f] = await conn.execute('SELECT * FROM propuestas WHERE id = ? FOR UPDATE', [Number(req.params.id)]);
+    if (!f.length) { await conn.rollback(); return res.status(404).json({ error: 'Encargo no encontrado' }); }
+    const p = f[0];
+    if (p.estado !== 'aceptada') { await conn.rollback(); return res.status(409).json({ error: p.estado === 'enviada' ? 'La propuesta aún no está aceptada: envía una nueva y retira esta' : 'Solo se corrige el importe de un encargo aceptado' }); }
+    const [pg] = await conn.execute('SELECT estado FROM pagos WHERE propuesta_id = ?', [p.id]);
+    if (pg.some(x => x.estado === 'confirmado')) { await conn.rollback(); return res.status(409).json({ error: 'Ese encargo ya está pagado: para cobrar más, amplía el encargo' }); }
+    if (pg.length) { await conn.rollback(); return res.status(409).json({ error: 'El cliente dice que ya ha pagado: confirma o rechaza ese pago antes de corregir el importe' }); }
+    // nuevo importe: con desglose, precio por servicio (los mismos servicios); sin desglose, el total
+    const antes = JSON.parse(p.servicios || '[]'), conDesglose = antes.length && typeof antes[0] === 'object';
+    let despues = antes, total;
+    if (conDesglose) {
+      const precios = (req.body || {}).precios || {};
+      despues = antes.map(x => Object.assign({}, x, { precio_centimos: precios[x.id] === undefined ? x.precio_centimos : Number(precios[x.id]) }));
+      if (despues.some(x => !Number.isInteger(x.precio_centimos) || x.precio_centimos <= 0)) { await conn.rollback(); return res.status(400).json({ error: 'Algún precio no es válido' }); }
+      total = despues.reduce((a, x) => a + x.precio_centimos, 0);
+    } else {
+      total = Number((req.body || {}).importe_centimos);
+      if (!Number.isInteger(total) || total <= 0) { await conn.rollback(); return res.status(400).json({ error: 'El importe no es válido' }); }
+    }
+    if (total === p.importe_centimos && JSON.stringify(despues) === JSON.stringify(antes)) { await conn.rollback(); return res.status(400).json({ error: 'El importe no cambia' }); }
+    await conn.execute('INSERT INTO propuestas_correcciones (propuesta_id, importe_antes, importe_despues, servicios_antes, servicios_despues, motivo, asesor_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [p.id, p.importe_centimos, total, p.servicios, JSON.stringify(despues), motivo, req.asesor.id]);
+    await conn.execute('UPDATE propuestas SET importe_centimos = ?, servicios = ?, importe_corregido_en = NOW(), importe_aceptado_en = NULL WHERE id = ?', [total, JSON.stringify(despues), p.id]);
+    await conn.commit();
+    // correo al cliente
+    const [cl] = await pool.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [p.cliente_id]);
+    if (brevoActivo() && cl.length && cl[0].correo) {
+      const asesor = await personaDeCliente(p.cliente_id).catch(() => null), quien = asesor ? ESC_HTML(asesor.nombre) + ', tu asesor de Acros,' : 'Tu asesor de Acros';
+      const eur = c => (c / 100).toFixed(2).replace('.', ',') + ' €', enlace = enlaceArea('area', p.token);
+      const correo = plantillaCorreo({
+        titulo: 'Ha cambiado el importe de tu encargo',
+        parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:', `${quien} ha corregido el importe de tu encargo: antes <strong>${eur(p.importe_centimos)}</strong>, ahora <strong>${eur(total)}</strong>.`,
+          '<em>' + ESC_HTML(motivo) + '</em>', 'Antes de pagar, entra en tu área y acepta el nuevo importe. Si algo no te cuadra, escríbele desde allí.'],
+        boton: enlace ? { texto: 'Ver el nuevo importe', url: enlace } : null,
+      });
+      enviarCorreo(cl[0].correo, 'Ha cambiado el importe de tu encargo de Acros', correo.html, correo.texto, { desde: 'asesor' }).catch(e => console.error('Correo de importe corregido no enviado:', e.message));
+    }
+    res.json({ ok: true, importe_centimos: total });
+  } catch (e) { await conn.rollback().catch(() => {}); console.error('Corregir importe:', e.message); res.status(500).json({ error: 'No se pudo corregir el importe' }); }
+  finally { conn.release(); }
+});
+app.post('/api/propuestas/:token/aceptar-importe', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (!p.importe_corregido_en || p.importe_aceptado_en) return res.status(409).json({ error: 'No hay ningún importe nuevo que aceptar' });
+    await conn.execute('UPDATE propuestas SET importe_aceptado_en = NOW() WHERE id = ?', [p.id]);
+    await conn.execute('UPDATE propuestas_correcciones SET aceptada_en = NOW() WHERE propuesta_id = ? AND aceptada_en IS NULL', [p.id]);
+    anotarRegistro({ actor_tipo: 'cliente', actor_nombre: 'Cliente', tipo: 'cliente', accion: 'Aceptó el importe corregido (' + (p.importe_centimos / 100).toFixed(2).replace('.', ',') + ' €)', cliente_id: p.cliente_id, objeto_id: p.id });
+    avisarCliente(p.cliente_id, '💶', 'un cliente ha aceptado el importe corregido', 'Ya puede pagar.', { prioridad: 3, etiqueta: 'euro' });
+    res.json({ ok: true, importe_centimos: p.importe_centimos });
+  } finally { conn.release(); }
+});
 app.post('/api/admin/propuestas/:id(\\d+)/recordar-pago', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
@@ -7569,7 +7798,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-11-11.3';
+const VERSION_ACROS = '2026-11-21.2';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -8113,7 +8342,7 @@ app.get('/api/admin/cliente-por-codigo/:codigo', requiereSesionAsesor, async (re
 // PANTALLAS DE ERROR BONITAS (29/10, Vikn) — generado por generar_errores.py
 // A quien llega con un navegador a una dirección que no existe o que falla se le enseña una página de Acros; a los programas, el JSON de siempre.
 // ================================================================
-const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main></body></html>"}};
+const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>"}};
 function pideHTML(req) { const a = String(req.headers.accept || ''); return a.includes('text/html') && !a.includes('application/json'); }
 function paginaError(req, codigo) { const i = /^en\b/i.test(String(req.headers['accept-language'] || '')) ? 'en' : 'es'; return PAGINAS_ERROR[i][codigo]; }
 
@@ -8918,7 +9147,7 @@ function cuestionarioSimulacros(res, extra = {}) {
   if (res.operaciones != null) c['Operaciones'] = res.operaciones.toLocaleString('es-ES');
   if (res.anos) c['Años con actividad'] = res.anos + (res.ano_desde ? ' (desde ' + res.ano_desde + ')' : '');
   if (res.salud != null) c['Salud de sus datos'] = res.salud + ' %';
-  if (res.avisos && res.avisos.length) c['Avisos que vio'] = res.avisos.join(' · ');
+  if (res.avisos && res.avisos.length) c['Avisos que vio'] = res.avisos.join('; ');
   if (res.resultado_ventas != null) c[res.resultado_ventas < 0 ? 'Pérdidas por ventas este año (sin revisar)' : 'Ganancias por ventas este año (sin revisar)'] = eurosSimulacros(res.resultado_ventas);
   if (res.impuesto != null) c['Impuesto orientativo si el año acabara hoy'] = eurosSimulacros(res.impuesto);
   if (res.no_realizado != null) c['PyG no realizado'] = eurosSimulacros(res.no_realizado);
@@ -9145,6 +9374,65 @@ const ART_PUBLICOS = ['Particulares', 'Gestorías y asesorías', 'Empresas'];
 const ART_TEMAS = ['Renta', 'Modelo 721', 'Exchanges', 'Pérdidas', 'Staking y DeFi', 'Herencias y donaciones', 'Inspecciones', 'Empresas'];
 const ART_MAX_BLOQUES = 400, ART_MAX_TEXTO = 20000, ART_MAX_IMAGEN = 900 * 1024;
 const ART_RUTA = { articulo: '/articulos', guia: '/guias' };
+// 17/11: plantillas de «¿Qué vas a escribir?» (Vikn). Cada bloque lleva su pista; los títulos de sección ya van escritos.
+const ART_PLANTILLAS = ['guia', 'fiscalidad', 'discusion'];
+async function plantillaArticulo(cual) {
+  const [recs] = await pool.query('SELECT id, nombre, boton_texto, boton_url FROM articulos_recuadros WHERE activo = 1 ORDER BY id');
+  // El recuadro se busca por lo que hace (su botón), no por el título, que el equipo puede cambiar
+  const rec = cual => { const r = cual === 'simulador' ? recs.find(x => /^\/simulador/.test(x.boton_url || '')) : (recs.find(x => /^hablar con un asesor$/i.test(x.nombre || '')) || recs.find(x => /^hablar con un asesor/i.test(x.boton_texto || ''))); return r ? [{ t: 'recuadro', id: r.id, forma: 'achatado' }] : []; };
+  const h2 = texto => ({ t: 'h2', texto }), p = pista => ({ t: 'p', texto: '', pista });
+  const faq = pista => ({ t: 'faq', pregunta: '', respuesta: '', pista });
+  if (cual === 'guia') return { plantilla: 'guia', columna: [{ tipo: 'indice' }], cuerpo: [
+    h2('Ficha rápida'),
+    { t: 'tabla', cabecera: false, cabecera_col: true, filas: [['Qué archivo necesitas', ''], ['Dónde se descarga', ''], ['Enlace directo', ''], ['Máximo por descarga', ''], ['Desde el móvil', ''], ['Tiempo aproximado', ''], ['Comprobado', '']],
+      ejemplos: ['Historial de operaciones, en CSV', 'La ruta de menús: Cartera → Historial → Exportar', 'El enlace a esa página del exchange, si lo hay', 'Por ejemplo: 3 meses por archivo', 'Sí, desde la app / No, solo desde la web', 'Unos 5 minutos; el archivo llega por correo', 'Fecha y quién lo comprobó'],
+      pista: 'Rellena la segunda columna: lo gris es un ejemplo. Si una fila no aplica a este exchange, quítala desde el asa ⋮⋮ que sale a su izquierda.' },
+    h2('Paso a paso'),
+    { t: 'h3', texto: '', pista: 'Paso 1, una sola acción: «1. Abre tu cartera»' },
+    p('Qué hay que pulsar, con el menú entre comillas y su nombre en inglés: «Cartera» («Wallet»). Debajo, añade la captura con «Imagen».'),
+    h2('Qué te descargas'),
+    p('Cuántos archivos, cómo se llaman y qué contienen. Termina con: «No lo abras ni lo guardes con Excel: envíalo tal como se descarga».'),
+    h2('Si algo no sale'),
+    faq('Una duda real: el archivo sale vacío, hay un rango máximo, solo se puede desde la web…'),
+    faq('Otra duda real, con su respuesta corta'),
+    faq('Otra duda real, con su respuesta corta'),
+    h2('Lo que este archivo no incluye'),
+    p('Lo que el exchange no da: el coste de lo que llegó de fuera, el valor en euros… Es donde entra el asesor.'),
+    ...rec('asesor'),
+    h2('Historial de cambios'),
+    { t: 'lista', numerada: false, items: [], pista: 'Una línea por cambio, con su fecha: «Noviembre de 2026: guía publicada y comprobada por …»' },
+    { t: 'fuentes', items: [], pista: 'El enlace a la ayuda oficial del exchange' },
+  ] };
+  if (cual === 'fiscalidad') return { plantilla: 'fiscalidad', columna: [{ tipo: 'indice' }], cuerpo: [
+    h2('La respuesta'),
+    p('La respuesta completa en un párrafo: sí o no, la cifra o el plazo, y a quién afecta.'),
+    h2('Un ejemplo con números'),
+    p('Un caso inventado con cifras redondas, paso a paso. Nunca un cliente real.'),
+    h2('Qué dice la norma'),
+    { t: 'cita', texto: '', pista: 'El artículo de la ley o la consulta de la DGT, copiado tal cual.' },
+    p('Qué significa en palabras sencillas.'),
+    h2('Errores frecuentes'),
+    { t: 'lista', numerada: false, items: [], pista: 'Un error por línea, y lo que puede costar.' },
+    h2('Preguntas frecuentes'),
+    faq('Una pregunta tal como la haría alguien, con su respuesta corta'),
+    faq('Otra pregunta, con su respuesta corta'),
+    faq('Otra pregunta, con su respuesta corta'),
+    ...rec('simulador'),
+    { t: 'fuentes', items: [], pista: 'BOE, AEAT y consultas de la DGT, con su enlace. Una por línea.' },
+  ] };
+  if (cual === 'discusion') return { plantilla: 'discusion', columna: [{ tipo: 'indice' }], cuerpo: [
+    h2('Qué está pasando'),
+    p('El hecho o la noticia, con su fecha y su fuente.'),
+    h2('Nuestra opinión'),
+    p('Qué pensamos y por qué, en primera persona.'),
+    h2('El otro lado'),
+    p('Los mejores argumentos de quien no está de acuerdo.'),
+    h2('Qué significa para ti'),
+    p('Qué debería vigilar quien tiene criptomonedas. Sin consejos de inversión.'),
+    { t: 'fuentes', items: [], pista: 'De dónde sale cada dato, con su enlace. Una por línea.' },
+  ] };
+  return null;
+}
 const artUrlBase = () => (process.env.SITE_URL || 'https://acrosfi.es').replace(/\/+$/, '');
 
 async function prepararArticulos() {
@@ -9184,6 +9472,62 @@ async function prepararArticulos() {
     subida_por_asesor_id INT NULL,
     creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  // 19/11: comentarios de los lectores (se publican cuando los revisa el equipo) y visitas de los rastreadores de IA
+  await pool.query(`CREATE TABLE IF NOT EXISTS articulos_comentarios (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    articulo_id INT NOT NULL,
+    nombre VARCHAR(60) NOT NULL,
+    texto TEXT NOT NULL,
+    estado VARCHAR(12) NOT NULL DEFAULT 'pendiente',
+    respuesta TEXT NULL, respuesta_asesor_id INT NULL,
+    revisado_por_asesor_id INT NULL, revisado_en DATETIME NULL,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_com_articulo (articulo_id, estado), INDEX idx_com_estado (estado)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS articulos_visitas_ia (
+    dia DATE NOT NULL,
+    bot VARCHAR(30) NOT NULL,
+    ruta VARCHAR(200) NOT NULL,
+    n INT NOT NULL DEFAULT 0,
+    ultima DATETIME NOT NULL,
+    PRIMARY KEY (dia, bot, ruta)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  // 19/11: preguntas y respuestas públicas (acrosfi.es/preguntas)
+  await pool.query(`CREATE TABLE IF NOT EXISTS preguntas (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    slug VARCHAR(120) NULL,
+    original TEXT NOT NULL,
+    titulo VARCHAR(200) NULL,
+    respuesta TEXT NULL,
+    tema VARCHAR(40) NULL,
+    subtema VARCHAR(60) NULL,
+    destacada TINYINT(1) NOT NULL DEFAULT 0,
+    estado VARCHAR(12) NOT NULL DEFAULT 'nueva',
+    respondida_por_asesor_id INT NULL,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    publicado_en DATETIME NULL, actualizado_en DATETIME NULL,
+    UNIQUE KEY uq_preguntas_slug (slug), INDEX idx_preguntas_estado (estado)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  // 20/11: columna «subtema» para tablas creadas antes
+  const [colSub] = await pool.query("SELECT COUNT(*) n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'preguntas' AND COLUMN_NAME = 'subtema'");
+  if (!colSub[0].n) await pool.query('ALTER TABLE preguntas ADD COLUMN subtema VARCHAR(60) NULL AFTER tema');
+  // 20/11 (2): «destacada» (sale en «Las más preguntadas», en la columna de la derecha)
+  const [colDes] = await pool.query("SELECT COUNT(*) n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'preguntas' AND COLUMN_NAME = 'destacada'");
+  if (!colDes[0].n) await pool.query('ALTER TABLE preguntas ADD COLUMN destacada TINYINT(1) NOT NULL DEFAULT 0 AFTER subtema');
+  // 20/11: primer paquete de preguntas (una sola vez). Entran «por publicar»; las publica un administrador tras revisarlas.
+  try {
+  await pool.query('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');
+  for (const [clave, paquete] of [['preguntas_semilla_1', PREG_SEMILLA], ['preguntas_semilla_2', PREG_SEMILLA_2]]) {
+  const [[sem]] = await pool.query('SELECT COUNT(*) n FROM ajustes WHERE clave = ?', [clave]);
+  if (!sem.n && process.env.ACROS_SIN_SEMILLA !== '1') {
+    for (const [tema, subtema, titulo, respuesta] of paquete) {
+      const [ya] = await pool.execute('SELECT id FROM preguntas WHERE titulo = ?', [titulo]); if (ya.length) continue;
+      await pool.execute("INSERT INTO preguntas (original, titulo, respuesta, tema, subtema, estado) VALUES (?, ?, ?, ?, ?, 'respondida')", ['Pregunta preparada por Acros para el arranque de la página.', titulo, respuesta, tema, subtema]);
+    }
+    await pool.query("INSERT INTO ajustes (clave, valor) VALUES (?, '1') ON DUPLICATE KEY UPDATE valor = valor", [clave]);
+  }
+  }
+  } catch (e) { console.error('Preguntas (primer paquete):', e.message); }
   const [[n]] = await pool.query('SELECT COUNT(*) n FROM articulos_recuadros');
   if (!n.n) {
     await pool.query(`INSERT INTO articulos_recuadros (nombre, titulo, texto, boton_texto, boton_url, estilo) VALUES
@@ -9204,7 +9548,16 @@ function artIdYoutube(v) {
   const m = s.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/|live\/))([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
   return m ? m[1] : '';
 }
+// 17/11: los bloques que vienen de una plantilla llevan una «pista» (lo que hay que escribir). Se guarda en el borrador,
+// se enseña en el editor y nunca sale en la web.
 function limpiarBloque(b) {
+  const r = limpiarBloqueBase(b);
+  if (r && b && b.pista) r.pista = artTxt(b.pista, 300);
+  // Ejemplos por fila de la ficha (solo en el editor, como la pista)
+  if (r && r.t === 'tabla' && b.pista && Array.isArray(b.ejemplos)) r.ejemplos = b.ejemplos.slice(0, 40).map(x => artTxt(x, 200));
+  return r;
+}
+function limpiarBloqueBase(b) {
   if (!b || typeof b !== 'object') return null;
   const t = String(b.t || '');
   switch (t) {
@@ -9215,7 +9568,9 @@ function limpiarBloque(b) {
     case 'img': return /^[a-f0-9]{32}$/.test(String(b.id || '')) ? { t, id: String(b.id), alt: artTxt(b.alt, 300), pie: artTxt(b.pie, 300) } : null;
     case 'tabla': {
       const filas = (Array.isArray(b.filas) ? b.filas : []).slice(0, 40).map(f => (Array.isArray(f) ? f : []).slice(0, 8).map(c => artTxt(c, 300)));
-      return { t, cabecera: b.cabecera !== false, filas: filas.filter(f => f.some(Boolean)) };
+      const r = { t, cabecera: b.cabecera !== false, filas: filas.filter(f => f.some(Boolean)) };
+      if (b.cabecera_col) r.cabecera_col = true; // la primera columna son los nombres de cada fila (como en una ficha)
+      return r;
     }
     case 'faq': return { t, pregunta: artTxt(b.pregunta, 300), respuesta: artTxt(b.respuesta, 3000) };
     case 'recuadro': return Number(b.id) > 0 ? { t, id: Number(b.id), forma: b.forma === 'cuadrado' ? 'cuadrado' : 'achatado' } : null;
@@ -9244,7 +9599,9 @@ function limpiarBorrador(b, tipo) {
     portada_alt: artTxt(b.portada_alt, 300),
     cuerpo: (Array.isArray(b.cuerpo) ? b.cuerpo : []).slice(0, ART_MAX_BLOQUES).map(limpiarBloque).filter(Boolean),
     columna: limpiarColumna(b.columna),
+    firma: Number(b.firma) === -1 ? -1 : Number(b.firma) > 0 ? Math.floor(Number(b.firma)) : 0,   // 19/11: quién firma (0 = el autor, -1 = sin su firma: firma de la casa)
   };
+  r.plantilla = tipo === 'guia' ? 'guia' : (['fiscalidad', 'discusion'].includes(b.plantilla) ? b.plantilla : '');
   if (tipo === 'guia') {
     r.exchange = artTxt(b.exchange, 60);
     r.video = artIdYoutube(b.video);
@@ -9252,9 +9609,24 @@ function limpiarBorrador(b, tipo) {
   }
   return r;
 }
+// Huecos de la plantilla que siguen vacíos: bloques con pista sin texto, o celdas vacías de la ficha
+function huecosBorrador(b) {
+  let n = 0;
+  for (const x of b.cuerpo || []) {
+    if (!x.pista) continue;
+    if (['p', 'h2', 'h3', 'cita'].includes(x.t) && !x.texto) n++;
+    else if ((x.t === 'lista' || x.t === 'fuentes') && !x.items.length) n++;
+    else if (x.t === 'faq' && (!x.pregunta || !x.respuesta)) n++;
+    else if (x.t === 'tabla') n += x.filas.slice(x.cabecera ? 1 : 0).filter(f => f.slice(1).some(c => !c) || f.length < 2).length;
+  }
+  return n;
+}
+const ART_MSG_HUECOS = 'Quedan huecos de la plantilla sin rellenar: rellénalos o quita esos bloques';
 // Comprobaciones que ve el administrador al revisar (no bloquean salvo título y dirección)
 function revisarBorrador(b, tipo) {
   const avisos = [];
+  const huecos = huecosBorrador(b);
+  if (huecos) avisos.push(huecos === 1 ? 'Queda 1 hueco de la plantilla sin rellenar' : 'Quedan ' + huecos + ' huecos de la plantilla sin rellenar');
   if (!b.titulo) avisos.push('Falta el título');
   if (!b.descripcion) avisos.push('Falta la descripción para Google');
   else if (b.descripcion.length > 160) avisos.push('La descripción para Google pasa de 160 caracteres');
@@ -9292,7 +9664,7 @@ async function autorPublico(asesorId) {
   if (!asesorId) return null;
   const [f] = await pool.execute('SELECT a.nombre AS nombre_asesor, p.nombre, p.puesto_es, p.bio_es, p.foto FROM asesores a LEFT JOIN personas p ON p.asesor_id = a.id AND p.activa = 1 WHERE a.id = ?', [asesorId]);
   if (!f.length) return null;
-  return { nombre: f[0].nombre || f[0].nombre_asesor, puesto: f[0].puesto_es || 'Asesor fiscal cripto en Acros', bio: f[0].bio_es || '', foto: f[0].foto || null };
+  return { nombre: f[0].nombre || f[0].nombre_asesor, puesto: String(f[0].puesto_es || 'Asesor fiscal cripto en Acros').replace(/\s*·\s*/g, ', '), bio: f[0].bio_es || '', foto: f[0].foto || null };
 }
 async function enlacesPublicados(tipo) {
   const [f] = await pool.execute("SELECT tipo, slug, publicado, publicado_en, actualizado_publico_en FROM articulos WHERE publicado IS NOT NULL" + (tipo ? ' AND tipo = ?' : '') + ' ORDER BY COALESCE(actualizado_publico_en, publicado_en) DESC', tipo ? [tipo] : []);
@@ -9308,6 +9680,7 @@ async function logoDeExchange(nombre) {
 const imgLogo = (l, tam) => l ? '<img src="' + ESC_HTML(l.url) + '" alt="" width="' + tam + '" height="' + tam + '" style="width:' + tam + 'px;height:' + tam + 'px;object-fit:contain;border-radius:12px;background:#fff;border:1px solid var(--linea);padding:6px;box-sizing:border-box">' : '';
 // ---------------- Montaje de las páginas
 const ART_CSS = `
+button,input,select,textarea{font-family:inherit}
 :root{--fondo:#FBF8F2;--panel:#FFFFFF;--linea:#E6DCCD;--circulo:#F1E6D8;--titular:#23402F;--tinta:#335C47;--suave:#423F3A;--acento:#A84C18;--verde:#2E7A4E;--f-display:'IBM Plex Serif',Georgia,serif;--f-cuerpo:'IBM Plex Sans',-apple-system,'Segoe UI',sans-serif}
 html[data-tema="oscuro"]{--fondo:#24221F;--panel:#2E2B27;--linea:#47423B;--circulo:#3A3631;--titular:#F2EDE4;--tinta:#C9D8CC;--suave:#D8D2C8;--acento:#E9A87C;--verde:#8FCBA3}
 *{box-sizing:border-box}body{margin:0;background:var(--fondo);color:var(--suave);font-family:var(--f-cuerpo);font-size:17px;line-height:1.65}
@@ -9322,6 +9695,7 @@ a{color:var(--acento)}img{max-width:100%;height:auto}
 .ar-ruta{font-size:14px;margin-bottom:16px}.ar-ruta a{text-decoration:none}
 .ar-pills{display:flex;flex-wrap:wrap;gap:6px}.ar-pill{font-size:12px;font-weight:600;padding:4px 10px;border-radius:12px;background:#E7F0EA;color:#23402F;text-decoration:none}
 .ar-pill.tema{background:var(--circulo);color:var(--suave)}
+.ar-pill.opinion{background:#F9E3D3;color:#8E3E12}
 h1.ar-h1{font-family:var(--f-display);font-weight:600;font-size:clamp(30px,4.4vw,46px);line-height:1.12;color:var(--titular);margin:12px 0}
 .ar-entr{font-size:19px;line-height:1.6;margin:0 0 16px;max-width:820px}
 .ar-autor{display:flex;align-items:center;gap:12px;font-size:14px}.ar-autor img,.ar-autor .sin{width:44px;height:44px;border-radius:50%;object-fit:cover;background:var(--circulo);flex-shrink:0}
@@ -9337,7 +9711,7 @@ h1.ar-h1{font-family:var(--f-display);font-weight:600;font-size:clamp(30px,4.4vw
 .ar-resumen ul{font-size:15px;line-height:1.55}
 figure{margin:0}figcaption{font-size:13px;margin-top:6px}
 .ar-tabla{overflow-x:auto;border:1px solid var(--linea);border-radius:14px;background:var(--panel)}
-.ar-tabla table{width:100%;border-collapse:collapse;font-size:15px}.ar-tabla th,.ar-tabla td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--linea)}
+.ar-tabla table{width:100%;border-collapse:collapse;font-size:15px}.ar-tabla tbody th{font-weight:600;color:var(--titular)}.ar-tabla th,.ar-tabla td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--linea)}
 .ar-faq{border:1px solid var(--linea);border-radius:14px;background:var(--panel);padding:2px 18px}
 .ar-faq summary{min-height:48px;display:flex;align-items:center;font-weight:700;color:var(--titular);cursor:pointer}.ar-faq p{margin:0 0 14px}
 .ar-rec{border-radius:16px;padding:18px 20px;display:flex;gap:12px;background:var(--circulo);color:var(--suave)}
@@ -9371,12 +9745,54 @@ figure{margin:0}figcaption{font-size:13px;margin-top:6px}
 .ar-guias a.g{display:flex;flex-direction:column;align-items:center;gap:8px;min-width:104px;padding:14px 12px;border-radius:14px;border:1px solid var(--linea);background:var(--panel);text-decoration:none;color:var(--titular);font-weight:700;font-size:14px}
 .ar-destacado{display:flex;flex-direction:column;gap:12px;background:var(--panel);border:1px solid var(--linea);border-radius:22px;padding:28px;margin-bottom:8px}
 .ar-destacado h2{margin:0;font-family:var(--f-display);font-size:clamp(24px,3vw,32px);line-height:1.2;color:var(--titular)}.ar-destacado h2 a{color:inherit;text-decoration:none}
+.ar-coms{display:flex;flex-direction:column;gap:14px;border-top:1px solid var(--linea);padding-top:20px;margin-top:8px;font-size:15px}
+.ar-coms h2.ar-coms-t{font-family:var(--f-cuerpo);font-size:15px;font-weight:600;color:var(--suave);margin:0}
+.ar-coms ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:16px}
+.ar-com p{margin:0 0 4px}.ar-com-quien{font-size:13px}.ar-com-quien strong{color:var(--titular)}
+.ar-com-resp{margin:8px 0 0 18px;padding-left:12px;border-left:2px solid var(--linea)}
+.ar-comentar summary{display:inline;cursor:pointer;font-size:14px;color:var(--suave);text-decoration:underline;text-underline-offset:3px}
+.ar-comentar form{display:flex;flex-direction:column;gap:10px;margin-top:12px;max-width:560px}
+.ar-comentar label{display:flex;flex-direction:column;gap:4px;font-size:14px;font-weight:600;color:var(--titular)}
+.ar-comentar input,.ar-comentar textarea{font:inherit;font-size:15px;font-weight:400;padding:9px 11px;border:1px solid var(--linea);border-radius:10px;background:var(--panel);color:var(--suave)}
+.ar-comentar .ar-btn{align-self:flex-start;min-height:42px;font-size:14px}
+.ar-com-nota{font-size:13px;margin:0}
+.ar-com-ok{font-size:14px;margin:0;color:var(--titular)}
+.contenedor{max-width:1180px;margin:0 auto;padding:0 24px}
+.cabecera{position:sticky;top:0;z-index:100;background:var(--fondo);border-bottom:1px solid var(--linea)}
+.cabecera-inner{display:flex;align-items:center;gap:20px;padding:14px 24px}
+.cabecera a{text-decoration:none}
+.nav{display:flex;align-items:center;gap:22px;margin-left:auto;font-size:14.5px}
+.nav a{color:var(--suave);transition:color .15s;padding:4px 0}.nav a:hover,.nav a[aria-current]{color:var(--tinta)}
+.nav a[aria-current]{font-weight:600}
+.nav .nav-secundario{display:flex;gap:22px}
+.acceso{color:var(--suave);font-size:14.5px;white-space:nowrap}.acceso:hover{color:var(--tinta)}
+.interruptor-tema-header{background:none;border:none;width:20px;height:20px;position:relative;flex:none;cursor:pointer;padding:0}
+.interruptor-tema-header svg{position:absolute;inset:0;width:20px;height:20px;fill:none;stroke-width:1.8;stroke-linecap:round;transition:opacity .2s}
+.interruptor-tema-header .icono-sol{stroke:#E0A400;opacity:1}.interruptor-tema-header .icono-luna{stroke:#8A97A3;opacity:0}
+html[data-tema="oscuro"] .interruptor-tema-header .icono-sol{opacity:0}html[data-tema="oscuro"] .interruptor-tema-header .icono-luna{opacity:1}
+.tira-secciones{display:none}
+.pie{border-top:1px solid var(--linea);padding:34px 0 60px;margin-top:40px}
+.pie-inner{display:flex;flex-wrap:wrap;gap:18px 34px;align-items:center;justify-content:space-between;font-size:13px;color:var(--suave)}
+.pie-legal{display:flex;flex-wrap:wrap;gap:18px}.pie a{color:var(--suave);text-decoration:none}.pie a:hover{color:var(--tinta)}
+.sello-cookies{font-size:11.5px;color:var(--suave);border:1px solid var(--linea);border-radius:999px;padding:4px 12px}
+@media (max-width:1060px){.nav .nav-secundario{display:none}.tira-secciones{display:block;border-top:1px solid var(--linea)}.tira-pista{display:flex;gap:18px;overflow-x:auto;padding:10px 24px;font-size:14px;white-space:nowrap}.tira-pista a{color:var(--suave);text-decoration:none}.tira-pista a[aria-current]{color:var(--tinta);font-weight:600}}
+@media (max-width:600px){.cabecera-inner{padding:10px 16px;gap:10px}.tira-pista{padding:8px 16px}}
 @media (max-width:760px){.ar-col{position:static;max-width:none}.ar-main{padding:20px 16px 48px}.ar-cuerpo h2{font-size:24px}}
 `;
+// 19/11 (Vikn): la cabecera y el pie son los del resto de acrosfi.es (logo, menú, modo oscuro, «Accede a tu área», pie legal)
+const ART_LOGO = '<svg viewBox="10 10 960 767" aria-hidden="true"><g transform="translate(0 787) scale(.1 -.1)"><path d="M4865 7763 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -604 -975 -605 -976 -627 -1103 -24 -140 32 -293 146 -399 75 -71 159 -109 274 -124 51 -6 1565 -9 4432 -7 l4355 3 65 23 c132 48 217 124 276 247 57 118 56 252 -1 382 -20 45 -119 212 -395 663 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -90 90 -168 138 -287 178 -78 27 -215 43 -299 35z m212 -383 c127 -59 126 -56 585 -810 69 -113 161 -261 203 -330 126 -202 224 -361 365 -590 72 -118 160 -260 194 -315 35 -55 130 -207 211 -338 166 -268 160 -242 82 -330 l-42 -48 -160 188 c-219 257 -244 283 -290 304 -104 48 -154 20 -287 -161 -57 -78 -137 -187 -178 -244 -42 -56 -87 -117 -101 -135 l-25 -32 -105 128 c-57 70 -128 160 -158 198 -187 242 -238 284 -324 271 -56 -9 -87 -34 -171 -139 -349 -436 -408 -507 -417 -507 -9 0 -163 197 -376 482 -103 138 -167 178 -256 164 -77 -13 -115 -49 -362 -341 -55 -65 -126 -149 -159 -187 l-59 -69 -24 23 c-40 37 -173 205 -173 218 0 11 128 223 293 485 28 44 92 148 142 230 51 83 140 227 200 320 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 285 452 336 527 397 583 121 111 280 139 423 72z m-968 -3004 c112 -141 221 -272 241 -290 24 -21 53 -36 79 -41 77 -13 109 13 306 243 358 417 338 396 355 375 8 -10 110 -134 227 -275 233 -281 252 -296 337 -283 53 9 97 55 274 280 73 94 158 200 188 237 l55 68 72 -84 c40 -45 115 -134 167 -197 52 -63 120 -140 151 -171 54 -56 58 -58 108 -58 32 0 65 7 83 18 16 9 73 70 125 135 l96 119 69 -109 c63 -98 474 -761 638 -1028 37 -60 185 -301 330 -535 144 -234 287 -465 318 -515 125 -205 347 -570 532 -875 108 -179 257 -423 330 -543 87 -144 134 -232 137 -256 6 -44 -14 -89 -53 -120 l-27 -21 -4348 0 -4349 0 -38 34 c-34 32 -37 39 -37 88 0 46 7 66 49 139 78 134 486 801 731 1194 34 55 149 240 255 410 106 171 225 362 265 425 40 63 128 203 195 310 67 107 178 283 245 390 67 107 232 371 365 585 133 215 249 400 257 413 19 30 14 34 179 -164 83 -99 146 -167 165 -174 36 -15 132 -9 155 11 9 8 84 95 167 194 82 99 192 231 244 293 l94 112 32 -38 c18 -22 124 -154 236 -296z"/></g></svg>';
+const ART_SOL = '<svg class="icono-sol" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v3M12 18.5v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2.5 12h3M18.5 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>', ART_LUNA = '<svg class="icono-luna" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5a8 8 0 1 1-9-11 6.5 6.5 0 0 0 9 11z"/></svg>';
 function marco({ titulo, descripcion, canonico, cuerpo, jsonld, md, actual, previa }) {
   const base = artUrlBase();
-  const nav = [['/inicio#servicios', 'Servicios', ''], ['/simulador', 'SimulAcros', ''], ['/articulos', 'Artículos', 'articulo'], ['/guias', 'Guías por exchange', 'guia'], ['/inicio#equipo', 'Equipo', '']]
-    .map(([h, t, k]) => '<a href="' + h + '"' + (k && k === actual ? ' aria-current="page"' : '') + '>' + t + '</a>').join('') + '<a class="ar-cta" href="/empieza-aqui">Empieza aquí</a>';
+  const enlaces = [['/inicio#servicios', 'Servicios', ''], ['/simulador', 'SimulAcros', ''], ['/articulos', 'Artículos', 'articulo'], ['/guias', 'Guías', 'guia'], ['/preguntas', 'Preguntas', 'preguntas'], ['/inicio#nosotros', 'Nosotros', ''], ['/inicio#contacto', 'Contacto', '']]
+    .map(([h, t, k]) => '<a href="' + h + '"' + (k && k === actual ? ' aria-current="page"' : '') + '>' + t + '</a>').join('');
+  const cabecera = '<header class="cabecera"><div class="contenedor cabecera-inner"><a class="logo" href="/inicio" aria-label="Acros — ir al inicio"><span class="logo-marca">' + ART_LOGO + '</span><span class="logo-nombre">Acros</span></a>' +
+    '<nav class="nav" aria-label="Navegación principal"><div class="nav-secundario">' + enlaces + '</div>' +
+    '<button class="interruptor-tema-header" id="alternar-tema" type="button" aria-label="Modo claro / oscuro">' + ART_SOL + ART_LUNA + '</button>' +
+    '<a class="acceso" href="/area?login=1">Accede a tu área</a></nav></div>' +
+    '<nav class="tira-secciones" aria-label="Secciones"><div class="tira-pista">' + enlaces + '</div></nav></header>';
+  const pie = '<footer class="pie"><div class="contenedor"><div class="pie-inner"><span>© ' + new Date().getFullYear() + ' Acros</span><span class="sello-cookies">Sin cookies de seguimiento — nada que aceptar</span>' +
+    '<div class="pie-legal"><a href="/legal#aviso-legal">Aviso legal</a><a href="/legal#privacidad">Privacidad</a><a href="/legal#cookies">Cookies</a><a href="/legal#condiciones">Condiciones de contratación</a></div></div></div></footer>';
   return '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">' +
     '<title>' + ESC_HTML(titulo) + '</title><meta name="description" content="' + ESC_HTML(descripcion || '') + '">' +
     (previa ? '<meta name="robots" content="noindex">' : '<link rel="canonical" href="' + ESC_HTML(base + canonico) + '">') +
@@ -9386,9 +9802,9 @@ function marco({ titulo, descripcion, canonico, cuerpo, jsonld, md, actual, prev
     '<script>try{if(localStorage.getItem("acros_tema")==="oscuro")document.documentElement.dataset.tema="oscuro"}catch(e){}</script>' +
     '<link rel="stylesheet" href="/acros_marca.css?v=20261008"><style>' + ART_CSS + '</style>' +
     (jsonld || []).map(j => '<script type="application/ld+json">' + JSON.stringify(j).replace(/</g, '\\u003c') + '</script>').join('') +
-    '</head><body><header class="ar-cab"><div class="ar-cab-in"><a class="ar-logo" href="/inicio">ACROS</a><nav class="ar-nav" aria-label="Menú principal">' + nav + '</nav></div></header>' +
-    '<main class="ar-main">' + cuerpo + '</main>' +
-    '<footer class="ar-pie"><div><span>Acros, tu asesoría fiscal de criptoactivos.</span><span>acrosfi.es · <a href="tel:+34668170020">668 17 00 20</a></span></div></footer>' +
+    '</head><body>' + cabecera +
+    '<main class="ar-main">' + cuerpo + '</main>' + pie +
+    '<script>(function(){var b=document.getElementById("alternar-tema");if(b)b.addEventListener("click",function(){var h=document.documentElement,o=h.dataset.tema==="oscuro";if(o)delete h.dataset.tema;else h.dataset.tema="oscuro";try{localStorage.setItem("acros_tema",o?"claro":"oscuro")}catch(e){}});})();</script>' +
     '<script>document.addEventListener("click",function(e){var b=e.target.closest("[data-yt]");if(!b)return;var f=document.createElement("iframe");f.src="https://www.youtube-nocookie.com/embed/"+b.dataset.yt+"?autoplay=1&rel=0";f.title=b.getAttribute("aria-label")||"Vídeo";f.allow="autoplay; encrypted-media; picture-in-picture";f.allowFullscreen=true;b.replaceWith(f);});</script>' +
     '</body></html>';
 }
@@ -9410,7 +9826,7 @@ function htmlCuerpo(d, recs) {
       const [primera, ...resto] = b.filas;
       const filas = b.cabecera ? resto : b.filas;
       h.push('<div class="ar-tabla"><table>' + (b.cabecera ? '<thead><tr>' + primera.map(c => '<th scope="col">' + artInline(c) + '</th>').join('') + '</tr></thead>' : '') +
-        '<tbody>' + filas.map(fila => '<tr>' + fila.map(c => '<td>' + artInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>');
+        '<tbody>' + filas.map(fila => '<tr>' + fila.map((c, k) => k === 0 && b.cabecera_col ? '<th scope="row">' + artInline(c) + '</th>' : '<td>' + artInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>');
     }
     else if (b.t === 'faq' && b.pregunta) h.push('<details class="ar-faq"><summary>' + ESC_HTML(b.pregunta) + '</summary><p>' + artInline(b.respuesta) + '</p></details>');
     else if (b.t === 'recuadro') h.push(htmlRecuadro(recs[b.id], b.forma));
@@ -9441,8 +9857,11 @@ function jsonLdArticulo(tipo, slug, d, autor, fechas) {
     '@context': 'https://schema.org', '@type': 'Article', headline: d.titulo, description: d.descripcion || d.entradilla, inLanguage: 'es-ES', url,
     datePublished: artIso(fechas.publicado), dateModified: artIso(fechas.actualizado || fechas.publicado),
     author: autor ? { '@type': 'Person', name: autor.nombre, jobTitle: autor.puesto, worksFor: { '@type': 'Organization', name: 'Acros' } } : { '@type': 'Organization', name: 'Acros' },
-    publisher: { '@type': 'Organization', name: 'Acros', url: base },
+    publisher: { '@type': 'Organization', name: 'Acros', url: base, description: ACROS_ORG_DESC },
     image: d.portada ? base + '/articulos/img/' + d.portada : undefined,
+    genre: d.plantilla === 'discusion' ? 'Opinión' : undefined,
+    commentCount: fechas.comentarios && fechas.comentarios.length ? fechas.comentarios.length : undefined,
+    comment: fechas.comentarios && fechas.comentarios.length ? fechas.comentarios.map(c => ({ '@type': 'Comment', author: { '@type': 'Person', name: c.nombre }, datePublished: artIso(c.creado_en), text: c.texto })) : undefined,
   }, {
     '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [
       { '@type': 'ListItem', position: 1, name: tipo === 'guia' ? 'Guías por exchange' : 'Artículos', item: base + ART_RUTA[tipo] },
@@ -9456,9 +9875,9 @@ function jsonLdArticulo(tipo, slug, d, autor, fechas) {
 async function htmlPaginaArticulo(tipo, slug, d, autor, fechas, previa) {
   const recs = await recuadrosPorId();
   const enlaces = await enlacesPublicados(null);
-  const pills = d.publico.map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (d.tema ? '<span class="ar-pill tema">' + ESC_HTML(d.tema) + '</span>' : '') + (tipo === 'guia' && d.exchange ? '<span class="ar-pill tema">' + ESC_HTML(d.exchange) + '</span>' : '');
+  const pills = (d.plantilla === 'discusion' ? '<span class="ar-pill opinion">Opinión</span>' : '') + d.publico.map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (d.tema ? '<span class="ar-pill tema">' + ESC_HTML(d.tema) + '</span>' : '') + (tipo === 'guia' && d.exchange ? '<span class="ar-pill tema">' + ESC_HTML(d.exchange) + '</span>' : '');
   const foto = autor && autor.foto ? '<img src="/api/web/imagen/' + ESC_HTML(autor.foto) + '" alt="">' : '<span class="sin" aria-hidden="true"></span>';
-  const fechaTxt = fechas.publicado ? 'Publicado el ' + artFecha(fechas.publicado) + (fechas.actualizado && artFecha(fechas.actualizado) !== artFecha(fechas.publicado) ? ' · Actualizado el ' + artFecha(fechas.actualizado) : '') : 'Vista previa, sin publicar';
+  const fechaTxt = fechas.publicado ? 'Publicado el ' + artFecha(fechas.publicado) + (fechas.actualizado && artFecha(fechas.actualizado) !== artFecha(fechas.publicado) ? '. Actualizado el ' + artFecha(fechas.actualizado) : '') : 'Vista previa, sin publicar';
   const logo = tipo === 'guia' ? await logoDeExchange(d.exchange) : null;
   const cab = '<nav class="ar-ruta" aria-label="Ruta"><a href="' + ART_RUTA[tipo] + '">' + (tipo === 'guia' ? 'Guías por exchange' : 'Artículos') + '</a> <span aria-hidden="true">›</span> ' + ESC_HTML(d.titulo) + '</nav>' +
     '<header style="max-width:820px"><div style="display:flex;align-items:center;gap:12px">' + imgLogo(logo, 48) + '<div class="ar-pills">' + pills + '</div></div><h1 class="ar-h1">' + ESC_HTML(d.titulo || 'Sin título') + '</h1>' + (d.entradilla ? '<p class="ar-entr">' + ESC_HTML(d.entradilla) + '</p>' : '') +
@@ -9470,14 +9889,35 @@ async function htmlPaginaArticulo(tipo, slug, d, autor, fechas, previa) {
   const sigue = otros.length ? '<section class="ar-sigue"><h2 style="margin:0 0 8px;font-size:17px;color:var(--titular)">Sigue leyendo</h2><div>' + otros.map(e => '<a href="' + ART_RUTA[e.tipo] + '/' + e.slug + '">' + ESC_HTML(e.d.titulo) + '</a>').join('') + '</div></section>' : '';
   const franja = '<section class="ar-franja"><span>¿Cuánto pagarías tú si el año acabara hoy?</span><span style="display:flex;flex-wrap:wrap;gap:8px"><a class="ar-btn claro" href="/simulador' + (tipo === 'guia' && d.exchange ? '?exchange=' + encodeURIComponent(d.exchange) : '') + '">Probar SimulAcros</a><a class="ar-btn nar" href="/empieza-aqui">Hablar con un asesor</a></span></section>';
   const columna = htmlColumna(d, recs, enlaces);
-  const cuerpo = cab + '<div class="ar-dos"><article class="ar-cuerpo">' + resumen + portada + (tipo === 'guia' ? htmlVideo(d) : '') + htmlCuerpo(d, recs) + ficha + '</article>' + (columna ? '<div class="ar-col">' + columna + '</div>' : '') + '</div>' + sigue + franja;
+  const coms = previa ? '' : htmlComentarios(tipo, slug, fechas.comentarios || [], fechas.aviso);
+  const cuerpo = cab + '<div class="ar-dos"><article class="ar-cuerpo">' + resumen + portada + (tipo === 'guia' ? htmlVideo(d) : '') + htmlCuerpo(d, recs) + ficha + coms + '</article>' + (columna ? '<div class="ar-col">' + columna + '</div>' : '') + '</div>' + sigue + franja;
   const ruta = ART_RUTA[tipo] + '/' + slug;
-  return marco({ titulo: d.titulo + ' · Acros', descripcion: d.descripcion || d.entradilla, canonico: ruta, cuerpo, jsonld: previa ? [] : jsonLdArticulo(tipo, slug, d, autor, fechas), md: previa ? null : ruta + '.md', actual: tipo, previa });
+  return marco({ titulo: d.titulo + ' | Acros', descripcion: d.descripcion || d.entradilla, canonico: ruta, cuerpo, jsonld: previa ? [] : jsonLdArticulo(tipo, slug, d, autor, fechas), md: previa ? null : ruta + '.md', actual: tipo, previa });
+}
+// 19/11 (Vikn): comentarios al final del artículo. Sin «0 comentarios»: la lista y su título solo salen si hay alguno;
+// debajo, siempre, «Escribe un comentario» discreto. Funciona sin programación en la página (formulario normal).
+const artParrafos = t => String(t || '').split(/\n\s*\n|\n/).map(x => x.trim()).filter(Boolean).map(x => '<p>' + ESC_HTML(x) + '</p>').join('');
+function htmlComentarios(tipo, slug, coms, aviso) {
+  const lista = coms.length ? '<h2 class="ar-coms-t">' + coms.length + (coms.length === 1 ? ' comentario' : ' comentarios') + '</h2><ol>' + coms.map(c => '<li class="ar-com"><p class="ar-com-quien"><strong>' + ESC_HTML(c.nombre) + '</strong>, ' + artFecha(c.creado_en) + '</p>' + artParrafos(c.texto) +
+    (c.respuesta ? '<div class="ar-com-resp"><p class="ar-com-quien"><strong>' + ESC_HTML(c.respondio || 'Acros') + '</strong>' + (c.respondio ? ', de Acros' : '') + '</p>' + artParrafos(c.respuesta) + '</div>' : '') + '</li>').join('') + '</ol>' : '';
+  const nota = aviso === 'gracias' ? '<p class="ar-com-ok" role="status">Gracias. Lo publicaremos en cuanto lo revisemos.</p>' : aviso === 'error' ? '<p class="ar-com-ok" role="alert">No se ha podido enviar. Escribe tu nombre y el comentario, y vuelve a probar.</p>' : '';
+  return '<section class="ar-coms" id="comentarios" aria-label="Comentarios">' + lista + nota +
+    '<details class="ar-comentar" id="comentar"' + (aviso === 'error' ? ' open' : '') + '><summary>Escribe un comentario</summary><form method="post" action="' + ART_RUTA[tipo] + '/' + slug + '/comentarios">' +
+    '<label>Nombre<input name="nombre" required maxlength="60" autocomplete="name"></label>' +
+    '<label>Comentario<textarea name="texto" required maxlength="2000" rows="5"></textarea></label>' +
+    '<label class="ar-oculto" aria-hidden="true">No rellenar<input name="web" tabindex="-1" autocomplete="off"></label>' +
+    '<p class="ar-com-nota">Lo leemos antes de publicarlo. Sale con el nombre que pongas: no escribas datos de tu declaración.</p>' +
+    '<button type="submit" class="ar-btn">Enviar</button></form></details></section>';
+}
+async function comentariosPublicos(articuloId) {
+  const [f] = await pool.execute("SELECT c.nombre, c.texto, c.respuesta, c.creado_en, COALESCE(p.nombre, a.nombre) respondio FROM articulos_comentarios c LEFT JOIN asesores a ON a.id = c.respuesta_asesor_id LEFT JOIN personas p ON p.asesor_id = a.id AND p.activa = 1 WHERE c.articulo_id = ? AND c.estado = 'publicado' ORDER BY c.creado_en", [articuloId]);
+  return f.map(x => Object.assign(x, { respondio: x.respuesta ? (x.respondio || '').trim() : '' }));
 }
 function mdArticulo(tipo, slug, d, autor, fechas) {
   const L = ['# ' + d.titulo, ''];
+  if (d.plantilla === 'discusion') L.push('Artículo de opinión.', '');
   if (d.entradilla) L.push(d.entradilla, '');
-  L.push('Fuente: ' + artUrlBase() + ART_RUTA[tipo] + '/' + slug + (autor ? ' · Autor: ' + autor.nombre + ', ' + autor.puesto : '') + (fechas.publicado ? ' · Publicado: ' + artFecha(fechas.publicado) : '') + (fechas.actualizado ? ' · Actualizado: ' + artFecha(fechas.actualizado) : ''), '');
+  L.push('Fuente: ' + artUrlBase() + ART_RUTA[tipo] + '/' + slug + (autor ? ' | Autor: ' + autor.nombre + ', ' + autor.puesto : '') + (fechas.publicado ? ' | Publicado: ' + artFecha(fechas.publicado) : '') + (fechas.actualizado ? ' | Actualizado: ' + artFecha(fechas.actualizado) : ''), '');
   if (d.resumen.length) { L.push('## En pocas palabras', ''); d.resumen.forEach(x => L.push('- ' + x)); L.push(''); }
   if (tipo === 'guia' && d.video) { L.push('Vídeo: https://www.youtube.com/watch?v=' + d.video, ''); if (d.transcripcion) L.push('### Transcripción del vídeo', '', d.transcripcion, ''); }
   for (const b of d.cuerpo) {
@@ -9491,7 +9931,12 @@ function mdArticulo(tipo, slug, d, autor, fechas) {
     else if (b.t === 'faq') L.push('**' + b.pregunta + '**', '', b.respuesta, '');
     else if (b.t === 'fuentes') { L.push('## Fuentes', ''); b.items.forEach(x => L.push('- ' + x)); L.push(''); }
   }
-  L.push('---', 'Acros, asesoría fiscal especializada en criptomonedas · ' + artUrlBase() + ' · Simulador gratuito: ' + artUrlBase() + '/simulador');
+  if (fechas.comentarios && fechas.comentarios.length) {
+    L.push('## Comentarios', '');
+    fechas.comentarios.forEach(c => { L.push('- **' + c.nombre + '** (' + artFecha(c.creado_en) + '): ' + String(c.texto).replace(/\s*\n\s*/g, ' ')); if (c.respuesta) L.push('  - Respuesta de ' + (c.respondio ? c.respondio + ', de Acros' : 'Acros') + ': ' + String(c.respuesta).replace(/\s*\n\s*/g, ' ')); });
+    L.push('');
+  }
+  L.push('---', 'Acros, asesoría fiscal especializada en criptomonedas, con economista colegiado en el Colegio de Economistas de Madrid | ' + artUrlBase() + ' | Simulador gratuito: ' + artUrlBase() + '/simulador');
   return L.join('\n');
 }
 async function htmlIndice(tipo, q) {
@@ -9513,12 +9958,12 @@ async function htmlIndice(tipo, q) {
       (lista.length ? '<div class="ar-guias" style="margin-top:8px"><div class="fila">' + lista.map(g => '<a class="g" href="/guias/' + g.slug + '">' + (imgLogo(logos[g.slug], 56) || '') + '<span>' + ESC_HTML(g.d.exchange || g.d.titulo) + '</span></a>').join('') + '</div></div>' : '<p>Muy pronto publicaremos aquí las primeras guías.</p>') +
       '<section class="ar-franja"><span>¿Ya tienes tus archivos?</span><span style="display:flex;flex-wrap:wrap;gap:8px"><a class="ar-btn claro" href="/simulador">Probar SimulAcros</a><a class="ar-btn nar" href="/empieza-aqui">Hablar con un asesor</a></span></section>';
     const jsonldG = [{ '@context': 'https://schema.org', '@type': 'CollectionPage', name: 'Guías por exchange', url: artUrlBase() + base, inLanguage: 'es-ES', hasPart: lista.slice(0, 50).map(e => ({ '@type': 'Article', headline: e.d.titulo, url: artUrlBase() + base + '/' + e.slug })) }];
-    return marco({ titulo: 'Guías por exchange: qué archivo descargar para tu renta · Acros', descripcion: 'Paso a paso, con vídeo, para descargar el historial correcto de cada exchange y declarar tus criptomonedas en España.', canonico: base, cuerpo: cuerpoG, jsonld: jsonldG, actual: tipo });
+    return marco({ titulo: 'Guías por exchange: qué archivo descargar para tu renta | Acros', descripcion: 'Paso a paso, con vídeo, para descargar el historial correcto de cada exchange y declarar tus criptomonedas en España.', canonico: base, cuerpo: cuerpoG, jsonld: jsonldG, actual: tipo });
   }
   const destacado = !publico && !tema && lista.length ? lista[0] : null;
   const resto = destacado ? lista.slice(1) : lista;
-  const htmlDestacado = destacado ? '<article class="ar-destacado"><div class="ar-pills"><span class="ar-pill" style="background:#23402F;color:#FBF8F2">Destacado</span>' + (destacado.d.publico || []).map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (destacado.d.tema ? '<span class="ar-pill tema">' + ESC_HTML(destacado.d.tema) + '</span>' : '') + '</div><h2><a href="' + base + '/' + destacado.slug + '">' + ESC_HTML(destacado.d.titulo) + '</a></h2>' + (destacado.d.entradilla ? '<p style="margin:0">' + ESC_HTML(destacado.d.entradilla) + '</p>' : '') + '<a class="ar-btn" href="' + base + '/' + destacado.slug + '" style="align-self:flex-start">Leer el artículo</a></article>' : '';
-  const tarjetas = resto.map(e => '<article class="ar-tarj"><div class="ar-pills">' + (e.d.publico || []).map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (e.d.tema ? '<span class="ar-pill tema">' + ESC_HTML(e.d.tema) + '</span>' : '') + (esGuia && e.d.exchange ? '<span class="ar-pill tema">' + ESC_HTML(e.d.exchange) + '</span>' : '') + '</div>' +
+  const htmlDestacado = destacado ? '<article class="ar-destacado"><div class="ar-pills"><span class="ar-pill" style="background:#23402F;color:#FBF8F2">Destacado</span>' + (destacado.d.plantilla === 'discusion' ? '<span class="ar-pill opinion">Opinión</span>' : '') + (destacado.d.publico || []).map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (destacado.d.tema ? '<span class="ar-pill tema">' + ESC_HTML(destacado.d.tema) + '</span>' : '') + '</div><h2><a href="' + base + '/' + destacado.slug + '">' + ESC_HTML(destacado.d.titulo) + '</a></h2>' + (destacado.d.entradilla ? '<p style="margin:0">' + ESC_HTML(destacado.d.entradilla) + '</p>' : '') + '<a class="ar-btn" href="' + base + '/' + destacado.slug + '" style="align-self:flex-start">Leer el artículo</a></article>' : '';
+  const tarjetas = resto.map(e => '<article class="ar-tarj"><div class="ar-pills">' + (e.d.plantilla === 'discusion' ? '<span class="ar-pill opinion">Opinión</span>' : '') + (e.d.publico || []).map(p => '<span class="ar-pill">' + ESC_HTML(p) + '</span>').join('') + (e.d.tema ? '<span class="ar-pill tema">' + ESC_HTML(e.d.tema) + '</span>' : '') + (esGuia && e.d.exchange ? '<span class="ar-pill tema">' + ESC_HTML(e.d.exchange) + '</span>' : '') + '</div>' +
     '<h2><a href="' + base + '/' + e.slug + '">' + ESC_HTML(e.d.titulo) + '</a></h2>' + (e.d.entradilla ? '<p>' + ESC_HTML(e.d.entradilla) + '</p>' : '') + '<small>' + (e.actualizado ? 'Actualizado el ' + artFecha(e.actualizado) : '') + '</small></article>').join('');
   const titulo = esGuia ? 'Guías por exchange: qué archivo descargar para tu renta' : 'Fiscalidad de las criptomonedas, explicada por asesores';
   const entr = esGuia ? 'Paso a paso, con vídeo, para descargar el historial correcto de cada exchange y declarar tus criptomonedas en España.' : 'Lo que necesitas saber para declarar tus criptomonedas en España, escrito y revisado por el equipo de Acros.';
@@ -9527,27 +9972,84 @@ async function htmlIndice(tipo, q) {
     (tarjetas ? '<div class="ar-rejilla">' + tarjetas + '</div>' : (destacado ? '' : '<p>' + (todos.length ? 'No hay nada con ese filtro todavía.' : 'Muy pronto publicaremos aquí los primeros artículos.') + '</p>')) +
     '<section class="ar-franja"><span>¿Cuánto pagarías tú si el año acabara hoy?</span><span style="display:flex;flex-wrap:wrap;gap:8px"><a class="ar-btn claro" href="/simulador">Probar SimulAcros</a><a class="ar-btn nar" href="/empieza-aqui">Hablar con un asesor</a></span></section>';
   const jsonld = [{ '@context': 'https://schema.org', '@type': 'CollectionPage', name: titulo, url: artUrlBase() + base, inLanguage: 'es-ES', hasPart: lista.slice(0, 50).map(e => ({ '@type': 'Article', headline: e.d.titulo, url: artUrlBase() + base + '/' + e.slug })) }];
-  return marco({ titulo: titulo + ' · Acros', descripcion: entr, canonico: base + (publico || tema ? '?' + (publico ? 'publico=' + encodeURIComponent(publico) : 'tema=' + encodeURIComponent(tema)) : ''), cuerpo, jsonld, actual: tipo });
+  return marco({ titulo: titulo + ' | Acros', descripcion: entr, canonico: base + (publico || tema ? '?' + (publico ? 'publico=' + encodeURIComponent(publico) : 'tema=' + encodeURIComponent(tema)) : ''), cuerpo, jsonld, actual: tipo });
 }
-const htmlNoEncontrado = tipo => marco({ titulo: 'No encontrado · Acros', descripcion: '', canonico: ART_RUTA[tipo], cuerpo: '<h1 class="ar-h1">Esta página no existe</h1><p>Puede que se haya movido. <a href="' + ART_RUTA[tipo] + '">Ver todos ' + (tipo === 'guia' ? 'las guías' : 'los artículos') + '</a>.</p>', actual: tipo, previa: true });
+const htmlNoEncontrado = tipo => marco({ titulo: 'No encontrado | Acros', descripcion: '', canonico: ART_RUTA[tipo], cuerpo: '<h1 class="ar-h1">Esta página no existe</h1><p>Puede que se haya movido. <a href="' + ART_RUTA[tipo] + '">Ver todos ' + (tipo === 'guia' ? 'las guías' : 'los artículos') + '</a>.</p>', actual: tipo, previa: true });
 
 // ---------------- Rutas públicas (las sirve el Worker de Cloudflare en acrosfi.es)
 function enviarHtml(res, html, estado = 200) { res.status(estado).set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(html); }
+// ---------------- 19/11: visitas de los rastreadores de IA (y de los buscadores, para comparar)
+// Se cuenta por día, rastreador y página; nada de la persona (ni IP ni nada). Se mira en el panel: Artículos y guías → «Visitas de las IA».
+// «momento»: una persona le ha preguntado a esa IA y la IA ha venido a leer la página para contestarle (lo más valioso);
+// «buscador»: la IA indexa para su buscador; «entrena»: recoge textos para entrenar modelos.
+const ART_BOTS = [
+  ['ChatGPT-User', 'ChatGPT', 'momento'], ['OAI-SearchBot', 'ChatGPT', 'buscador'], ['GPTBot', 'ChatGPT', 'entrena'],
+  ['Claude-User', 'Claude', 'momento'], ['Claude-SearchBot', 'Claude', 'buscador'], ['ClaudeBot', 'Claude', 'entrena'], ['anthropic-ai', 'Claude', 'entrena'],
+  ['Perplexity-User', 'Perplexity', 'momento'], ['PerplexityBot', 'Perplexity', 'buscador'],
+  ['Google-Extended', 'Gemini', 'entrena'], ['Googlebot', 'Google', 'buscador'],
+  ['bingbot', 'Bing y Copilot', 'buscador'],
+  ['DuckAssistBot', 'DuckDuckGo', 'momento'], ['MistralAI-User', 'Mistral', 'momento'],
+  ['meta-externalfetcher', 'Meta AI', 'momento'], ['meta-externalagent', 'Meta AI', 'entrena'],
+  ['Applebot-Extended', 'Apple', 'entrena'], ['Applebot', 'Apple', 'buscador'],
+  ['Amazonbot', 'Amazon', 'buscador'], ['YouBot', 'You.com', 'buscador'], ['cohere-ai', 'Cohere', 'entrena'],
+  ['Bytespider', 'ByteDance', 'entrena'], ['CCBot', 'Common Crawl', 'entrena'],
+].map(([bot, quien, uso]) => ({ bot, quien, uso, re: new RegExp(bot.replace(/[-]/g, '\\-'), 'i') }));
+const botDe = ua => ART_BOTS.find(b => b.re.test(String(ua || ''))) || null;
+let artVisitasPurga = 0;
+app.use((req, res, next) => {
+  if ((req.method === 'GET' || req.method === 'HEAD') && /^\/(articulos|guias|preguntas)(\/|\.|$)/.test(req.path) && !req.path.startsWith('/articulos/img/')) {
+    const b = botDe(req.get('user-agent'));
+    if (b) {
+      const ruta = req.path.replace(/\/+$/, '').slice(0, 200) || '/';
+      pool.execute('INSERT INTO articulos_visitas_ia (dia, bot, ruta, n, ultima) VALUES (CURDATE(), ?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE n = n + 1, ultima = NOW()', [b.bot, ruta])
+        .catch(e => console.error('Visita de IA no anotada:', e.message));
+      if (Date.now() - artVisitasPurga > 864e5) { artVisitasPurga = Date.now(); pool.execute('DELETE FROM articulos_visitas_ia WHERE dia < CURDATE() - INTERVAL 400 DAY').catch(() => {}); }
+    }
+  }
+  next();
+});
+// Freno de comentarios por IP (solo en memoria; la IP no se guarda): 5 por hora y 15 al día
+const ART_COM_FRENO = new Map();
+function frenoComentario(ip) {
+  const ahora = Date.now(), lista = (ART_COM_FRENO.get(ip) || []).filter(t => ahora - t < 864e5);
+  if (lista.filter(t => ahora - t < 36e5).length >= 5 || lista.length >= 15) { ART_COM_FRENO.set(ip, lista); return false; }
+  lista.push(ahora); ART_COM_FRENO.set(ip, lista);
+  if (ART_COM_FRENO.size > 5000) for (const [k, v] of ART_COM_FRENO) if (!v.some(t => ahora - t < 864e5)) ART_COM_FRENO.delete(k);
+  return true;
+}
+const artFormulario = express.urlencoded({ extended: false, limit: '20kb' });
 for (const tipo of ART_TIPOS) {
   const base = ART_RUTA[tipo];
+  app.post(base + '/:slug([a-z0-9-]{1,100})/comentarios', artFormulario, async (req, res) => {
+    const vuelta = que => res.redirect(303, base + '/' + req.params.slug + '?comentario=' + que + '#' + (que === 'error' ? 'comentar' : 'comentarios'));
+    try {
+      const [f] = await pool.execute('SELECT id, tipo, slug, autor_asesor_id FROM articulos WHERE tipo = ? AND slug = ? AND publicado IS NOT NULL', [tipo, req.params.slug]);
+      if (!f.length) return res.status(404).type('text/plain').send('No encontrado');
+      const b = req.body || {};
+      if (String(b.web || '').trim()) return vuelta('gracias');   // trampa para robots: se hace como si nada
+      const nombre = artTxt(b.nombre, 60).replace(/\s+/g, ' '), texto = artTxt(b.texto, 2000);
+      if (nombre.length < 2 || texto.length < 2) return vuelta('error');
+      const ip = String(req.get('x-acros-ip') || ipFreno(req) || '').slice(0, 64);
+      if (!frenoComentario(ip)) return vuelta('gracias');
+      await pool.execute('INSERT INTO articulos_comentarios (articulo_id, nombre, texto) VALUES (?, ?, ?)', [f[0].id, nombre, texto]);
+      avisarAdmin('Nuevo comentario por revisar', 'Un lector ha comentado un artículo de la web. Revísalo en el panel: Artículos y guías → Comentarios.');
+      vuelta('gracias');
+    } catch (e) { console.error('Comentario:', e); vuelta('error'); }
+  });
   app.get(base, async (req, res) => { try { enviarHtml(res, await htmlIndice(tipo, req.query || {})); } catch (e) { console.error('Índice de artículos:', e); res.status(500).send('Error'); } });
   app.get(base + '/:slug([a-z0-9-]{1,100}).md', async (req, res) => {
     const [f] = await pool.execute('SELECT * FROM articulos WHERE tipo = ? AND slug = ? AND publicado IS NOT NULL', [tipo, req.params.slug]);
     if (!f.length) return res.status(404).type('text/plain').send('No encontrado');
-    const d = JSON.parse(f[0].publicado), autor = await autorPublico(f[0].autor_asesor_id);
-    res.set({ 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(mdArticulo(tipo, f[0].slug, d, autor, { publicado: f[0].publicado_en, actualizado: f[0].actualizado_publico_en }));
+    const d = JSON.parse(f[0].publicado), autor = await autorPublico(await firmanteDe(d, f[0])), comentarios = await comentariosPublicos(f[0].id);
+    res.set({ 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(mdArticulo(tipo, f[0].slug, d, autor, { publicado: f[0].publicado_en, actualizado: f[0].actualizado_publico_en, comentarios }));
   });
   app.get(base + '/:slug([a-z0-9-]{1,100})', async (req, res) => {
     try {
       const [f] = await pool.execute('SELECT * FROM articulos WHERE tipo = ? AND slug = ? AND publicado IS NOT NULL', [tipo, req.params.slug]);
       if (!f.length) return enviarHtml(res, htmlNoEncontrado(tipo), 404);
-      const d = JSON.parse(f[0].publicado), autor = await autorPublico(f[0].autor_asesor_id);
-      enviarHtml(res, await htmlPaginaArticulo(tipo, f[0].slug, d, autor, { publicado: f[0].publicado_en, actualizado: f[0].actualizado_publico_en }, false));
+      const d = JSON.parse(f[0].publicado), autor = await autorPublico(await firmanteDe(d, f[0])), comentarios = await comentariosPublicos(f[0].id);
+      const aviso = ['gracias', 'error'].includes(req.query.comentario) ? req.query.comentario : '';
+      enviarHtml(res, await htmlPaginaArticulo(tipo, f[0].slug, d, autor, { publicado: f[0].publicado_en, actualizado: f[0].actualizado_publico_en, comentarios, aviso }, false));
     } catch (e) { console.error('Página de artículo:', e); res.status(500).send('Error'); }
   });
 }
@@ -9558,7 +10060,8 @@ app.get('/articulos/img/:id([a-f0-9]{32})', async (req, res) => {
 });
 app.get('/articulos/sitemap.xml', async (req, res) => {
   const todos = await enlacesPublicados(null), base = artUrlBase();
-  const urls = [[base + '/articulos', null], [base + '/guias', null], ...todos.map(e => [base + ART_RUTA[e.tipo] + '/' + e.slug, e.actualizado])];
+  const [pq] = await pool.query("SELECT slug, COALESCE(actualizado_en, publicado_en) actualizado FROM preguntas WHERE estado = 'publicada'");
+  const urls = [[base + '/articulos', null], [base + '/guias', null], [base + '/preguntas', null], ...todos.map(e => [base + ART_RUTA[e.tipo] + '/' + e.slug, e.actualizado]), ...pq.map(x => [base + '/preguntas/' + x.slug, x.actualizado])];
   res.set('Content-Type', 'application/xml; charset=utf-8').send('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls.map(([u, d]) => '<url><loc>' + ESC_HTML(u) + '</loc>' + (d ? '<lastmod>' + new Date(d).toISOString().slice(0, 10) + '</lastmod>' : '') + '</url>').join('') + '</urlset>');
 });
 
@@ -9566,7 +10069,7 @@ app.get('/articulos/sitemap.xml', async (req, res) => {
 const artPuedeEditar = (req, fila) => req.asesor.esAdmin || fila.autor_asesor_id === req.asesor.id;
 function artFila(x, conBorrador) {
   let d = {}; try { d = JSON.parse(x.borrador); } catch (e) {}
-  const o = { id: x.id, tipo: x.tipo, slug: x.slug, estado: x.estado, autor_asesor_id: x.autor_asesor_id, autor: x.autor_nombre || null, titulo: d.titulo || '', publico: d.publico || [], tema: d.tema || '', exchange: d.exchange || '',
+  const o = { id: x.id, tipo: x.tipo, slug: x.slug, estado: x.estado, autor_asesor_id: x.autor_asesor_id, autor: x.autor_nombre || null, titulo: d.titulo || '', plantilla: x.tipo === 'guia' ? 'guia' : (d.plantilla || ''), publico: d.publico || [], tema: d.tema || '', exchange: d.exchange || '',
     publicado: !!x.publicado, comentario_revision: x.comentario_revision, enviado_en: x.enviado_en, publicado_en: x.publicado_en, actualizado_publico_en: x.actualizado_publico_en, actualizado_en: x.actualizado_en,
     url: x.publicado ? ART_RUTA[x.tipo] + '/' + x.slug : null };
   if (conBorrador) { o.borrador = d; o.avisos = revisarBorrador(limpiarBorrador(d, x.tipo), x.tipo); }
@@ -9586,11 +10089,15 @@ async function artSlugLibre(tipo, slug, idPropio) {
 }
 app.get('/api/admin/articulos', requiereSesionAsesor, async (req, res) => {
   const [f] = await pool.query('SELECT a.*, s.nombre AS autor_nombre FROM articulos a LEFT JOIN asesores s ON s.id = a.autor_asesor_id ORDER BY a.actualizado_en DESC');
-  res.json({ articulos: f.map(x => artFila(x, false)), es_admin: !!req.asesor.esAdmin, yo: req.asesor.id, publicos: ART_PUBLICOS, temas: ART_TEMAS });
+  const [[c]] = await pool.query("SELECT COUNT(*) n FROM articulos_comentarios WHERE estado = 'pendiente'");
+  const [[pq]] = await pool.query("SELECT SUM(estado = 'nueva') nuevas, SUM(estado = 'respondida') respondidas FROM preguntas");
+  res.json({ articulos: f.map(x => artFila(x, false)), es_admin: !!req.asesor.esAdmin, yo: req.asesor.id, publicos: ART_PUBLICOS, temas: ART_TEMAS, comentarios_pendientes: c.n,
+    firmantes: await firmantes(), firma_defecto: await firmaPorDefecto(), preguntas_nuevas: Number(pq.nuevas) || 0, preguntas_por_publicar: Number(pq.respondidas) || 0 });
 });
 app.post('/api/admin/articulos', requiereSesionAsesor, async (req, res) => {
-  const b = req.body || {}, tipo = ART_TIPOS.includes(b.tipo) ? b.tipo : 'articulo';
-  const borr = limpiarBorrador({ titulo: b.titulo || '', columna: [{ tipo: 'indice' }] }, tipo);
+  const b = req.body || {}, plantilla = ART_PLANTILLAS.includes(b.plantilla) ? b.plantilla : '';
+  const tipo = plantilla === 'guia' ? 'guia' : plantilla ? 'articulo' : (ART_TIPOS.includes(b.tipo) ? b.tipo : 'articulo');
+  const borr = limpiarBorrador(plantilla ? Object.assign(await plantillaArticulo(plantilla), { titulo: b.titulo || '' }) : { titulo: b.titulo || '', columna: [{ tipo: 'indice' }] }, tipo);
   const slug = await artSlugLibre(tipo, artSlug(b.slug || b.titulo) || (tipo === 'guia' ? 'guia' : 'articulo'), 0);
   const [ins] = await pool.execute('INSERT INTO articulos (tipo, slug, autor_asesor_id, borrador) VALUES (?, ?, ?, ?)', [tipo, slug, req.asesor.id, JSON.stringify(borr)]);
   res.status(201).json(artFila(await artCargar(ins.insertId), true));
@@ -9605,6 +10112,8 @@ app.put('/api/admin/articulos/:id(\\d+)', requiereSesionAsesor, async (req, res)
   if (f.estado === 'revision' && !req.asesor.esAdmin) return res.status(409).json({ error: 'Está en revisión: espera a que un administrador lo publique o te lo devuelva' });
   const b = req.body || {};
   const borr = limpiarBorrador(b.borrador, f.tipo);
+  // 19/11: el autor elige firmarlo él o no firmarlo (firma de la casa); poner a otra persona concreta solo un administrador
+  if (borr.firma > 0 && !req.asesor.esAdmin) { let antes = 0; try { antes = limpiarBorrador(JSON.parse(f.borrador), f.tipo).firma; } catch (e) {} borr.firma = antes; }
   let slug = f.slug;
   if (b.slug !== undefined && artSlug(b.slug) && artSlug(b.slug) !== f.slug) {
     if (f.publicado && !req.asesor.esAdmin) return res.status(409).json({ error: 'La dirección de un artículo publicado solo la cambia un administrador' });
@@ -9620,18 +10129,53 @@ app.post('/api/admin/articulos/:id(\\d+)/enviar', requiereSesionAsesor, async (r
   if (!artPuedeEditar(req, f)) return res.status(403).json({ error: 'Solo su autor puede enviarlo' });
   const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo);
   if (!d.titulo || !d.cuerpo.length) return res.status(400).json({ error: 'Pon al menos el título y algo de texto antes de enviarlo' });
+  if (huecosBorrador(d)) return res.status(400).json({ error: ART_MSG_HUECOS });
   await pool.execute("UPDATE articulos SET estado = 'revision', enviado_en = NOW(), comentario_revision = NULL WHERE id = ?", [f.id]);
   try { if (typeof avisarCaptacion === 'function') avisarCaptacion('Artículo pendiente de revisión', 'Hay un artículo esperando a que un administrador lo publique. Está en Web → Artículos.', { etiqueta: 'memo' }); } catch (e) {}
   res.json(artFila(await artCargar(f.id), true));
 });
+// Correo al autor cuando un administrador publica, devuelve o retira su artículo (17/11). Si lo hace el propio autor, no se envía.
+// Nunca frena la petición: si el correo falla, queda en el registro del servidor.
+async function avisarAutorArticulo(f, que, req, comentario) {
+  try {
+    if (!f || !f.autor_asesor_id || f.autor_asesor_id === req.asesor.id || !brevoActivo()) return;
+    const [a] = await pool.execute('SELECT correo, nombre FROM asesores WHERE id = ? AND activo = 1', [f.autor_asesor_id]);
+    if (!a.length || !a[0].correo) return;
+    let d = {}; try { d = JSON.parse(f.publicado || f.borrador) || {}; } catch (e) {}
+    const guia = f.tipo === 'guia', Tu = guia ? 'Tu guía' : 'Tu artículo', lo = guia ? 'la' : 'lo';
+    const titulo = '«' + ESC_HTML(d.titulo || 'Sin título') + '»', quien = ESC_HTML(req.asesor.nombre || 'Un administrador');
+    const hola = 'Hola' + (a[0].nombre ? ', ' + ESC_HTML(String(a[0].nombre).split(' ')[0]) : '') + ':';
+    const enPanel = { texto: 'Abrir en el panel', url: PANEL_URL + '/?vista=articulos&articulo=' + f.id };
+    let asunto, c;
+    if (que === 'publicado') {
+      asunto = Tu + (guia ? ' ya está publicada' : ' ya está publicado');
+      c = plantillaCorreo({ titulo: asunto, parrafos: [hola, quien + ' ha publicado ' + titulo + ' en la web de Acros. Ya se puede leer y compartir.'],
+        boton: { texto: guia ? 'Ver la guía' : 'Ver el artículo', url: (SITE_URL || 'https://acrosfi.es') + ART_RUTA[f.tipo] + '/' + f.slug },
+        nota: 'Si ' + lo + ' cambias desde el panel, la web seguirá enseñando esta versión hasta que un administrador ' + lo + ' vuelva a publicar.' });
+    } else if (que === 'devuelto') {
+      asunto = Tu + ' necesita cambios';
+      c = plantillaCorreo({ titulo: asunto, parrafos: [hola, quien + ' ha revisado ' + titulo + ' y te ' + lo + ' devuelve con este comentario:',
+        '<div style="border-left:3px solid #E6DCCD; padding:4px 0 4px 12px; color:#23402F;">' + ESC_HTML(comentario || '').replace(/\n/g, '<br>') + '</div>',
+        'Cuando ' + lo + ' corrijas, vuelve a enviar' + lo + ' a revisión desde el panel.'], boton: enPanel });
+    } else if (que === 'retirado') {
+      asunto = Tu + ' se ha retirado de la web';
+      c = plantillaCorreo({ titulo: asunto, parrafos: [hola, quien + ' ha retirado ' + titulo + ' de la web de Acros. Sigue en el panel como borrador, por si quieres cambiar' + lo + ' y enviar' + lo + ' otra vez a revisión.'], boton: enPanel });
+    } else return;
+    await enviarCorreo(a[0].correo, asunto, c.html, c.texto);
+  } catch (e) { console.error('Correo al autor del ' + (f && f.tipo === 'guia' ? 'guía' : 'artículo') + ':', e.message); }
+}
 app.post('/api/admin/articulos/:id(\\d+)/publicar', requiereSesionAsesor, async (req, res) => {
   if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador publica' });
   const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
   const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo);
   if (!d.titulo || !d.cuerpo.length) return res.status(400).json({ error: 'Le falta el título o el texto' });
+  if (huecosBorrador(d)) return res.status(400).json({ error: ART_MSG_HUECOS });
+  d.cuerpo.forEach(x => { delete x.pista; delete x.ejemplos; });
   await pool.execute("UPDATE articulos SET publicado = ?, estado = 'publicado', comentario_revision = NULL, revisado_por_asesor_id = ?, revisado_en = NOW(), publicado_en = COALESCE(publicado_en, NOW()), actualizado_publico_en = NOW() WHERE id = ?",
     [JSON.stringify(d), req.asesor.id, f.id]);
-  res.json(artFila(await artCargar(f.id), true));
+  const fp = await artCargar(f.id);
+  avisarAutorArticulo(fp, 'publicado', req);
+  res.json(artFila(fp, true));
 });
 app.post('/api/admin/articulos/:id(\\d+)/devolver', requiereSesionAsesor, async (req, res) => {
   if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador devuelve artículos' });
@@ -9639,12 +10183,14 @@ app.post('/api/admin/articulos/:id(\\d+)/devolver', requiereSesionAsesor, async 
   const com = artTxt((req.body || {}).comentario, 2000);
   if (!com) return res.status(400).json({ error: 'Escribe al autor qué tiene que cambiar' });
   await pool.execute("UPDATE articulos SET estado = 'devuelto', comentario_revision = ?, revisado_por_asesor_id = ?, revisado_en = NOW() WHERE id = ?", [com, req.asesor.id, f.id]);
+  avisarAutorArticulo(f, 'devuelto', req, com);
   res.json(artFila(await artCargar(f.id), true));
 });
 app.post('/api/admin/articulos/:id(\\d+)/despublicar', requiereSesionAsesor, async (req, res) => {
   if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador lo retira' });
   const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
   await pool.execute("UPDATE articulos SET publicado = NULL, estado = 'borrador' WHERE id = ?", [f.id]);
+  if (f.publicado) avisarAutorArticulo(f, 'retirado', req);
   res.json(artFila(await artCargar(f.id), true));
 });
 app.delete('/api/admin/articulos/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
@@ -9656,7 +10202,7 @@ app.delete('/api/admin/articulos/:id(\\d+)', requiereSesionAsesor, async (req, r
 });
 app.get('/api/admin/articulos/:id(\\d+)/vista-previa', requiereSesionAsesor, async (req, res) => {
   const f = await artCargar(req.params.id); if (!f) return res.status(404).json({ error: 'No existe' });
-  const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo), autor = await autorPublico(f.autor_asesor_id);
+  const d = limpiarBorrador(JSON.parse(f.borrador), f.tipo), autor = await autorPublico(await firmanteDe(d, f));
   res.json({ html: await htmlPaginaArticulo(f.tipo, f.slug, d, autor, { publicado: f.publicado_en, actualizado: f.actualizado_publico_en }, true) });
 });
 // Imagen ya reducida en el navegador (máx. 1.600 px). Se comprueba que sea de verdad JPG, PNG o WebP; el id es su huella.
@@ -9698,6 +10244,656 @@ app.put('/api/admin/articulos-recuadros/:id(\\d+)', requiereSesionAsesor, async 
 app.delete('/api/admin/articulos-recuadros/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
   if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador cambia la biblioteca' });
   await pool.execute('UPDATE articulos_recuadros SET activo = 0 WHERE id = ?', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// ---------------- 19/11: comentarios de los lectores en el panel
+// Todo el equipo los ve; los publica, responde o borra un administrador o el autor del artículo.
+async function cargarComentario(req, res) {
+  const [f] = await pool.execute('SELECT c.*, a.autor_asesor_id FROM articulos_comentarios c JOIN articulos a ON a.id = c.articulo_id WHERE c.id = ?', [Number(req.params.id)]);
+  if (!f.length) { res.status(404).json({ error: 'No existe' }); return null; }
+  if (!req.asesor.esAdmin && f[0].autor_asesor_id !== req.asesor.id) { res.status(403).json({ error: 'Solo un administrador o el autor del artículo' }); return null; }
+  return f[0];
+}
+app.get('/api/admin/articulos-comentarios', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.query(`SELECT c.id, c.articulo_id, c.nombre, c.texto, c.estado, c.respuesta, c.creado_en, c.revisado_en, a.tipo, a.slug, a.publicado, a.autor_asesor_id,
+      COALESCE(p.nombre, s.nombre) respondio
+    FROM articulos_comentarios c JOIN articulos a ON a.id = c.articulo_id
+    LEFT JOIN asesores s ON s.id = c.respuesta_asesor_id LEFT JOIN personas p ON p.asesor_id = s.id AND p.activa = 1
+    ORDER BY c.estado = 'pendiente' DESC, c.creado_en DESC LIMIT 500`);
+  res.json({ comentarios: f.map(x => {
+    let titulo = ''; try { titulo = JSON.parse(x.publicado || '{}').titulo || ''; } catch (e) {}
+    return { id: x.id, articulo_id: x.articulo_id, titulo, url: ART_RUTA[x.tipo] + '/' + x.slug, nombre: x.nombre, texto: x.texto, estado: x.estado, respuesta: x.respuesta, respondio: x.respuesta ? x.respondio : null,
+      creado_en: x.creado_en, puede: !!req.asesor.esAdmin || x.autor_asesor_id === req.asesor.id };
+  }) });
+});
+app.post('/api/admin/articulos-comentarios/:id(\\d+)/publicar', requiereSesionAsesor, async (req, res) => {
+  const c = await cargarComentario(req, res); if (!c) return;
+  await pool.execute("UPDATE articulos_comentarios SET estado = 'publicado', revisado_por_asesor_id = ?, revisado_en = NOW() WHERE id = ?", [req.asesor.id, c.id]);
+  res.json({ ok: true });
+});
+app.post('/api/admin/articulos-comentarios/:id(\\d+)/responder', requiereSesionAsesor, async (req, res) => {
+  const c = await cargarComentario(req, res); if (!c) return;
+  const r = artTxt((req.body || {}).respuesta, 3000);
+  // Responder también publica el comentario; con la respuesta vacía se quita la respuesta
+  await pool.execute("UPDATE articulos_comentarios SET respuesta = ?, respuesta_asesor_id = ?, estado = 'publicado', revisado_por_asesor_id = ?, revisado_en = NOW() WHERE id = ?", [r || null, r ? req.asesor.id : null, req.asesor.id, c.id]);
+  res.json({ ok: true });
+});
+app.delete('/api/admin/articulos-comentarios/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const c = await cargarComentario(req, res); if (!c) return;
+  await pool.execute('DELETE FROM articulos_comentarios WHERE id = ?', [c.id]);
+  res.json({ ok: true });
+});
+
+// ---------------- 19/11: visitas de las IA, para el panel
+app.get('/api/admin/articulos-visitas-ia', requiereSesionAsesor, async (req, res) => {
+  const dias = Math.min(365, Math.max(7, Number(req.query.dias) || 30));
+  const [f] = await pool.execute('SELECT DATE_FORMAT(dia, \'%Y-%m-%d\') dia, bot, ruta, n, ultima FROM articulos_visitas_ia WHERE dia >= CURDATE() - INTERVAL ? DAY', [dias - 1]);
+  const info = Object.fromEntries(ART_BOTS.map(b => [b.bot, b]));
+  const porBot = {}, porRuta = {}, porDia = {};
+  for (const x of f) {
+    const b = info[x.bot] || { quien: x.bot, uso: 'buscador' };
+    const k = porBot[x.bot] || (porBot[x.bot] = { bot: x.bot, quien: b.quien, uso: b.uso, n: 0, ultima: null });
+    k.n += x.n; if (!k.ultima || x.ultima > k.ultima) k.ultima = x.ultima;
+    const r = porRuta[x.ruta] || (porRuta[x.ruta] = { ruta: x.ruta, n: 0, momento: 0, ia: 0 });
+    r.n += x.n; if (b.uso === 'momento') r.momento += x.n; if (b.quien !== 'Google' && b.quien !== 'Bing y Copilot') r.ia += x.n;
+    const dd = porDia[x.dia] || (porDia[x.dia] = { dia: x.dia, ia: 0, buscadores: 0, momento: 0 });
+    if (b.quien === 'Google' || b.quien === 'Bing y Copilot') dd.buscadores += x.n; else dd.ia += x.n;
+    if (b.uso === 'momento') dd.momento += x.n;
+  }
+  res.json({ dias, bots: Object.values(porBot).sort((a, b) => b.n - a.n), paginas: Object.values(porRuta).sort((a, b) => b.ia - a.ia || b.n - a.n).slice(0, 30),
+    por_dia: Object.values(porDia).sort((a, b) => a.dia < b.dia ? -1 : 1), conocidos: ART_BOTS.map(b => ({ bot: b.bot, quien: b.quien, uso: b.uso })) });
+});
+
+// ---------------- 19/11 (Vikn): quién firma
+// Firma quien lo escribe. Puede elegir no firmarlo: entonces firma «la firma de la casa» (Bernardo; la elige un
+// administrador en el panel). Un administrador puede poner de firmante a cualquiera del equipo, también a sí mismo.
+async function firmaPorDefecto() {
+  const [f] = await pool.execute("SELECT valor FROM ajustes WHERE clave = 'articulos_firma'");
+  const id = f.length ? Number(f[0].valor) || 0 : 0;
+  if (!id) return 0;
+  const [a] = await pool.execute('SELECT id FROM asesores WHERE id = ? AND activo = 1', [id]);
+  return a.length ? id : 0;
+}
+// Quién sale como autor: una persona concreta, la firma de la casa o quien lo escribió (null = solo «Acros»)
+async function firmanteDe(d, fila) {
+  if (d.firma > 0) return d.firma;
+  if (d.firma === -1) return (await firmaPorDefecto()) || null;
+  return fila.autor_asesor_id;
+}
+async function firmantes() {
+  const [f] = await pool.query('SELECT a.id, COALESCE(p.nombre, a.nombre) nombre FROM asesores a LEFT JOIN personas p ON p.asesor_id = a.id AND p.activa = 1 WHERE a.activo = 1 ORDER BY nombre');
+  return f.map(x => ({ id: x.id, nombre: x.nombre }));
+}
+app.put('/api/admin/articulos-ajustes', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador' });
+  const id = Number((req.body || {}).firma_defecto) || 0;
+  if (id) { const [a] = await pool.execute('SELECT id FROM asesores WHERE id = ? AND activo = 1', [id]); if (!a.length) return res.status(400).json({ error: 'Esa persona no está en el equipo' }); }
+  await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('articulos_firma', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [String(id)]);
+  res.json({ ok: true, firma_defecto: id });
+});
+
+// =====================================================================================================
+// 19/11 (Vikn): PREGUNTAS Y RESPUESTAS — acrosfi.es/preguntas
+// Cualquiera pregunta (anónimo, sin datos personales); el equipo contesta desde el panel y la pregunta respondida tiene su
+// propia página, con datos estructurados de pregunta y respuesta (QAPage), su versión .md y entrada en el mapa del sitio.
+// Estados: nueva (sin responder) → respondida (respuesta escrita por un asesor, falta que la publique un administrador)
+// → publicada. Descartada: no se publica. Un administrador puede responder y publicar a la vez.
+// =====================================================================================================
+const PREG_CSS = `
+.pq-cab{max-width:none}.pq-cab p{margin:0 0 8px}
+.pq-form{display:flex;flex-direction:column;gap:10px;margin:22px 0 8px}
+.pq-caja{position:relative}
+.pq-caja textarea{display:block;width:100%;box-sizing:border-box;field-sizing:content;min-height:132px;max-height:420px;resize:none;font:inherit;font-size:17px;line-height:1.55;padding:18px 22px 72px;border:1.5px solid var(--linea);border-radius:8px;background:var(--panel);color:var(--titular);box-shadow:0 2px 10px rgba(35,64,47,.05);transition:border-color .2s ease,background-color .2s ease,box-shadow .2s ease}
+.pq-caja textarea::placeholder{color:var(--suave);opacity:.75}
+.pq-caja textarea:hover{border-color:var(--suave)}
+.pq-caja textarea:focus{outline:none;border-color:var(--tinta);background:var(--panel);box-shadow:0 6px 24px rgba(35,64,47,.10)}
+.pq-enviar{position:absolute;right:12px;bottom:12px;min-height:44px;font-size:15px;border-radius:8px;transition:opacity .3s ease,transform .3s cubic-bezier(.2,.8,.2,1),visibility 0s,background-color .25s ease,color .25s ease}
+.pq-caja .pq-enviar{border:2px solid var(--tinta);background:color-mix(in srgb,var(--tinta) calc(var(--p,1) * 100%),#EAF1EC);color:#fff;box-shadow:none}
+.pq-caja.claro .pq-enviar{color:#1D3427}
+.pq-caja .pq-enviar:hover{filter:brightness(.96)}
+.pq-caja.esperando .pq-enviar{opacity:0;transform:translateY(6px) scale(.96);visibility:hidden;pointer-events:none;transition:opacity .2s ease,transform .2s ease,visibility 0s .2s}
+@media (prefers-reduced-motion:reduce){.pq-enviar,.pq-caja.esperando .pq-enviar{transition:none}}
+.pq-caja.con-error textarea{border-color:var(--acento)}
+.pq-error{margin:2px 4px 0;font-size:14px;font-weight:500;color:var(--acento)}
+.pq-vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media (max-width:600px){.pq-caja textarea{padding:16px 18px 68px;font-size:16px}.pq-enviar{left:12px;right:12px;justify-content:center}}
+.pq-temas{border:0;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}.pq-temas legend{font-weight:600;color:var(--titular);font-size:15px;padding:0;margin-bottom:8px}
+.pq-temas div{display:flex;flex-wrap:wrap;gap:8px}.pq-temas label{display:inline-flex;font-weight:600;font-size:14px}
+.pq-temas input{position:absolute;opacity:0;width:1px;height:1px}
+.pq-temas span{display:inline-flex;align-items:center;min-height:38px;padding:0 14px;border-radius:19px;border:1.5px solid var(--tinta);color:var(--tinta);cursor:pointer}
+.pq-temas input:checked+span{background:var(--tinta);color:var(--fondo)}.pq-temas input:focus-visible+span{outline:2px solid var(--acento);outline-offset:2px}
+.pq-aviso{border:1px solid var(--linea);border-radius:18px;padding:22px 24px;max-width:460px;background:var(--panel);color:var(--suave)}
+.pq-aviso::backdrop{background:rgba(20,20,20,.45)}.pq-aviso h2{margin:0 0 8px;font-family:var(--f-display);font-size:22px;color:var(--titular)}.pq-aviso p{margin:0 0 16px;font-size:15px;line-height:1.55}
+.pq-aviso{position:relative;width:min(520px,calc(100vw - 32px));margin:12vh auto auto}
+.pq-cuerpo{border-radius:12px}
+.pq-op.elegida{border-color:var(--tinta);background:var(--circulo)}
+.pq-opciones{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.pq-op{min-height:48px;text-align:left;padding:0 16px;border-radius:12px;border:1.5px solid var(--linea);background:var(--fondo);color:var(--titular);font:inherit;font-size:16px;font-weight:600;cursor:pointer}
+.pq-op:hover,.pq-op:focus-visible{border-color:var(--tinta);outline:none}
+.pq-atras{border:0;background:none;color:var(--acento);font:inherit;font-size:14px;padding:0;margin:0 0 12px;cursor:pointer}
+.pq-cerrar{position:absolute;top:10px;right:12px;width:36px;height:36px;border:0;background:none;color:var(--suave);font-size:24px;cursor:pointer;border-radius:8px}
+.pq-aviso .pq-nota{font-size:13px;line-height:1.5;margin:0;color:var(--suave)}
+.pq-nota{font-size:13px;margin:0}.pq-ok{font-size:15px;margin:8px 0 0;color:var(--titular)}
+.pq-lista{list-style:none;margin:24px 0 0;padding:0;display:flex;flex-direction:column}
+.pq-lista li{border-top:1px solid var(--linea);padding:16px 0;display:flex;flex-direction:column;gap:6px}
+.pq-lista a.t{font-family:var(--f-display);font-size:21px;line-height:1.3;color:var(--titular);text-decoration:none;font-weight:600}
+.pq-lista p{margin:0;font-size:15px}.pq-lista small{font-size:13px}.pq-meta{display:flex;flex-wrap:wrap;gap:4px 18px}
+.pq-resp{max-width:760px;display:flex;flex-direction:column;gap:14px;margin-top:20px}
+.pq-resp p{margin:0}
+.pq-firma{display:flex;align-items:center;gap:12px;font-size:14px;border-top:1px solid var(--linea);padding-top:14px;margin-top:8px}
+.pq-firma img,.pq-firma .sin{width:44px;height:44px;border-radius:50%;object-fit:cover;background:var(--circulo);flex-shrink:0}
+.pq-otra{max-width:760px;margin-top:28px;font-size:15px}
+.pq-pestanas{display:flex;margin:22px 0 0;border-bottom:1px solid var(--linea);overflow-x:auto;scrollbar-width:none}.pq-pestanas::-webkit-scrollbar{display:none}
+.pq-pestanas a{position:relative;flex:0 0 auto;min-width:max-content;text-align:center;padding:12px 16px 10px;font-weight:700;font-size:16px;color:var(--titular);text-decoration:none;transition:flex-grow .45s ease,color .45s ease}
+.pq-pestanas a::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:3px;background:var(--titular);transform:scaleX(0);transform-origin:left;transition:transform .45s ease,background-color .45s ease}
+.pq-pestanas a:hover{color:var(--acento)}.pq-pestanas a[aria-current="page"]{flex-grow:1;color:var(--acento)}.pq-pestanas a[aria-current="page"]::after{transform:scaleX(1);background:var(--acento)}
+@media (prefers-reduced-motion:reduce){.pq-pestanas a,.pq-pestanas a::after{transition:none}}
+.pq-pestanas~.pq-lista{margin-top:0}.pq-pestanas~.pq-lista li{border-top:0;border-bottom:1px solid var(--linea)}.pq-lista li[hidden]{display:none}
+.pq-rej{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:56px;align-items:start}
+.pq-lado{display:flex;flex-direction:column;gap:28px;padding-top:10px}
+/* 20/11 (Vikn): en ordenador, el recuadro del asesor se queda fijo al bajar (debajo de la cabecera) */
+@media (min-width:961px){.pq-lado{align-self:stretch}.pq-lado .pq-asesor{position:sticky;top:92px}}
+.pq-lado section{display:flex;flex-direction:column;gap:2px}
+.pq-lado h2{margin:0 0 8px;font-family:var(--f-display);font-size:19px;font-weight:600;line-height:1.3;color:var(--titular)}
+.pq-lado ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+.pq-lado li{border-top:1px solid var(--linea);padding:10px 0}.pq-lado li:last-child{border-bottom:1px solid var(--linea)}
+.pq-lado li a{display:block;font-family:var(--f-display);color:var(--titular);text-decoration:none;font-weight:600;font-size:16px;line-height:1.35}.pq-lado li a:hover{text-decoration:underline;text-underline-offset:2px}
+.pq-lado li small{display:block;font-size:12px;margin-top:2px}
+.pq-lado .pq-temas-l a{display:flex;justify-content:space-between;gap:12px;font-family:var(--f-cuerpo);font-weight:700;font-size:15px}.pq-lado .pq-temas-l span{color:var(--suave);font-weight:400}
+/* 20/11 (Vikn): el recuadro del asesor con más presencia y esquinas más rectas */
+.pq-asesor{position:relative;overflow:hidden;background:linear-gradient(160deg,#4A6B58 0%,#3F5E4C 100%);color:#EEF1EA;border-radius:8px;padding:26px 24px 24px;display:flex;flex-direction:column;gap:12px;font-size:15px;line-height:1.55;box-shadow:0 10px 28px rgba(35,64,47,.14)}
+.pq-asesor::before{content:"";position:absolute;left:0;top:0;right:0;height:4px;background:linear-gradient(90deg,#D2601F,#BD561B,#A84C18)}
+.pq-asesor strong{font-family:var(--f-display);font-size:23px;font-weight:600;color:#FBF8F2;line-height:1.2}
+.pq-asesor p{margin:0}.pq-lado .pq-asesor{gap:12px}.pq-asesor p+p{margin-top:-4px}
+.pq-asesor .pq-asesor-btn{display:flex;align-items:center;justify-content:center;min-height:48px;margin-top:4px;padding:0 18px;border-radius:8px;background:#BD561B;color:#fff;font-weight:700;font-size:16px;text-decoration:none;transition:background-color .2s ease,transform .2s ease}
+.pq-asesor .pq-asesor-btn:hover{background:#A84C18;transform:translateY(-1px)}
+.pq-asesor .pq-asesor-tel{font-size:14px;color:#EEF1EA;text-align:center}.pq-asesor .pq-asesor-tel a{color:#FBF8F2;font-weight:600;text-decoration:none;white-space:nowrap}.pq-asesor .pq-asesor-tel a:hover{text-decoration:underline}
+@media (max-width:600px){.pq-pestanas a{padding:12px 10px 10px;font-size:15px}}
+@media (max-width:960px){.pq-rej{grid-template-columns:minmax(0,1fr);gap:36px}.pq-lado{padding-top:0;border-top:1px solid var(--linea);padding-top:28px}}
+`;
+// 20/11 (Vikn): columna de la derecha de /preguntas y de cada pregunta. Sin publicidad ni huecos: solo contenido propio.
+// «Las más preguntadas» (las que se destacan en el panel), «Para leer con calma» (artículos o guías elegidos en el panel),
+// temas con su número de preguntas, y al final el recuadro para hablar con un asesor. Lo que no se rellena no sale;
+// el recuadro del asesor sale siempre, así la columna nunca queda vacía.
+async function lecturasPreguntas() {
+  let l = []; try { const [f] = await pool.execute("SELECT valor FROM ajustes WHERE clave = 'preguntas_lecturas'"); if (f.length) l = JSON.parse(f[0].valor || '[]'); } catch (e) {}
+  if (!Array.isArray(l) || !l.length) return [];
+  const pub = await enlacesPublicados();
+  return l.map(x => pub.find(e => e.tipo === x.tipo && e.slug === x.slug)).filter(Boolean).slice(0, 3);
+}
+async function htmlLadoPreguntas({ x, temaActual } = {}) {
+  const bloques = [];
+  if (x) {
+    // Primero las del mismo tema (con su título); si son pocas, se completa con otras hasta 5
+    const [rel] = await pool.execute("SELECT slug, titulo, (tema <=> ?) mismo FROM preguntas WHERE estado = 'publicada' AND id <> ? ORDER BY (tema <=> ?) DESC, (subtema <=> ?) DESC, publicado_en DESC LIMIT 5", [x.tema || null, x.id, x.tema || null, x.subtema || null]);
+    const li = l => '<ul>' + l.map(o => '<li><a href="/preguntas/' + o.slug + '">' + ESC_HTML(o.titulo) + '</a></li>').join('') + '</ul>';
+    const mismo = x.tema ? rel.filter(o => o.mismo) : [], otras = rel.filter(o => !mismo.includes(o));
+    if (mismo.length) bloques.push('<section><h2>Más sobre ' + ESC_HTML(x.tema.toLowerCase()) + '</h2>' + li(mismo) + '</section>');
+    if (otras.length) bloques.push('<section><h2>Otras preguntas</h2>' + li(otras) + '</section>');
+  } else {
+    const [des] = await pool.execute("SELECT slug, titulo, tema, subtema FROM preguntas WHERE estado = 'publicada' AND destacada = 1" + (temaActual ? ' AND tema = ?' : '') + ' ORDER BY publicado_en DESC LIMIT 5', temaActual ? [temaActual] : []);
+    if (des.length) bloques.push('<section><h2>Las más preguntadas</h2><ul>' + des.map(o => '<li><a href="/preguntas/' + o.slug + '">' + ESC_HTML(o.titulo) + '</a>' + (o.subtema || o.tema ? '<small>' + ESC_HTML(o.subtema || o.tema) + '</small>' : '') + '</li>').join('') + '</ul></section>');
+  }
+  const lect = await lecturasPreguntas();
+  if (lect.length) bloques.push('<section><h2>Para leer con calma</h2><ul>' + lect.map(e => '<li><a href="' + ART_RUTA[e.tipo] + '/' + e.slug + '">' + ESC_HTML(e.d.titulo || e.slug) + '</a><small>' + (e.tipo === 'guia' ? 'Guía paso a paso' : 'Artículo') + '</small></li>').join('') + '</ul></section>');
+  if (!x) {
+    const [cu] = await pool.query("SELECT tema, COUNT(*) n FROM preguntas WHERE estado = 'publicada' AND tema IS NOT NULL AND tema <> '' GROUP BY tema");
+    const orden = (await temasPreguntas()).map(t => t.tema), cuenta = cu.sort((a, b) => (orden.indexOf(a.tema) + 1 || 99) - (orden.indexOf(b.tema) + 1 || 99));
+    if (cuenta.length > 1) bloques.push('<section class="pq-temas-l"><h2>Por temas</h2><ul>' + cuenta.map(t => '<li><a href="/preguntas?tema=' + encodeURIComponent(t.tema) + '"' + (t.tema === temaActual ? ' aria-current="page"' : '') + '>' + ESC_HTML(t.tema) + '<span>' + t.n + '</span></a></li>').join('') + '</ul></section>');
+  }
+  bloques.push('<section class="pq-asesor"><strong>¿Tu caso es más complejo?</strong><p>Deja que te lo miremos nosotros: tus exchanges, wallets, operativa y errores.</p><p>Te diremos cuánto pagarías, y si hubiera manera de rebajarlo.</p><p>Si lo necesitas, te preparamos la declaración.</p><a class="pq-asesor-btn" href="/empieza-aqui">Pide presupuesto</a><span class="pq-asesor-tel">o llámanos al <a href="tel:+34668170020">668 17 00 20</a></span></section>');
+  return '<aside class="pq-lado" aria-label="Más contenido">' + bloques.join('') + '</aside>';
+}
+// 20/11 (Vikn): primer paquete de 20 preguntas para que /preguntas no arranque vacía.
+// Entran en el panel como «Respondidas, por publicar» (estado 'respondida'). No sale nada en la web hasta que un
+// administrador las revisa y las publica; firma quien la guarda o la publica primero.
+const PREG_SEMILLA = [
+  ['Renta', 'Cómo se declara', '¿Tengo que declarar mis criptomonedas si solo compré y no he vendido?',
+`En la renta, no. Comprar criptomonedas con euros y guardarlas no genera nada que declarar: el impuesto llega cuando vendes, cuando cambias una por otra o cuando pagas algo con ellas.
+
+Aun así, hay dos casos en los que puede tocarte presentar algo sin haber vendido. El primero es el **modelo 721**: si a 31 de diciembre tienes más de 50.000 € en criptomonedas guardadas en exchanges o custodios extranjeros, hay que presentarlo entre el 1 de enero y el 31 de marzo. Es una declaración informativa: no se paga nada por presentarla.
+
+El segundo es el **Impuesto sobre el Patrimonio**, si tu patrimonio total, criptomonedas incluidas, supera el mínimo exento de tu comunidad autónoma.
+
+Y si has cobrado recompensas de staking o intereses por prestar tus criptomonedas, eso sí va en la renta del año en que las recibes, aunque no hayas vendido nada.`],
+  ['Renta', 'Ganancias y pérdidas', '¿Cambiar una criptomoneda por otra tributa?',
+`Sí. Cambiar BTC por ETH, o por USDT o USDC, es una **permuta** y tributa aunque no pases por euros.
+
+Se calcula como si hubieras vendido lo que entregas: lo que te costó, frente al mayor de estos dos valores en euros en el momento del cambio, el de lo que entregas o el de lo que recibes. La diferencia es una ganancia o una pérdida que va a la base del ahorro de la renta del año en que hiciste el cambio.
+
+Lo que recibes empieza a contar con ese mismo valor como coste, para cuando más adelante lo vendas o lo vuelvas a cambiar.
+
+Es el criterio de la Dirección General de Tributos desde 2018 (consulta V0999-18), y es donde más se equivoca la gente: muchos creen que mientras no vuelvan a euros no tienen nada que declarar.`],
+  ['Renta', 'Ganancias y pérdidas', '¿Cuánto se paga a Hacienda por vender criptomonedas?',
+`Depende de cuánto ganes, no de cuánto vendas. Solo tributa la ganancia: lo que recibes al vender menos lo que te costó, con las comisiones descontadas.
+
+Esa ganancia va a la base del ahorro de la renta, que se paga por tramos: 19 % hasta 6.000 €, 21 % de 6.000 a 50.000 €, 23 % de 50.000 a 200.000 €, 27 % de 200.000 a 300.000 € y 30 % a partir de 300.000 €. Son los tipos vigentes desde el ejercicio 2025.
+
+Cada tipo se aplica solo a la parte que cae en su tramo. Si ganas 10.000 €, pagas el 19 % de los primeros 6.000 € (1.140 €) y el 21 % de los otros 4.000 € (840 €): 1.980 € en total.
+
+Dos matices: la escala se aplica a toda tu base del ahorro, junto con los intereses y dividendos que hayas cobrado ese año, y antes de aplicarla se restan las pérdidas que hayas tenido con otras criptomonedas, acciones o fondos.`],
+  ['Renta', 'Ganancias y pérdidas', '¿Puedo compensar las pérdidas de criptomonedas?',
+`Sí. Las pérdidas por vender o cambiar criptomonedas se restan de las ganancias del mismo tipo de ese año: las de otras criptomonedas, pero también las de acciones o fondos.
+
+Si aún sobra pérdida, puede compensar hasta el 25 % de los rendimientos del capital mobiliario del mismo año (intereses, dividendos o recompensas de staking). Y lo que quede se arrastra a los **cuatro años siguientes**, para compensar ganancias futuras.
+
+Para aprovecharlas tienes que declararlas, aunque ese año no te salga nada a pagar. Si no las declaras, Hacienda no las tiene en cuenta después.`],
+  ['Renta', 'Ganancias y pérdidas', '¿Cómo se calcula la ganancia si compré a precios distintos?',
+`Con el método **FIFO**: las primeras unidades que compraste son las primeras que se consideran vendidas. No puedes elegir qué compra vendes.
+
+Un ejemplo: compras 1 ETH a 1.500 € y, más tarde, otro a 3.000 €. Si vendes 1 ETH por 2.500 €, para Hacienda has vendido el primero: ganas 1.000 €, aunque el último que compraste te dé pérdida.
+
+Las comisiones de compra se suman al coste y las de venta se restan de lo que recibes. Y en una permuta, lo que recibes entra en la cola con su valor en euros del momento del cambio.
+
+El FIFO se aplica sumando todas tus unidades de esa criptomoneda, en todos los exchanges y wallets, sin separarlas por plataforma (consultas V1604-18 y V1550-25).
+
+Por eso hace falta el historial completo, desde la primera compra y de todos los exchanges y wallets que hayas usado: si falta una parte, los costes no cuadran y la ganancia sale mal calculada.`],
+  ['Renta', 'Cómo se declara', '¿En qué apartado de la renta se declaran las criptomonedas?',
+`Las ventas y los cambios de criptomonedas van en el apartado de ganancias y pérdidas patrimoniales, en el bloque específico de **monedas virtuales**. Ahí se anota cada criptomoneda con lo que obtuviste al transmitirla y lo que te había costado.
+
+Las recompensas de staking y los intereses por prestar criptomonedas van en otro sitio: en los rendimientos del capital mobiliario.
+
+Puede que veas algunas operaciones ya cargadas en tus datos fiscales, porque los exchanges informan a Hacienda. Revísalas siempre: suelen faltar costes de compra o permutas entre criptomonedas, y si las das por buenas puedes acabar pagando de más o de menos.
+
+El modelo 721 y el Impuesto sobre el Patrimonio, si te tocan, son declaraciones aparte de la renta.`],
+  ['Cripto', 'Staking', '¿Cómo tributan las recompensas de staking?',
+`Según la Dirección General de Tributos (consultas V1766-22 y V0612-26), las recompensas de staking son rendimientos del capital mobiliario: se declaran en la base del ahorro, por su valor en euros el día en que las recibes, aunque no las vendas.
+
+Si haces staking nativo y las recompensas se acumulan en el contrato hasta que las reclamas, se declaran el año en que las reclamas y pasan a estar disponibles en tu wallet, no antes.
+
+El staking líquido funciona distinto. Si entregas ETH y recibes a cambio un token como rETH, que va subiendo de precio a medida que se acumulan las recompensas, Hacienda trata cada intercambio, al entrar y al salir, como un cambio de una criptomoneda por otra, que puede dar ganancia o pérdida. Las recompensas quedan dentro del mayor valor del token. Los tokens cuyo saldo crece solo, como stETH, no están tratados en esa consulta: conviene revisar el caso.
+
+Guarda el historial de recompensas que te da el exchange o la wallet: sin él es difícil justificar las fechas y los importes.`],
+  ['Cripto', 'Modelo 721', '¿Quién tiene que presentar el modelo 721?',
+`Quien vive en España y, a 31 de diciembre, tiene más de 50.000 € en criptomonedas guardadas por exchanges o custodios que no son residentes en España ni tienen establecimiento aquí. Se suman todas las plataformas extranjeras y se valora cada criptomoneda a su precio de esa fecha.
+
+Se presenta entre el 1 de enero y el 31 de marzo del año siguiente. Es una declaración informativa: no se paga nada por presentarla.
+
+Una vez presentado, solo hay que volver a hacerlo si el valor total sube más de 20.000 € respecto a la última declaración, o si dejas de tener alguna de las criptomonedas declaradas.
+
+No entran las criptomonedas que guardas tú mismo en una wallet propia, ni las de exchanges con sede o establecimiento en España. Tampoco los euros que dejas en un exchange extranjero: esos pueden ir en el modelo 720, como cuenta, si superan sus umbrales (consulta V0315-24). Y aunque no te toque el 721, las ganancias de esas criptomonedas tributan igual en la renta.`],
+  ['Cripto', 'Modelo 721', 'Si tengo mis criptomonedas en una wallet propia (Ledger, MetaMask), ¿van en el 721?',
+`No. El modelo 721 solo incluye las criptomonedas que guarda por ti una entidad extranjera: un exchange o un custodio que tiene tus claves. Si las claves las tienes tú, como en una Ledger, una MetaMask o una wallet de papel, no entran.
+
+Es el criterio de la Dirección General de Tributos (consultas V2290-23 y V0941-24).
+
+Que no vayan en el 721 no significa que Hacienda no las tenga en cuenta. Las ventas y los cambios que hagas desde esa wallet tributan en la renta como cualquier otra, y su valor cuenta para el Impuesto sobre el Patrimonio.
+
+Guarda las direcciones de tus wallets y el historial: si algún día tienes que demostrar de dónde salen esas criptomonedas, es lo que te van a pedir.`],
+  ['Cripto', 'Exchanges', '¿Tributa pasar criptomonedas de un exchange a mi wallet?',
+`No. Mover criptomonedas entre cuentas o wallets que son tuyas no es una venta ni un cambio: siguen siendo las mismas y conservan su coste original.
+
+La comisión que te cobra el exchange por la retirada tampoco tiene efecto en la renta cuando es un traspaso entre wallets tuyas, según la Dirección General de Tributos (consulta V0648-24).
+
+Lo que sí conviene es poder demostrarlo. Hacienda puede ver la salida del exchange, pero no sabe que la wallet de destino es tuya. Guarda las direcciones de tus wallets y el historial de cada traspaso, para que nadie lo confunda con una venta o con un envío a otra persona.
+
+Si envías criptomonedas a otra persona, eso ya no es un traspaso: puede ser una venta, un pago o una donación, y cada uno tributa de forma distinta.`],
+  ['Cripto', 'Exchanges', '¿Cómo declaro las operaciones de un exchange que ha cerrado o no me da el historial?',
+`Reconstruyendo el historial con todo lo que tengas. Hacienda no acepta como excusa que el exchange ya no exista: si vendiste, tienes que declarar la ganancia, y si no puedes justificar lo que te costó, puede considerar que el coste fue cero.
+
+Sirven los correos de confirmación de cada operación, los extractos del banco con las transferencias de entrada y salida, las capturas antiguas y las transacciones en la blockchain de los depósitos y retiradas, que siguen siendo públicas. Muchos exchanges cerrados dejaron además un plazo o un portal para descargar los datos.
+
+Si el exchange quebró con tus fondos dentro, la pérdida no se puede declarar en cuanto cierra. En general, hay que esperar a que el procedimiento de insolvencia termine o a que se apruebe un acuerdo con quita, o a que se cumpla un año desde que reclamaste judicialmente la deuda. Y cuando se puede declarar, esa pérdida va a la base general de la renta, no a la del ahorro.
+
+Cuanto antes se reconstruya, mejor: con el tiempo se pierden correos y accesos.`],
+  ['Cripto', 'DeFi', '¿Cómo se declaran los préstamos y la liquidez en DeFi?',
+`Lo que ganas prestando criptomonedas en plataformas como Aave, o aportando liquidez a pools como Uniswap o Curve, son rendimientos del capital mobiliario: van a la base del ahorro, por su valor en euros el día en que los recibes. Es el criterio de la Dirección General de Tributos (consulta V0648-24).
+
+Los intereses que pagas cuando pides prestado no se pueden restar de esos rendimientos.
+
+Hay una parte que Hacienda aún no ha aclarado: si entregar tus criptomonedas a un pool a cambio de un token que representa tu parte (LP token) es en sí un cambio que tributa. Mientras no haya criterio, lo prudente es documentar bien cada entrada y salida del pool, con sus importes y valores en euros.
+
+DeFi es donde más se complica el historial: muchas operaciones, en varias redes y sin un extracto único. Conviene ordenarlo cada año, no al final.`],
+  ['Residencia fiscal', 'Me voy de España', 'Si me voy a vivir fuera de España, ¿dejo de pagar impuestos por mis criptomonedas?',
+`Depende de cuándo dejes de ser residente fiscal. Mientras pases más de 183 días al año en España, o tengas aquí el centro de tus intereses económicos, sigues siendo residente ese año entero y tributas en España por todas tus ganancias, también las de criptomonedas.
+
+Irse no obliga a pagar por la revalorización acumulada: la Dirección General de Tributos ha dicho que el impuesto de salida no se aplica a criptomonedas como bitcoin (consulta V0666-25), porque solo afecta a acciones y participaciones.
+
+Ojo si tienes nacionalidad española y te vas a un país o territorio considerado paraíso fiscal: en ese caso sigues siendo contribuyente en España el año del cambio y los cuatro siguientes.
+
+Para dejar las cosas claras, comunica tu cambio de domicilio a Hacienda y consigue un certificado de residencia fiscal del país al que te mudas.`],
+  ['Residencia fiscal', 'Vengo a España', 'Vengo a vivir a España y tengo criptomonedas, ¿qué tengo que declarar?',
+`Desde el año en que pasas a ser residente fiscal (en general, cuando pasas más de 183 días en España), tributas aquí por todo lo que ganes en el mundo, criptomonedas incluidas.
+
+Cuando vendas o cambies criptomonedas que ya tenías antes de llegar, la ganancia se calcula con lo que te costaron en su día, no con su valor al llegar. Por eso conviene que traigas el historial de compras desde el principio.
+
+Además, si a 31 de diciembre tienes más de 50.000 € en exchanges extranjeros, tendrás que presentar el modelo 721, y tu patrimonio puede llevarte al Impuesto sobre el Patrimonio.
+
+Si vienes a trabajar, puede que te puedas acoger al régimen de impatriados, conocido como Ley Beckham. Con él tributas como no residente, solo por lo que se considera obtenido en España. Según la Dirección General de Tributos (consulta V0376-24), las ganancias de criptomonedas guardadas en un exchange sin sede ni establecimiento en España no se consideran obtenidas aquí. Conviene revisar cada caso antes de vender: dónde están, quién las custodia y qué tipo de operación es.`],
+];
+// 20/11 (Vikn): segundo paquete (NFT, minería y airdrops). Igual que el primero: entra «por publicar».
+const PREG_SEMILLA_2 = [
+  ['Cripto', 'NFT', '¿Cómo tributan los NFT?',
+`Si compras y vendes NFT como particular, lo razonable es tratarlos como una criptomoneda más: la ganancia o la pérdida de cada venta va a la base del ahorro de la renta, entre el 19 % y el 30 % según el tramo. Hacienda todavía no se ha pronunciado sobre este caso concreto, así que conviene revisarlo si las cantidades son importantes.
+
+Ojo con cómo pagas. Si compras un NFT con ETH, para Hacienda has entregado ETH a cambio de otra cosa, así que esa compra es también una venta de ETH, con su propia ganancia o pérdida. Y cuando revendas el NFT por ETH, pasa lo mismo al revés.
+
+Si eres tú quien crea y vende NFT, cambia. La Dirección General de Tributos considera que vender un NFT es prestar un servicio por vía electrónica, con un IVA del 21 % (consulta V0486-22). Basta con que te organices para vender, aunque sea de vez en cuando; solo queda fuera una venta puntual y aislada. En la renta es una actividad económica: los ingresos van a la base general y puedes restar gastos como la comisión de acuñación (consulta V2388-24).
+
+Guarda el historial de cada NFT: lo que pagaste, en qué moneda y en qué fecha, y lo mismo de la venta. Los marketplaces no siempre dan un extracto completo.`],
+  ['Cripto', 'Airdrops', '¿Tributan los airdrops?',
+`Sí. Los tokens que recibes gratis en un airdrop tributan el año en que los recibes, por su valor de mercado en euros ese día.
+
+Hacienda los trata como una ganancia patrimonial que no viene de vender nada, y por eso van a la base general de la renta, a tu tipo marginal, no a la del ahorro. Es el criterio de la Dirección General de Tributos para los airdrops (consultas V0648-24 y V1948-21), aunque para recibirlos hayas tenido que participar en promociones en internet o en redes sociales.
+
+Ese valor pasa a ser su coste: cuando vendas o cambies esos tokens, la ganancia o la pérdida va a la base del ahorro, como cualquier otra venta.
+
+Si el token todavía no cotiza en ningún sitio cuando lo recibes, darle un valor es difícil: guarda cómo lo has valorado y con qué fuente. Y si lo recibes por tu trabajo o por una actividad profesional que ya ejerces, por ejemplo como artista de NFT, es un ingreso de esa actividad, no una ganancia patrimonial (consulta V2388-24).`],
+];
+// 21/11 (Acros 10): preguntas que aún no tienen la fuente comprobada. NO se cargan; cuando Acros 10 las cierre, pasan a un paquete nuevo.
+const PREG_SIN_COMPROBAR = [
+  ['Renta', 'Cartas de Hacienda', 'Me ha llegado una carta de Hacienda por mis criptomonedas, ¿qué hago?',
+`Lo primero, no la ignores y mira el plazo: suele ser de 10 días hábiles desde que la recibes, y se puede pedir una ampliación.
+
+Hay tres tipos de carta. Un aviso o una comunicación informativa te recuerda que Hacienda tiene datos de tus criptomonedas y que revises tu declaración. Un requerimiento te pide documentación. Una propuesta de liquidación ya trae un cálculo de lo que, según Hacienda, debes pagar.
+
+En los dos últimos casos no pagues sin revisar. Hacienda suele calcular solo con lo que le informan los exchanges, y muchas veces le faltan los costes de compra: entonces considera ganancia todo lo que vendiste. Puedes presentar alegaciones con tu historial completo y el cálculo correcto.
+
+Prepara los extractos de todos tus exchanges y wallets desde la primera compra. Con eso se reconstruye la ganancia real, que casi siempre es menor que la de la carta.`],
+  ['Renta', 'Cartas de Hacienda', 'No declaré mis criptomonedas en años anteriores, ¿qué puedo hacer?',
+`Presentar una declaración complementaria de cada año afectado, antes de que Hacienda te requiera. Si lo haces por tu cuenta no hay sanción: solo un recargo por presentarla tarde.
+
+El recargo es del 1 % más otro 1 % por cada mes completo de retraso. Si ha pasado más de un año, es del 15 % y además se pagan intereses de demora desde ese momento. Si pagas a tiempo y no aplazas, el recargo se reduce un 25 %.
+
+Solo se pueden revisar los años que no han prescrito: en general, los cuatro últimos contados desde el final del plazo de cada declaración.
+
+Si ya te ha llegado un requerimiento de Hacienda sobre esas operaciones, la complementaria deja de ser voluntaria y puede haber sanción, así que en ese caso conviene contestar al requerimiento con el cálculo bien hecho.`],
+  ['Renta', 'Patrimonio', '¿Las criptomonedas cuentan para el Impuesto sobre el Patrimonio?',
+`Sí. Forman parte de tu patrimonio y se valoran a su precio de mercado a 31 de diciembre, estén en un exchange o en una wallet propia.
+
+Con la norma estatal, tienes que presentar el impuesto si te sale cuota a pagar, lo que en general pasa cuando tu patrimonio neto supera 700.000 €, sin contar hasta 300.000 € de tu vivienda habitual. También si tus bienes y derechos valen más de 2 millones de euros, aunque no pagues nada.
+
+Cada comunidad autónoma puede cambiar el mínimo y aplicar bonificaciones; en algunas la cuota está bonificada del todo. Por encima de 3 millones de patrimonio neto puede tocar además el Impuesto temporal de solidaridad de las grandes fortunas, que es estatal.
+
+Es un impuesto distinto de la renta y del modelo 721: presentar uno no te libra de los otros.`],
+  ['Renta', 'Herencias y donaciones', '¿Cómo tributan las criptomonedas que se heredan o se regalan?',
+`Las dos pagan el Impuesto sobre Sucesiones y Donaciones, que paga quien las recibe y que cambia mucho según la comunidad autónoma. Se valoran a su precio de mercado del día del fallecimiento o de la donación.
+
+En una herencia, la revalorización que tuvieran no tributa en la renta del fallecido. Quien hereda toma como coste el valor declarado en el impuesto de sucesiones, y desde ahí calculará su ganancia cuando venda.
+
+En una donación es distinto: quien regala tributa en su renta por la ganancia acumulada, como si las hubiera vendido, y si en lugar de ganancia hay pérdida no puede restarla. Quien las recibe paga el impuesto de donaciones y toma como coste el valor declarado.
+
+Para que alguien pueda heredar criptomonedas que estaban en una wallet propia, alguien de confianza tiene que poder acceder a las claves. Sin ellas, no hay forma de recuperarlas.`],
+  ['Cripto', 'Exchanges', '¿Cómo tributan los futuros y el trading con apalancamiento?',
+`Como ganancias y pérdidas patrimoniales en la base del ahorro, igual que vender criptomonedas: entre el 19 % y el 30 % según el tramo.
+
+Se declara el resultado de cada posición cuando se cierra, con las comisiones y los pagos de financiación (funding) que te hayan cobrado o pagado. Una liquidación es una pérdida más.
+
+Las pérdidas de futuros se compensan con las ganancias de vender criptomonedas, acciones o fondos del mismo año, y lo que sobre se arrastra cuatro años, como cualquier otra pérdida patrimonial.
+
+Lo difícil suele ser el historial: los exchanges dan los resultados de futuros en informes separados del resto de operaciones, a veces en otra moneda (USDT o la propia criptomoneda del contrato). Hay que descargarlos aparte y pasar cada resultado a euros con el precio del día en que se cobró.`],
+  ['Residencia fiscal', 'Vivo entre dos países', 'Vivo entre dos países, ¿dónde declaro mis criptomonedas?',
+`Donde seas residente fiscal. Las ganancias por vender criptomonedas tributan, en general, solo en el país de residencia.
+
+España te considera residente si pasas aquí más de 183 días al año o si aquí está el centro de tus intereses económicos, o si viven aquí tu cónyuge y tus hijos menores. El otro país tendrá sus propias reglas, y puede que los dos te consideren residente a la vez.
+
+Para ese caso, los convenios para evitar la doble imposición tienen un orden de desempate: dónde tienes una vivienda permanente, dónde está el centro de tus intereses vitales, dónde vives habitualmente y, por último, tu nacionalidad.
+
+Pide un certificado de residencia fiscal al país donde declares y guárdalo. Si Hacienda te pregunta, es la prueba principal de que tributas allí.`],
+  ['Cripto', 'Minería', '¿Cómo tributa minar criptomonedas?',
+`Si organizas tus propios medios para minar, como los equipos y la electricidad, con la idea de obtener ingresos, Hacienda lo trata como una actividad económica. Las criptomonedas que obtienes son ingresos de esa actividad por su valor en euros el día en que las recibes, y van a la base general de la renta, a tu tipo marginal.
+
+Como actividad, puedes restar los gastos necesarios: la electricidad, la amortización de los equipos o la comisión del pool. A cambio, tienes que darte de alta en Hacienda como actividad económica y, si es tu actividad habitual, también en autónomos. La minería no lleva IVA.
+
+El valor de cada criptomoneda el día que la recibes pasa a ser su coste. Cuando más adelante la vendas o la cambies, esa ganancia o pérdida va aparte, a la base del ahorro, como cualquier otra venta.
+
+Si minas de forma muy esporádica, con un solo equipo y sin organización, conviene revisar el caso: no siempre encaja como actividad económica, pero lo minado tributa igualmente al recibirlo.`],
+];
+// 20/11 (Vikn): al enviar, quien pregunta elige en dos clics «¿Sobre qué es tu pregunta?» y «Especifica un poco más el
+// tema». Las dos listas las cambia un administrador en el panel. Una categoría sin subtemas se envía con el primer clic.
+const PREG_TEMAS_DEFECTO = [
+  { tema: 'Renta', sub: ['Ganancias y pérdidas', 'Cómo se declara', 'Cartas de Hacienda', 'Patrimonio', 'Herencias y donaciones'] },
+  { tema: 'Cripto', sub: ['Exchanges', 'Staking', 'DeFi', 'Modelo 721', 'NFT', 'Minería', 'Airdrops'] },
+  { tema: 'Residencia fiscal', sub: ['Me voy de España', 'Vengo a España', 'Vivo entre dos países'] },
+  { tema: 'Otra cosa', sub: [] },
+];
+function limpiarTemasPreguntas(l) {
+  const vistos = new Set();
+  return (Array.isArray(l) ? l : []).map(x => typeof x === 'string' ? { tema: x, sub: [] } : x).filter(x => x && typeof x === 'object')
+    .map(x => ({ tema: artTxt(x.tema, 40).replace(/\s+/g, ' '), sub: [...new Set((Array.isArray(x.sub) ? x.sub : []).map(y => artTxt(y, 60).replace(/\s+/g, ' ')).filter(Boolean))].slice(0, 15) }))
+    .filter(x => x.tema && !vistos.has(x.tema) && vistos.add(x.tema)).slice(0, 12);
+}
+async function temasPreguntas() {
+  try { const [f] = await pool.execute("SELECT valor FROM ajustes WHERE clave = 'preguntas_temas'"); const l = f.length ? limpiarTemasPreguntas(JSON.parse(f[0].valor || '[]')) : []; if (l.length) return l; } catch (e) {}
+  return PREG_TEMAS_DEFECTO;
+}
+const pregParrafos = t => String(t || '').split(/\n\s*\n|\n/).map(x => x.trim()).filter(Boolean).map(x => '<p>' + artInline(x) + '</p>').join('');
+// Primer párrafo; si es largo, se corta en un espacio (nunca a mitad de palabra) y se cierra con «…»
+const pregCorta = (x, n) => x.length <= n ? x : x.slice(0, x.lastIndexOf(' ', n - 1) > n * 0.6 ? x.lastIndexOf(' ', n - 1) : n - 1).replace(/[\s,;:.]+$/, '') + '…';
+const pregPrimera = (t, n = 220) => pregCorta(artPlano(String(t || '').split(/\n/)[0]), n);
+function htmlFormPregunta(aviso, temas) {
+  const datos = JSON.stringify(temas || []).replace(/</g, '\\u003c');
+  return '<form class="pq-form" id="preguntar" method="post" action="/preguntas">' +
+    // 20/11 (Vikn): sin caja dentro de caja. Un solo campo, como una barra de chat, con el botón dentro.
+    '<div class="pq-caja"><label for="pq-texto" class="pq-vh">Tu pregunta</label><textarea id="pq-texto" name="pregunta" required minlength="8" maxlength="1500" rows="3" placeholder="Escribe aquí tu duda. Por ejemplo: ¿tengo que declarar si solo compré y no he vendido nada?"></textarea>' +
+    '<button type="submit" class="ar-btn pq-enviar">Enviar la pregunta</button></div>' +
+    '<p class="pq-error" id="pq-error" role="alert" hidden></p>' +
+    '<input type="hidden" name="tema"><input type="hidden" name="subtema">' +
+    // Sin programación en la página (raro): el tema se elige aquí
+    '<noscript><label>¿Sobre qué es?<select name="tema_sin_js">' + (temas || []).map(t => t.sub.length ? t.sub.map(x => '<option value="' + ESC_HTML(t.tema + '|' + x) + '">' + ESC_HTML(t.tema + ': ' + x) + '</option>').join('') : '<option value="' + ESC_HTML(t.tema + '|') + '">' + ESC_HTML(t.tema) + '</option>').join('') + '</select></label></noscript>' +
+    '<label class="ar-oculto" aria-hidden="true">No rellenar<input name="web" tabindex="-1" autocomplete="off"></label>' +
+    (aviso === 'gracias' ? '<p class="pq-ok" role="status">Gracias. Si es una duda que le sirve a más gente, la responderemos aquí.</p>' : aviso === 'error' ? '<p class="pq-ok" role="alert">Escribe tu pregunta, elige de qué es y vuelve a enviarla.</p>' : '') +
+    '</form>' +
+    // Al pulsar «Enviar la pregunta»: dos clics (tema y subtema) y se envía. El aviso de anonimato va en el primer paso.
+    '<dialog class="pq-aviso" id="pq-aviso" aria-labelledby="pq-paso-t"><button type="button" class="pq-cerrar" data-pq-cerrar aria-label="Cerrar">×</button><div class="pq-cuerpo"><h2 id="pq-paso-t"></h2><div class="pq-opciones" id="pq-opciones"></div>' +
+    '<button type="button" class="pq-atras" data-pq-atras hidden>← Volver</button>' +
+    '<p class="pq-nota">Tu pregunta es anónima: no pongas tu nombre, tu correo ni cifras de tu declaración. Si la respondemos, saldrá publicada aquí para que le sirva a más gente.</p></div></dialog>' +
+    '<script>' + PREG_DIALOGO_JS.replace('__TEMAS__', () => datos) + '</script>';
+}
+// 20/11 (Vikn): transiciones del diálogo, inspiradas en las del Área (Acros 8): lo que se va se funde hacia arriba y lo
+// nuevo llega desde abajo. Al elegir un tema, su pantalla emerge desde el botón pulsado: el botón se expande hasta
+// ocupar el diálogo y dentro aparecen las opciones. Sin animaciones si la persona las tiene desactivadas.
+const PREG_DIALOGO_JS = `(function(){
+var T=__TEMAS__,f=document.getElementById("preguntar"),d=document.getElementById("pq-aviso");if(!f||!d||!d.showModal)return;
+var c=d.querySelector(".pq-cuerpo"),t=document.getElementById("pq-paso-t"),o=document.getElementById("pq-opciones"),at=d.querySelector("[data-pq-atras]"),nota=d.querySelector(".pq-nota"),ok=false,ocupado=false;
+var quieto=!c.animate||(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches);
+var SUAVE="cubic-bezier(.2,.8,.2,1)";
+function enviar(tema,sub){f.elements.tema.value=tema;f.elements.subtema.value=sub||"";ok=true;d.close();if(f.requestSubmit)f.requestSubmit();else f.submit();}
+function boton(txt,fn){var b=document.createElement("button");b.type="button";b.className="pq-op";b.textContent=txt;b.addEventListener("click",function(){if(!ocupado)fn(b);});o.appendChild(b);}
+function pintar1(){t.textContent="¿Sobre qué es tu pregunta?";o.innerHTML="";at.hidden=true;nota.hidden=false;T.forEach(function(x){boton(x.tema,function(b){x.sub.length?paso2(x,b):enviar(x.tema,"");});});}
+function pintar2(x){t.textContent="Especifica un poco más el tema";o.innerHTML="";at.hidden=false;nota.hidden=true;x.sub.forEach(function(s){boton(s,function(){enviar(x.tema,s);});});}
+function foco(){var p=o.querySelector("button");if(p)p.focus();}
+function piezas(){return [].filter.call(c.children,function(el){return !el.hidden;});}
+function llegar(retraso){piezas().forEach(function(el,i){el.animate([{opacity:0,transform:"translateY(12px)"},{opacity:1,transform:"none"}],{duration:280,delay:(retraso||0)+i*40,easing:"ease",fill:"backwards"});});}
+function irse(fin){var as=piezas().map(function(el){return el.animate([{opacity:1,transform:"none"},{opacity:0,transform:"translateY(-10px)"}],{duration:200,easing:"ease",fill:"forwards"});});setTimeout(function(){fin();as.forEach(function(a){a.cancel();});},200);}
+function alto(h0,h1,ms){c.animate([{height:h0+"px"},{height:h1+"px"}],{duration:ms,easing:SUAVE});}
+function paso2(x,b){
+  if(quieto){pintar2(x);foco();return;}
+  ocupado=true;
+  var rc=c.getBoundingClientRect(),rb=b.getBoundingClientRect(),h0=rc.height,cb=getComputedStyle(b),fondo=cb.backgroundColor,borde=cb.borderTopLeftRadius;
+  b.classList.add("elegida");
+  var fuera=[].map.call(c.querySelectorAll("h2,.pq-op:not(.elegida),.pq-nota"),function(el){return el.animate([{opacity:1},{opacity:0}],{duration:160,fill:"forwards"});});
+  setTimeout(function(){
+    var fondoE=getComputedStyle(b).backgroundColor;
+    pintar2(x);fuera.forEach(function(a){a.cancel();});
+    var h1=c.getBoundingClientRect().height,arriba=rb.top-rc.top,izq=rb.left-rc.left,der=rc.right-rb.right;
+    c.style.overflow="hidden";
+    var ex=c.animate([
+      {height:h0+"px",clipPath:"inset("+arriba+"px "+der+"px "+Math.max(0,h0-(rb.bottom-rc.top))+"px "+izq+"px round "+borde+")",backgroundColor:fondoE},
+      {height:h1+"px",clipPath:"inset(0px 0px 0px 0px round 0px)",backgroundColor:"rgba(0,0,0,0)"}],{duration:460,easing:SUAVE});
+    llegar(0);
+    ex.onfinish=function(){c.style.overflow="";ocupado=false;foco();};
+  },170);
+}
+at.addEventListener("click",function(){
+  if(ocupado)return;if(quieto){pintar1();foco();return;}
+  ocupado=true;var h0=c.getBoundingClientRect().height;
+  irse(function(){pintar1();var h1=c.getBoundingClientRect().height;alto(h0,h1,300);llegar(0);setTimeout(function(){ocupado=false;foco();},320);});
+});
+d.querySelector("[data-pq-cerrar]").addEventListener("click",function(){d.close();});
+var tx=f.elements.pregunta,er=document.getElementById("pq-error"),caja=tx.closest(".pq-caja");f.noValidate=true;
+function aviso(m){er.textContent=m;er.hidden=!m;caja.classList.toggle("con-error",!!m);if(m)tx.setAttribute("aria-describedby","pq-error");else tx.removeAttribute("aria-describedby");}
+// 20/11 (Vikn): el botón no aparece hasta que la pregunta tiene al menos 8 caracteres
+// y se va oscureciendo según crece la pregunta: claro a los 8 caracteres, del todo oscuro a los 65 (solo es el color, no un límite)
+function listo(){var n=tx.value.trim().length,si=n>=8,p=Math.max(0,Math.min(1,(n-8)/57));caja.classList.toggle("esperando",!si);caja.style.setProperty("--p",p.toFixed(3));caja.classList.toggle("claro",p<.68);if(si&&!er.hidden)aviso("");}
+listo();tx.addEventListener("input",listo);
+f.addEventListener("submit",function(e){if(ok)return;e.preventDefault();var n=tx.value.trim().length;
+  if(!n){aviso("Escribe tu pregunta antes de enviarla.");tx.focus();return;}
+  if(n<8){aviso("Cuéntanos un poco más para que podamos entender tu duda (al menos 8 caracteres).");tx.focus();return;}
+  aviso("");pintar1();d.showModal();
+  if(!quieto){d.animate([{opacity:0,transform:"translateY(12px) scale(.98)"},{opacity:1,transform:"none"}],{duration:280,easing:SUAVE});}
+  foco();});
+})();`;
+async function htmlIndicePreguntas(q) {
+  const temasP = await temasPreguntas();
+  const nombresP = temasP.map(t => t.tema);
+  const tema = q.tema && /^[^<>"]{1,40}$/.test(String(q.tema)) ? String(q.tema) : '';
+  const [f] = await pool.execute("SELECT p.slug, p.titulo, p.respuesta, p.tema, p.subtema, p.publicado_en FROM preguntas p WHERE p.estado = 'publicada' ORDER BY p.publicado_en DESC LIMIT 300");
+  const temas = [...new Set((await pool.query("SELECT DISTINCT tema FROM preguntas WHERE estado = 'publicada' AND tema IS NOT NULL AND tema <> ''"))[0].map(x => x.tema))];
+  const filtros = temas.length ? '<nav class="pq-pestanas" aria-label="Filtrar por tema"><a href="/preguntas" data-tema=""' + (!tema ? ' aria-current="page"' : '') + '>Todas</a>' + nombresP.concat(temas.filter(t => !nombresP.includes(t))).filter(t => temas.includes(t)).map(t => '<a href="/preguntas?tema=' + encodeURIComponent(t) + '" data-tema="' + ESC_HTML(t) + '"' + (t === tema ? ' aria-current="page"' : '') + '>' + ESC_HTML(t) + '</a>').join('') + '</nav>' +
+    // 20/11 (Vikn): cambiar de tema sin recargar; la raya de la pestaña anterior se encoge y la nueva crece
+    '<script>(function(){var n=document.querySelector(".pq-pestanas");if(!n)return;' +
+    'function ir(t,p){n.querySelectorAll("a[data-tema]").forEach(function(a){if(a.getAttribute("data-tema")===t)a.setAttribute("aria-current","page");else a.removeAttribute("aria-current");});' +
+    'document.querySelectorAll(".pq-lista > li").forEach(function(li){li.hidden=!!t&&li.getAttribute("data-tema")!==t;});' +
+    'if(p&&/^\\/preguntas\\/?$/.test(location.pathname))history.pushState({t:t},"","/preguntas"+(t?"?tema="+encodeURIComponent(t):""));}' +
+    'n.addEventListener("click",function(e){var a=e.target.closest("a[data-tema]");if(!a||e.metaKey||e.ctrlKey||e.shiftKey)return;e.preventDefault();ir(a.getAttribute("data-tema"),true);});' +
+    'window.addEventListener("popstate",function(e){ir((e.state&&e.state.t)||new URLSearchParams(location.search).get("tema")||"",false);});})();</script>' : '';
+  const lista = f.length ? '<ol class="pq-lista">' + f.map(x => '<li data-tema="' + ESC_HTML(x.tema || '') + '"' + (tema && x.tema !== tema ? ' hidden' : '') + '><a class="t" href="/preguntas/' + x.slug + '">' + ESC_HTML(x.titulo) + '</a><p>' + ESC_HTML(pregPrimera(x.respuesta)) + '</p><small class="pq-meta">' + [[x.tema, x.subtema].filter(Boolean).join(' › '), 'Respondida el ' + artFecha(x.publicado_en)].filter(Boolean).map(t => '<span>' + ESC_HTML(t) + '</span>').join('') + '</small></li>').join('') + '</ol>'
+    : '<p style="margin-top:20px">Todavía no hay preguntas respondidas' + (tema ? ' de este tema' : '') + '. La tuya puede ser la primera.</p>';
+  const cuerpo = '<div class="pq-rej"><div class="pq-principal"><header class="pq-cab"><h1 class="ar-h1">¡Te respondemos!</h1><p class="ar-entr">Pregúntanos tus dudas sobre criptos e impuestos, ¡te las respondemos!</p></header>' +
+    htmlFormPregunta(q.pregunta, temasP) + filtros + lista + '</div>' + await htmlLadoPreguntas({ temaActual: tema }) + '</div>';
+  const base = artUrlBase();
+  // 20/11 (Vikn): la frase descriptiva no se enseña en la página (a la vista parece hecha con IA), pero la leen buscadores
+  // e IA en la descripción, en estos datos estructurados y en /preguntas.md. Nada de texto oculto en la página.
+  const jsonld = [{ '@context': 'https://schema.org', '@type': 'CollectionPage', name: 'Preguntas y respuestas sobre criptomonedas e impuestos', description: PREG_DESCRIPCION, url: base + '/preguntas', inLanguage: 'es-ES',
+    about: PREG_SOBRE.map(name => ({ '@type': 'Thing', name })), publisher: { '@type': 'Organization', name: 'Acros', url: base, description: ACROS_ORG_DESC, knowsAbout: PREG_SOBRE }, hasPart: f.slice(0, 50).map(x => ({ '@type': 'QAPage', name: x.titulo, url: base + '/preguntas/' + x.slug })) }];
+  return marco({ titulo: 'Preguntas y respuestas sobre criptomonedas e impuestos | Acros', descripcion: PREG_META, canonico: '/preguntas' + (tema ? '?tema=' + encodeURIComponent(tema) : ''), cuerpo: '<style>' + PREG_CSS + '</style>' + cuerpo, jsonld, md: '/preguntas.md', actual: 'preguntas' });
+}
+const PREG_DESCRIPCION = 'Preguntas reales sobre criptomonedas e impuestos en España (renta, modelo 721, staking, DeFi, exchanges, residencia fiscal), respondidas por los asesores de Acros, asesoría fiscal especializada en cripto con economista colegiado en el Colegio de Economistas de Madrid.';
+// Lo que enseña Google debajo del título (unos 150 caracteres): palabras clave y quién responde, en tono natural
+const PREG_META = 'Dudas reales sobre criptomonedas e impuestos en España: renta, modelo 721, staking, DeFi y residencia fiscal. Las responden los asesores de Acros.';
+// 20/11 (Vikn): colegiado en el Colegio de Economistas de Madrid. Solo el colegio; el número no se publica en ningún sitio.
+const ACROS_ORG_DESC = 'Asesoría fiscal especializada en criptomonedas, con economista colegiado en el Colegio de Economistas de Madrid.';
+const PREG_SOBRE = ['Fiscalidad de las criptomonedas en España', 'IRPF y criptomonedas', 'Modelo 721', 'Staking', 'DeFi', 'Exchanges de criptomonedas', 'Residencia fiscal'];
+async function mdIndicePreguntas() {
+  const [f] = await pool.execute("SELECT slug, titulo, respuesta, tema, subtema FROM preguntas WHERE estado = 'publicada' ORDER BY tema, publicado_en DESC LIMIT 500");
+  const b = artUrlBase(), l = ['# Preguntas y respuestas sobre criptomonedas e impuestos', '', PREG_DESCRIPCION + ' Cualquiera puede preguntar de forma anónima en ' + b + '/preguntas; las respuestas las escribe y firma el equipo de asesores de Acros.', ''];
+  let tema = null;
+  for (const x of f) { if (x.tema !== tema) { tema = x.tema; l.push('## ' + (tema || 'Otras'), ''); } l.push('- [' + x.titulo + '](' + b + '/preguntas/' + x.slug + '.md)' + (x.subtema ? ' (' + x.subtema + ')' : '') + ': ' + pregPrimera(x.respuesta)); }
+  if (tema !== null) l.push('');
+  l.push('---', 'Acros, asesoría fiscal especializada en criptomonedas, con economista colegiado en el Colegio de Economistas de Madrid | ' + b);
+  return l.join('\n');
+}
+function jsonLdPregunta(x, autor) {
+  const base = artUrlBase(), url = base + '/preguntas/' + x.slug;
+  return [{
+    '@context': 'https://schema.org', '@type': 'QAPage', url, inLanguage: 'es-ES',
+    mainEntity: {
+      '@type': 'Question', name: x.titulo, text: x.titulo, answerCount: 1, dateCreated: artIso(x.creado_en),
+      acceptedAnswer: { '@type': 'Answer', text: artPlano(x.respuesta), datePublished: artIso(x.publicado_en), dateModified: artIso(x.actualizado_en || x.publicado_en), url,
+        author: autor ? { '@type': 'Person', name: autor.nombre, jobTitle: autor.puesto, worksFor: { '@type': 'Organization', name: 'Acros' } } : { '@type': 'Organization', name: 'Acros' } },
+    },
+  }, { '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [
+    { '@type': 'ListItem', position: 1, name: 'Preguntas y respuestas', item: base + '/preguntas' }, { '@type': 'ListItem', position: 2, name: x.titulo, item: url }] }];
+}
+async function htmlPregunta(x, autor) {
+  const foto = autor && autor.foto ? '<img src="/api/web/imagen/' + ESC_HTML(autor.foto) + '" alt="">' : '<span class="sin" aria-hidden="true"></span>';
+  const cuerpo = '<div class="pq-rej"><div class="pq-principal"><nav class="ar-ruta" aria-label="Ruta"><a href="/preguntas">Preguntas y respuestas</a> <span aria-hidden="true">›</span> ' + (x.tema ? '<a href="/preguntas?tema=' + encodeURIComponent(x.tema) + '">' + ESC_HTML(x.tema) + '</a>' + (x.subtema ? ' <span aria-hidden="true">›</span> ' + ESC_HTML(x.subtema) : '') : 'Pregunta') + '</nav>' +
+    '<h1 class="ar-h1" style="max-width:820px">' + ESC_HTML(x.titulo) + '</h1>' +
+    '<section class="pq-resp ar-cuerpo">' + pregParrafos(x.respuesta) +
+    '<div class="pq-firma">' + foto + '<span>' + (autor ? 'Responde <strong style="color:var(--titular)">' + ESC_HTML(autor.nombre) + '</strong>, ' + ESC_HTML(autor.puesto) + '<br>' : 'Responde el equipo de Acros<br>') + 'Respondida el ' + artFecha(x.publicado_en) + (x.actualizado_en && artFecha(x.actualizado_en) !== artFecha(x.publicado_en) ? '. Actualizada el ' + artFecha(x.actualizado_en) : '') + '</span></div></section>' +
+    '<section class="pq-otra"><h2 style="margin:0 0 8px;font-size:17px;color:var(--titular)">¿Tienes otra duda?</h2>' + htmlFormPregunta('', await temasPreguntas()) + '</section></div>' + await htmlLadoPreguntas({ x }) + '</div>' +
+    '<section class="ar-franja"><span>¿Cuánto pagarías tú si el año acabara hoy?</span><a class="ar-btn claro" href="/simulador">Probar SimulAcros</a></section>';
+  return marco({ titulo: x.titulo + ' | Acros', descripcion: pregPrimera(x.respuesta, 155), canonico: '/preguntas/' + x.slug, cuerpo: '<style>' + PREG_CSS + '</style>' + cuerpo, jsonld: jsonLdPregunta(x, autor), md: '/preguntas/' + x.slug + '.md', actual: 'preguntas' });
+}
+function mdPregunta(x, autor) {
+  return ['# ' + x.titulo, '', 'Fuente: ' + artUrlBase() + '/preguntas/' + x.slug + (autor ? ' | Responde: ' + autor.nombre + ', ' + autor.puesto : '') + ' | Respondida: ' + artFecha(x.publicado_en), '',
+    String(x.respuesta || ''), '', '---', 'Acros, asesoría fiscal especializada en criptomonedas, con economista colegiado en el Colegio de Economistas de Madrid | ' + artUrlBase() + ' | Más preguntas: ' + artUrlBase() + '/preguntas'].join('\n');
+}
+async function preguntaPublica(slug) {
+  const [f] = await pool.execute("SELECT * FROM preguntas WHERE slug = ? AND estado = 'publicada'", [slug]);
+  return f[0] || null;
+}
+app.get('/preguntas', async (req, res) => { try { enviarHtml(res, await htmlIndicePreguntas(req.query || {})); } catch (e) { console.error('Preguntas:', e); res.status(500).send('Error'); } });
+app.post('/preguntas', artFormulario, async (req, res) => {
+  const vuelta = que => res.redirect(303, '/preguntas?pregunta=' + que + '#preguntar');
+  try {
+    const b = req.body || {};
+    if (String(b.web || '').trim()) return vuelta('gracias');
+    const texto = artTxt(b.pregunta, 1500), temasP = await temasPreguntas();
+    let [tTema, tSub] = [String(b.tema || ''), String(b.subtema || '')];
+    if (!tTema && b.tema_sin_js) [tTema, tSub] = String(b.tema_sin_js).split('|');
+    const cat = temasP.find(t => t.tema === tTema), tema = cat ? cat.tema : '', subtema = cat && cat.sub.includes(tSub) ? tSub : '';
+    if (texto.length < 8 || !tema || (cat.sub.length && !subtema)) return vuelta('error');
+    if (!frenoComentario(String(req.get('x-acros-ip') || ipFreno(req) || '').slice(0, 64))) return vuelta('gracias');
+    await pool.execute('INSERT INTO preguntas (original, tema, subtema) VALUES (?, ?, ?)', [texto, tema, subtema || null]);
+    avisarAdmin('Nueva pregunta en la web', 'Alguien ha enviado una pregunta. Respóndela en el panel: Artículos y guías → Preguntas.');
+    vuelta('gracias');
+  } catch (e) { console.error('Pregunta:', e); vuelta('error'); }
+});
+app.get('/preguntas.md', async (req, res) => {
+  try { res.set({ 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(await mdIndicePreguntas()); } catch (e) { console.error('Preguntas md:', e); res.status(500).type('text/plain').send('Error'); }
+});
+app.get('/preguntas/:slug([a-z0-9-]{1,120}).md', async (req, res) => {
+  const x = await preguntaPublica(req.params.slug); if (!x) return res.status(404).type('text/plain').send('No encontrado');
+  res.set({ 'Content-Type': 'text/markdown; charset=utf-8', 'Cache-Control': 'public, max-age=300' }).send(mdPregunta(x, await autorPublico(x.respondida_por_asesor_id)));
+});
+app.get('/preguntas/:slug([a-z0-9-]{1,120})', async (req, res) => {
+  try {
+    const x = await preguntaPublica(req.params.slug);
+    if (!x) return enviarHtml(res, marco({ titulo: 'No encontrado | Acros', descripcion: '', canonico: '/preguntas', cuerpo: '<h1 class="ar-h1">Esta pregunta no existe</h1><p><a href="/preguntas">Ver todas las preguntas</a></p>', actual: 'preguntas' }), 404);
+    enviarHtml(res, await htmlPregunta(x, await autorPublico(x.respondida_por_asesor_id)));
+  } catch (e) { console.error('Pregunta:', e); res.status(500).send('Error'); }
+});
+
+// ---- Panel: preguntas
+async function pregSlugLibre(base, id) {
+  let s = (base || 'pregunta').slice(0, 110), n = 1;
+  for (;;) { const [f] = await pool.execute('SELECT id FROM preguntas WHERE slug = ? AND id <> ?', [s, id]); if (!f.length) return s; n++; s = base.slice(0, 105) + '-' + n; }
+}
+app.get('/api/admin/preguntas', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.query(`SELECT p.*, COALESCE(pe.nombre, a.nombre) respondio FROM preguntas p LEFT JOIN asesores a ON a.id = p.respondida_por_asesor_id LEFT JOIN personas pe ON pe.asesor_id = a.id AND pe.activa = 1
+    ORDER BY FIELD(p.estado, 'nueva', 'respondida', 'publicada', 'descartada'), p.creado_en DESC LIMIT 500`);
+  res.json({ preguntas: f.map(x => ({ id: x.id, original: x.original, titulo: x.titulo, respuesta: x.respuesta, tema: x.tema, subtema: x.subtema, destacada: !!x.destacada, estado: x.estado, slug: x.slug, respondio: x.respondio, creado_en: x.creado_en, publicado_en: x.publicado_en })), temas: await temasPreguntas(), es_admin: !!req.asesor.esAdmin,
+    lecturas: (await lecturasPreguntas()).map(e => ({ tipo: e.tipo, slug: e.slug })), lecturas_opciones: (await enlacesPublicados()).map(e => ({ tipo: e.tipo, slug: e.slug, titulo: e.d.titulo || e.slug })) });
+});
+// 20/11 (2): destacar una pregunta publicada («Las más preguntadas», columna de la derecha). Solo administradores.
+app.post('/api/admin/preguntas/:id(\\d+)/destacar', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador' });
+  const si = !!(req.body || {}).destacada;
+  if (si) { const [[n]] = await pool.query("SELECT COUNT(*) n FROM preguntas WHERE destacada = 1 AND estado = 'publicada' AND id <> ?", [Number(req.params.id)]); if (n.n >= 5) return res.status(400).json({ error: 'Ya hay 5 destacadas. Quita una antes.' }); }
+  await pool.execute('UPDATE preguntas SET destacada = ? WHERE id = ?', [si ? 1 : 0, Number(req.params.id)]);
+  res.json({ ok: true, destacada: si });
+});
+// «Para leer con calma»: hasta 3 artículos o guías publicados. Lista vacía: el bloque no sale.
+app.put('/api/admin/preguntas-lecturas', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador' });
+  const pub = await enlacesPublicados(), vistos = new Set();
+  const l = (Array.isArray((req.body || {}).lecturas) ? req.body.lecturas : []).filter(x => x && pub.some(e => e.tipo === x.tipo && e.slug === x.slug) && !vistos.has(x.tipo + x.slug) && vistos.add(x.tipo + x.slug)).map(x => ({ tipo: x.tipo, slug: x.slug })).slice(0, 3);
+  await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('preguntas_lecturas', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [JSON.stringify(l)]);
+  res.json({ ok: true, lecturas: l });
+});
+// Guardar la respuesta (cualquiera del equipo). Con publicar: true, la publica (solo un administrador).
+app.put('/api/admin/preguntas/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.execute('SELECT * FROM preguntas WHERE id = ?', [Number(req.params.id)]); if (!f.length) return res.status(404).json({ error: 'No existe' });
+  const x = f[0], b = req.body || {};
+  const titulo = artTxt(b.titulo, 200).replace(/\s+/g, ' '), respuesta = artTxt(b.respuesta, 6000), tema = (await temasPreguntas()).some(t => t.tema === b.tema) || b.tema === x.tema ? artTxt(b.tema, 40) : '', subtema = artTxt(b.subtema, 60);
+  if (!titulo || !respuesta) return res.status(400).json({ error: 'Escribe la pregunta tal como se publicará y su respuesta' });
+  const publicar = !!b.publicar || x.estado === 'publicada';
+  if (publicar && !req.asesor.esAdmin) return res.status(403).json({ error: 'La publica un administrador. Guarda la respuesta y avísale.' });
+  const slug = x.slug || await pregSlugLibre(artSlug(titulo), x.id);
+  await pool.execute(`UPDATE preguntas SET titulo = ?, respuesta = ?, tema = ?, subtema = ?, slug = ?, respondida_por_asesor_id = COALESCE(respondida_por_asesor_id, ?),
+      estado = ?, publicado_en = IF(? AND publicado_en IS NULL, NOW(), publicado_en), actualizado_en = IF(estado = 'publicada', NOW(), actualizado_en) WHERE id = ?`,
+    [titulo, respuesta, tema || null, subtema || null, slug, req.asesor.id, publicar ? 'publicada' : 'respondida', publicar ? 1 : 0, x.id]);
+  res.json({ ok: true, estado: publicar ? 'publicada' : 'respondida', url: '/preguntas/' + slug });
+});
+app.post('/api/admin/preguntas/:id(\\d+)/:que(descartar|retirar)', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador' });
+  await pool.execute('UPDATE preguntas SET estado = ? WHERE id = ?', [req.params.que === 'descartar' ? 'descartada' : 'respondida', Number(req.params.id)]);
+  res.json({ ok: true });
+});
+// Temas de las preguntas (solo administradores): la lista entre la que elige quien pregunta
+app.put('/api/admin/preguntas-temas', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador' });
+  const l = limpiarTemasPreguntas((req.body || {}).temas);
+  if (!l.length) return res.status(400).json({ error: 'Pon al menos un tema' });
+  await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('preguntas_temas', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [JSON.stringify(l)]);
+  res.json({ ok: true, temas: l });
+});
+app.delete('/api/admin/preguntas/:id(\\d+)', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin) return res.status(403).json({ error: 'Solo un administrador' });
+  await pool.execute('DELETE FROM preguntas WHERE id = ?', [Number(req.params.id)]);
   res.json({ ok: true });
 });
 
@@ -9923,6 +11119,13 @@ async function prepararFormatosArchivo() {
   await agregaColumnaSiFalta('documentos_fiscales', '`nombre_anterior`', 'VARCHAR(255) NULL');   // 03/11: nombre que tenía antes de que el asesor lo renombrara
   await agregaColumnaSiFalta('documentos_fiscales', '`renombrado_en`', 'DATETIME NULL');
   await agregaColumnaSiFalta('propuestas', '`amplia_a`', 'INT NULL');   // 05/11: la propuesta amplía este encargo aceptado
+  // 18/11: corregir el importe de un encargo aceptado y sin pagar (el cliente lo acepta antes de pagar)
+  await agregaColumnaSiFalta('propuestas', '`importe_corregido_en`', 'DATETIME NULL');
+  await agregaColumnaSiFalta('propuestas', '`importe_aceptado_en`', 'DATETIME NULL');
+  await pool.execute(`CREATE TABLE IF NOT EXISTS propuestas_correcciones (
+    id INT AUTO_INCREMENT PRIMARY KEY, propuesta_id INT NOT NULL, importe_antes INT NOT NULL, importe_despues INT NOT NULL,
+    servicios_antes JSON NULL, servicios_despues JSON NULL, motivo VARCHAR(500) NOT NULL, asesor_id INT NULL,
+    creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, aceptada_en DATETIME NULL, INDEX (propuesta_id))`);
 }
 const limpiaLista = (xs, max) => (Array.isArray(xs) ? xs : []).map(x => String(x || '').trim().toLowerCase().slice(0, 120)).filter(Boolean).slice(0, max);
 function filaFormato(f) {
@@ -10037,11 +11240,20 @@ const FORMULARIOS = ['cripto'];
 const ANIO_ACTUAL = new Date().getFullYear();
 const op = (id, t, extra) => Object.assign({ id, t, s: '', mapa: true, img: null, burbujas: null }, extra || {});
 const PLANTILLA_DEF = { izq: ['paso', 'pregunta', 'respuestas', 'recordatorio', 'info'], der: ['nube'], anchoIzq: 62, zona: 330, aire: { paso: 0, pregunta: 0, respuestas: 22, recordatorio: 14, info: 16, nube: 0 } };
-const EXCHANGES = ['Binance', 'Coinbase', 'Kraken', 'Bit2Me', 'Bitpanda', 'Revolut', 'KuCoin', 'Bybit', 'OKX', 'Crypto.com', 'Bitget', 'eToro', 'Trade Republic', 'Bitstamp', 'Gate.io', 'Otros'];
+// 18/11 (Vikn): 11 + «Otros» (3 filas de 4), para que quepan sin desplazarse; Bitstamp, Gate.io, Bitget y KuCoin pasan a «Otros»
+const EXCHANGES = ['Binance', 'Coinbase', 'Kraken', 'Bit2Me', 'Bitpanda', 'Revolut', 'Bybit', 'OKX', 'Crypto.com', 'eToro', 'Trade Republic', 'Otros'];
+const EXCHANGES_A_OTROS = ['Bitstamp', 'Gate.io', 'Bitget', 'KuCoin'], WALLETS_A_OTRAS = ['SafePal', 'Electrum', 'Atomic Wallet'];
 const REDES = ['Bitcoin', 'Ethereum', 'BNB Chain', 'Solana', 'Tron', 'Cardano', 'Hyperliquid', 'Polygon', 'Arbitrum', 'Base', 'Optimism', 'Otras'];
 // 11/11: las «más» (mas: true) solo se ven al marcar «Otros»/«Otras»; en el cierre del expediente se buscan todas
-const EXCHANGES_MAS = ['Bitfinex', 'Gemini', 'HTX (Huobi)', 'MEXC', 'Phemex', 'Deribit', 'BitMart', 'Poloniex', 'Bitvavo', 'Young Platform', 'Bitso', 'Nexo', 'Celsius', 'BlockFi', 'FTX', 'Binance US', 'LBank', 'CEX.IO', 'Pionex', 'BingX', 'BloFin', '3Commas', 'Quantfury', 'Exodus', 'Ledger Live', 'Trust Wallet', 'MetaMask', 'Uphold', 'Bitget Wallet', 'Coinbase Wallet'];
+const EXCHANGES_MAS = ['Bitstamp', 'Gate.io', 'Bitget', 'KuCoin', 'Bitfinex', 'Gemini', 'HTX (Huobi)', 'MEXC', 'Phemex', 'Deribit', 'BitMart', 'Poloniex', 'Bitvavo', 'Young Platform', 'Bitso', 'Nexo', 'Celsius', 'BlockFi', 'FTX', 'Binance US', 'LBank', 'CEX.IO', 'Pionex', 'BingX', 'BloFin', '3Commas', 'Quantfury', 'Uphold'];   // 16/11 (Vikn): las wallets salen de aquí: van en «¿Qué wallets has usado?»
 const REDES_MAS = ['Avalanche', 'Lightning', 'Cosmos', 'Osmosis', 'Polkadot', 'Near', 'Aptos', 'Sui', 'Sei', 'Injective', 'TON', 'Berachain', 'Sonic (Fantom)', 'Gnosis', 'zkSync Era', 'Linea', 'Scroll', 'Starknet', 'Blast', 'Mantle', 'Unichain', 'Ink', 'Soneium', 'World Chain', 'Zora', 'Abstract', 'Celo', 'Cronos', 'Ronin', 'Immutable', 'Manta', 'Metis', 'Kava', 'Moonbeam', 'Hedera', 'Algorand', 'Tezos', 'XRP Ledger', 'Stellar', 'Litecoin', 'Kaspa', 'Mode', 'Taiko', 'Monad'];
+// 16/11 (Vikn): wallets (monederos) para la pregunta «¿Qué wallets has usado?» de la batería 2
+const WALLETS = ['MetaMask', 'Ledger', 'Trezor', 'Trust Wallet', 'Exodus', 'Phantom', 'Coinbase Wallet', 'Rabby', 'Bitget Wallet', 'OKX Wallet', 'Tangem', 'Otras'];   // 18/11: 11 + «Otras»
+const WALLETS_MAS = ['SafePal', 'Electrum', 'Atomic Wallet', 'Binance Web3 Wallet', 'Rainbow', 'Zerion', 'Safe', 'Argent', 'Uniswap Wallet', 'Brave Wallet', 'Blockchain.com', 'Zengo', 'Guarda', 'Coinomi', 'MyEtherWallet',
+  'Keplr', 'Leap', 'Solflare', 'Backpack', 'TronLink', 'Tonkeeper', 'Petra', 'Sui Wallet', 'Yoroi', 'Eternl', 'Daedalus', 'Talisman', 'Polkadot.js', 'Kaspium', 'Sweat Wallet',
+  'Sparrow', 'BlueWallet', 'Wasabi', 'Muun', 'Ellipal', 'Keystone', 'BitBox', 'Coldcard', 'Arculus'];
+const preguntaWallets = () => { const b = (n, g, r) => ({ t: n, grupo: g, r: r || 28 }); return { id: 'wallets', texto: '¿Qué wallets has usado?', tipo: 'varias', forma: 'rejilla', col: 4, dep: { pregunta: 'donde', respuestas: ['wallet'] },
+  opciones: WALLETS.map(t => op(slug(t), t, { burbujas: [b(t, 'wallet', 20)] })).concat(WALLETS_MAS.map(t => op(slug(t), t, { mas: true, burbujas: [b(t, 'wallet', 18)] }))) }; };
 const slug = t => String(t).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 function definicionInicialCripto() {
   const b = (n, g, r) => ({ t: n, grupo: g, r: r || 28 });
@@ -10052,7 +11264,7 @@ function definicionInicialCripto() {
         intro: ['<b>Son {n} preguntas y se responden en un minuto.</b> Con ellas preparamos tu propuesta sin tener que llamarte.',
                 '<b>No es un examen.</b> Si dudas, elige lo que más se parezca a tu caso. Cuanto más sincero seas, más rápido y más barato será tu servicio.',
                 '<b>Si alguna respuesta no es exacta, no pasa nada:</b> lo veremos al revisar tus documentos. Eso sí, nos llevará más tiempo entender tu caso y el servicio podría encarecerse.'],
-        espera: 10, recordatorio: 'Responder con sinceridad hace tu servicio más rápido y más barato.', plantilla: PLANTILLA_DEF,
+        espera: 10, recordatorio: 'Recuerda: responder con sinceridad hace tu servicio más rápido y más barato.', plantilla: PLANTILLA_DEF,
         preguntas: [
           { id: 'anio', texto: '¿Desde qué año tienes criptomonedas?', tipo: 'anio', forma: 'barra', desde: 2013, hasta: ANIO_ACTUAL, nota: 'Si no recuerdas el año exacto, elige el más cercano.',
             expl: 'Nos dice cuántos años de historial habrá que revisar. Cuenta la primera vez que compraste o recibiste cualquier criptomoneda, aunque fuera una cantidad pequeña o una prueba.', opciones: [] },
@@ -10076,7 +11288,7 @@ function definicionInicialCripto() {
       { id: 's-solicitud', tipo: 'sistema', nombre: 'Solicitud de presupuesto' },
       { id: 's-cuenta', tipo: 'sistema', nombre: 'Crear la cuenta' },
       { id: 'b2', tipo: 'bateria', nombre: 'Batería 2 · Para tu presupuesto', donde: 'area', obligatoria: true, intro: [], espera: 0,
-        recordatorio: 'Responder con sinceridad hace tu servicio más rápido y más barato.', plantilla: PLANTILLA_DEF,
+        recordatorio: 'Recuerda: responder con sinceridad hace tu servicio más rápido y más barato.', plantilla: PLANTILLA_DEF,
         preguntas: [
           { id: 'exchanges', texto: '¿En qué exchanges o apps has operado?', tipo: 'varias', forma: 'rejilla', col: 4, opciones: EXCHANGES.map(t => op(slug(t), t, { burbujas: [b(t, 'cex', 22)] })).concat(EXCHANGES_MAS.map(t => op(slug(t), t, { mas: true, burbujas: [b(t, 'cex', 20)] }))) },
           { id: 'ventas', texto: '¿Has vendido o cambiado criptomonedas?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media', opciones: [op('si', 'Sí', { s: 'Por euros o por otras criptos', burbujas: [b('Ventas', 'base', 20)] }), op('no', 'No', { mapa: false }), op('nose', 'No estoy seguro', { mapa: false })] },
@@ -10085,14 +11297,15 @@ function definicionInicialCripto() {
             opciones: [op('cex', 'En exchanges', { mapa: false }), op('defi', 'En plataformas DeFi', { burbujas: [b('Futuros DeFi', 'cadena', 18)] }), op('ambos', 'En ambos', { burbujas: [b('Futuros DeFi', 'cadena', 18)] })] },
           { id: 'valor', texto: '¿Cuánto valían tus criptos a 31 de diciembre del año pasado?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media', expl: 'Solo para saber si debes presentar el modelo 721 o el Impuesto sobre el Patrimonio.',
             opciones: [op('menos50', 'Menos de 50.000 €', { mapa: false }), op('50a700', 'De 50.000 a 700.000 €', { mapa: false }), op('mas700', 'Más de 700.000 €', { mapa: false })] },
+          preguntaWallets(),
           { id: 'redes', texto: '¿Qué redes has usado?', tipo: 'varias', forma: 'rejilla', col: 4, dep: { pregunta: 'donde', respuestas: ['wallet'] }, opciones: REDES.map(t => op(slug(t), t, { burbujas: [b(t, 'cadena', 20)] })).concat(REDES_MAS.map(t => op(slug(t), t, { mas: true, burbujas: [b(t, 'cadena', 18)] }))) },
           { id: 'fuera', texto: '¿Qué has hecho fuera de los exchanges?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'donde', respuestas: ['wallet'] },
             opciones: ['Staking', 'Préstamos (lending)', 'Pools de liquidez', 'Airdrops', 'Presales', 'NFTs', 'Intercambios en DEX'].map(t => op(slug(t), t, { burbujas: [b(t, 'cadena', 17)] })) },
           { id: 'forma', texto: '¿De qué forma recibiste esas criptos?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'recibidas', respuestas: ['si'] },
             opciones: ['Staking o recompensas', 'Airdrops', 'Préstamos', 'Minería', 'Pagos por un trabajo o servicio'].map(t => op(slug(t), t, { burbujas: [b(t, 'ingresos', 16)] })) },
-          { id: 'que_paso', texto: '¿Qué pasó?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'problema', respuestas: ['si'] },
+          { id: 'que_paso', texto: 'Nos has comentado que ocurrió algo con tus criptos. ¿Qué pasó exactamente?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'problema', respuestas: ['si'] },
             opciones: ['Un exchange cerró o quebró', 'Perdí el acceso', 'Estafa', 'Hackeo'].map(t => op(slug(t), t, { mapa: false })) },
-          { id: 'denuncia', texto: '¿Tienes denuncia policial?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'media', dep: { pregunta: 'que_paso', respuestas: ['estafa'] }, opciones: [op('si', 'Sí', { mapa: false }), op('no', 'No', { mapa: false })] },
+          { id: 'denuncia', texto: '¿Tienes denuncia policial sobre la estafa?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'media', dep: { pregunta: 'que_paso', respuestas: ['estafa'] }, opciones: [op('si', 'Sí', { mapa: false }), op('no', 'No', { mapa: false })] },
           { id: 'comentario', texto: '¿Algo más que quieras contarnos?', tipo: 'texto', forma: 'texto', opciones: [] }
         ] },
       { id: 's-propuesta', tipo: 'sistema', nombre: 'Propuesta' },
@@ -10118,6 +11331,59 @@ async function prepararFormularios() {
     const [h] = await pool.query('SELECT 1 FROM formularios_def WHERE formulario = ? LIMIT 1', [f]);
     if (!h.length) await pool.query('INSERT INTO formularios_def (formulario, version, definicion, nota) VALUES (?, 1, ?, ?)', [f, JSON.stringify(definicionInicialCripto()), 'Versión inicial']);
   }
+  await anadirPreguntaWallets();
+  await walletsFueraDeExchanges();
+  await menosEnPantalla();
+}
+// 16/11 (Vikn): Exodus, Ledger Live, Trust Wallet, MetaMask, Bitget Wallet y Coinbase Wallet son wallets: salen de la pregunta de
+// exchanges (una vez, como versión nueva; quien ya las eligió las sigue viendo en sus respuestas). Ledger Live queda como «Ledger».
+const WALLETS_EN_EXCHANGES = ['exodus', 'ledger-live', 'trust-wallet', 'metamask', 'bitget-wallet', 'coinbase-wallet'];
+// 18/11 (Vikn): exchanges y wallets, 11 + «Otros» para que quepan en 3 filas sin desplazarse. Entra UNA vez como versión nueva; lo que
+// el equipo cambie después en el editor (la casilla «Solo se ve con Otros» y el orden) se respeta.
+async function menosEnPantalla() {
+  const nota = 'Exchanges y wallets: 11 a la vista, el resto en «Otros»';
+  const [ya] = await pool.query("SELECT 1 FROM formularios_def WHERE formulario = 'cripto' AND nota = ? LIMIT 1", [nota]);
+  if (ya.length) return;
+  const d = await leerDefinicion('cripto'); if (!d) return;
+  const qs = d.flujo.flatMap(p => p.preguntas || []); let cambia = false;
+  [['exchanges', EXCHANGES_A_OTROS], ['wallets', WALLETS_A_OTRAS]].forEach(([id, nombres]) => {
+    const q = qs.find(x => x.id === id); if (!q || !Array.isArray(q.opciones)) return;
+    const pasan = q.opciones.filter(o => nombres.includes(o.t) && !o.mas); if (!pasan.length) return;
+    pasan.forEach(o => { o.mas = true; }); cambia = true;
+    // a la vista primero (con «Otros» al final); detrás, las de «Otros», empezando por las que acaban de pasar
+    const vista = q.opciones.filter(o => !o.mas), mas = q.opciones.filter(o => o.mas);
+    q.opciones = vista.concat(pasan, mas.filter(o => !pasan.includes(o)));
+  });
+  if (!cambia) return;
+  const version = d.version + 1; delete d.version;
+  await pool.query('INSERT IGNORE INTO formularios_def (formulario, version, definicion, nota) VALUES (?, ?, ?, ?)', ['cripto', version, JSON.stringify(d), nota]);
+  console.log('Formularios: ' + nota + ' (versión ' + version + ')');
+}
+async function walletsFueraDeExchanges() {
+  const [ya] = await pool.query("SELECT 1 FROM formularios_def WHERE formulario = 'cripto' AND nota = 'Wallets fuera de la pregunta de exchanges' LIMIT 1");
+  if (ya.length) return;
+  const d = await leerDefinicion('cripto'); if (!d) return;
+  const qs = d.flujo.flatMap(p => p.preguntas || []), ex = qs.find(q => q.id === 'exchanges');
+  if (!ex || !qs.some(q => q.id === 'wallets') || !(ex.opciones || []).some(o => WALLETS_EN_EXCHANGES.includes(o.id))) return;
+  ex.opciones = ex.opciones.filter(o => !WALLETS_EN_EXCHANGES.includes(o.id));
+  const version = d.version + 1; delete d.version;
+  await pool.query('INSERT IGNORE INTO formularios_def (formulario, version, definicion, nota) VALUES (?, ?, ?, ?)', ['cripto', version, JSON.stringify(d), 'Wallets fuera de la pregunta de exchanges']);
+  console.log('Formularios: wallets fuera de la pregunta de exchanges (versión ' + version + ')');
+}
+// 16/11 (Vikn): la pregunta de las wallets entra UNA vez como versión nueva en el formulario que ya está en marcha (justo antes de
+// «¿Qué redes has usado?»). Si alguna versión ya la tuvo, no se vuelve a poner (si el equipo la quita en el editor, se respeta).
+async function anadirPreguntaWallets() {
+  const [ya] = await pool.query("SELECT 1 FROM formularios_def WHERE formulario = 'cripto' AND definicion LIKE '%\"id\":\"wallets\"%' LIMIT 1");
+  if (ya.length) return;
+  const d = await leerDefinicion('cripto'); if (!d) return;
+  const b2 = d.flujo.find(p => p.id === 'b2'); if (!b2 || !Array.isArray(b2.preguntas)) return;
+  const usados = new Set(d.flujo.flatMap(p => (p.preguntas || []).map(q => q.id))); if (usados.has('wallets')) return;
+  const i = b2.preguntas.findIndex(q => q.id === 'redes'), k = i >= 0 ? i : Math.max(0, b2.preguntas.findIndex(q => q.tipo === 'texto'));
+  const q = preguntaWallets(); if (!usados.has('donde')) delete q.dep;
+  b2.preguntas.splice(k >= 0 ? k : b2.preguntas.length, 0, q);
+  const version = d.version + 1; delete d.version;
+  await pool.query('INSERT IGNORE INTO formularios_def (formulario, version, definicion, nota) VALUES (?, ?, ?, ?)', ['cripto', version, JSON.stringify(d), 'Pregunta «¿Qué wallets has usado?» añadida a la batería 2']);
+  console.log('Formularios: pregunta de wallets añadida (versión ' + version + ')');
 }
 async function leerDefinicion(form, version) {
   const [f] = version
@@ -10154,6 +11420,27 @@ function validarDefinicion(d) {
     if (idx.get(dp.pregunta) > idx.get(q.id)) return '«' + q.texto + '» depende de «' + base.texto + '», que va después';
     if (!(dp.respuestas || []).every(r => (base.opciones || []).some(o => o.id === r))) return '«' + q.texto + '» depende de una respuesta que ya no existe';
   }
+  // 13/11: tarifas: números positivos (o vacío)
+  const malPrecio = v => v !== undefined && v !== null && v !== '' && !(Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 100000);
+  const malMapa = m => m !== undefined && m !== null && (typeof m !== 'object' || Object.values(m).some(malPrecio));
+  if (malMapa(d.precios_base)) return 'Hay un precio base que no es un número válido';
+  for (const q of orden) { if ([q.precio_por_anio, q.precio_por_cada].some(malPrecio) || [q.precios_por_anio, q.precios_por_cada].some(malMapa) || (q.opciones || []).some(o => malPrecio(o.precio) || malMapa(o.precios))) return 'Hay un precio que no es un número válido en «' + q.texto + '»'; }
+  // 16/11: imágenes del año (normal y por temporada)
+  const urlImgOk = u => typeof u === 'string' && u.length <= 300 && (/^\/api\/web\/imagen\/[A-Za-z0-9_-]+$/.test(u) || /^https:\/\//.test(u));
+  for (const q of orden) {
+    if (q.imgs !== undefined && q.imgs !== null && (typeof q.imgs !== 'object' || Object.entries(q.imgs).some(([y, u]) => !/^\d{4}$/.test(y) || !urlImgOk(u)))) return 'Las imágenes del año de «' + q.id + '» no son válidas';
+    if (q.imgs_temporada !== undefined && q.imgs_temporada !== null && (typeof q.imgs_temporada !== 'object' || Object.entries(q.imgs_temporada).some(([tp, m]) => !['navidad', 'semana-santa', 'renta', 'pizza', 'halving'].includes(tp) || !m || typeof m !== 'object' || Object.entries(m).some(([y, u]) => !/^\d{4}$/.test(y) || !urlImgOk(u))))) return 'Las imágenes por temporada de «' + q.id + '» no son válidas';
+  }
+  // 16/11: imágenes de concepto ({ texto de la burbuja: url })
+  if (d.conceptos !== undefined && d.conceptos !== null && (typeof d.conceptos !== 'object' || Array.isArray(d.conceptos) || Object.entries(d.conceptos).some(([k, u]) => !k || k.length > 80 || !urlImgOk(u)))) return 'Las imágenes de concepto no son válidas';
+  // 16/11: colores de cada categoría del mapa ({ grupo: { claro, oscuro } }, en hexadecimal)
+  if (d.colores !== undefined && d.colores !== null) {
+    if (typeof d.colores !== 'object' || Array.isArray(d.colores)) return 'Los colores del mapa no son válidos';
+    for (const [g, c] of Object.entries(d.colores)) { if (!['base', 'cex', 'cadena', 'wallet', 'ingresos', 'aviso'].includes(g) || !c || typeof c !== 'object') return 'Los colores del mapa no son válidos';
+      for (const m of ['claro', 'oscuro']) if (c[m] !== undefined && !/^#[0-9a-fA-F]{6}$/.test(c[m])) return 'El color «' + g + '» (' + m + ') no es válido'; } }
+  // 16/11: logos de ejemplo de cada respuesta (claves del catálogo «Plataformas y logos»; máximo 12)
+  for (const q of orden) for (const o of (q.opciones || [])) { if (o.ejemplos === undefined || o.ejemplos === null) continue;
+    if (!Array.isArray(o.ejemplos) || o.ejemplos.length > 12 || o.ejemplos.some(k => typeof k !== 'string' || !/^[a-z0-9-]{1,60}$/.test(k)) || new Set(o.ejemplos).size !== o.ejemplos.length) return 'Los ejemplos de «' + (o.t || o.id) + '» no son válidos (máximo 12 plataformas del catálogo)'; }
   if (JSON.stringify(d).length > 400000) return 'La definición es demasiado grande';
   return null;
 }
@@ -10177,6 +11464,58 @@ function resumenRespuestas(def, bateriaId, resp) {
   }
   return filas;
 }
+/* ---------- ESTIMACIÓN DEL PRESUPUESTO (13/11, Vikn; rehecha el 16/11 tras perderse) ----------
+   Tarifas en la definición (las pone el equipo en Automatizaciones → Formularios; el cliente NUNCA las ve: sinPrecios):
+   - def.precios_base = { tipo de servicio: € }            → precio de partida de cada servicio
+   - respuesta (una / varias): precios = { tipo: € } y/o precio = €   → lo que suma esa respuesta
+   - pregunta de año: precios_por_anio / precio_por_anio  → € por cada año desde ese año hasta hoy (mínimo 1)
+   - pregunta de varias: precios_por_cada / precio_por_cada → € por cada respuesta marcada (si no lo tiene, suman las de cada respuesta)
+   El precio sin servicio (precio, precio_por_anio, precio_por_cada) vale para los servicios que no tienen el suyo propio.
+   Es orientativa: el precio de la propuesta lo decide el asesor. */
+const CAMPOS_PRECIO = ['precios_base', 'precio', 'precios', 'precio_por_anio', 'precios_por_anio', 'precio_por_cada', 'precios_por_cada'];
+function sinPrecios(def) {
+  if (!def) return def;
+  const quita = o => { if (o && typeof o === 'object') CAMPOS_PRECIO.forEach(k => { delete o[k]; }); return o; };
+  const d = quita(JSON.parse(JSON.stringify(def)));
+  (d.flujo || []).forEach(p => (p.preguntas || []).forEach(q => { quita(q); (q.opciones || []).forEach(quita); }));
+  return d;
+}
+const numPrecio = v => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+const precioDe = (o, campoServ, campoGen, tipo) => o ? numPrecio(o[campoServ] && o[campoServ][tipo] !== undefined && o[campoServ][tipo] !== '' ? o[campoServ][tipo] : o[campoGen]) : 0;
+// Nombre de servicio (como llega de la web) → tipo (pyg, renta, m721…)
+function tipoServicioDeNombre(nombre) {
+  const n = t => String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\(.*?\)|\d+/g, ' ').replace(/[^a-z&]+/g, ' ').trim();
+  const t = String(nombre || '').trim(); if (TIPOS_SERVICIO[t]) return t;
+  for (const [k, d] of Object.entries(TIPOS_SERVICIO)) if (d.legacy === t) return k;
+  const nn = n(t);
+  for (const [k, d] of Object.entries(TIPOS_SERVICIO)) for (const l of ['es', 'en']) if (d.nombre && d.nombre[l] && n(d.nombre[l]('')) === nn) return k;
+  if (/perdidas y ganancias|gains and losses/.test(nn)) return /anterior|previous/.test(nn) ? 'pyg_anteriores' : 'pyg';
+  if (/renta|modelo|income tax/.test(nn) && /renta|income/.test(nn)) return 'renta';
+  const m = nn.match(/\b(7[0-9]{2})\b/) || String(t).match(/\b(7\d\d)\b/); if (m && TIPOS_SERVICIO['m' + m[1]]) return 'm' + m[1];
+  return tipoDeServicio(t);
+}
+function estimarPresupuesto(def, respuestas, tipos) {
+  const base = def.precios_base || {}, anioHoy = Number(hoyMadridISO().slice(0, 4));
+  const servicios = tipos.map(t => ({ tipo: t, base: numPrecio(base[t]), total: numPrecio(base[t]), con_tarifa: base[t] !== undefined && base[t] !== '' }));
+  const lineas = [];
+  for (const p of def.flujo) for (const q of (p.preguntas || [])) {
+    if (!visible(q, respuestas)) continue;
+    const v = respuestas[q.id]; if (v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length)) continue;
+    const por = {};
+    for (const s of servicios) {
+      let x = 0;
+      if (q.tipo === 'anio') { const a = Number(v); if (Number.isFinite(a)) x = precioDe(q, 'precios_por_anio', 'precio_por_anio', s.tipo) * Math.max(1, anioHoy - a + 1); }
+      else if (q.tipo === 'varias') {
+        const vals = Array.isArray(v) ? v : [v], cada = precioDe(q, 'precios_por_cada', 'precio_por_cada', s.tipo);
+        x = cada ? cada * vals.length : vals.reduce((t, id) => t + precioDe((q.opciones || []).find(o => o.id === id), 'precios', 'precio', s.tipo), 0);
+      } else if (q.tipo === 'una') x = precioDe((q.opciones || []).find(o => o.id === v), 'precios', 'precio', s.tipo);
+      if (x) { por[s.tipo] = Math.round(x * 100) / 100; s.total += por[s.tipo]; }
+    }
+    lineas.push({ bateria: p.id, pregunta_id: q.id, por_servicio: por, importe: Object.values(por).reduce((a, b) => a + b, 0) });
+  }
+  servicios.forEach(s => { s.total = Math.round(s.total * 100) / 100; });
+  return { servicios, total: Math.round(servicios.reduce((t, s) => t + s.total, 0) * 100) / 100, lineas };
+}
 // Lo que llega con /api/presupuesto: {_v2: {formulario, version, bateria, respuestas}} → se completa con el resumen del servidor
 async function cuestionarioConFormulario(c) {
   if (!c || typeof c !== 'object' || !c._v2) return c;
@@ -10191,7 +11530,7 @@ async function cuestionarioConFormulario(c) {
 /* ---------- Rutas ---------- */
 app.get('/api/formularios/:form', async (req, res) => {
   if (!FORMULARIOS.includes(req.params.form)) return res.status(404).json({ error: 'Formulario desconocido' });
-  try { res.set('Cache-Control', 'no-cache'); res.json(await leerDefinicion(req.params.form)); }
+  try { res.set('Cache-Control', 'no-cache'); res.json(sinPrecios(await leerDefinicion(req.params.form))); }   // 13/11: sin tarifas (el cliente nunca ve cifras)
   catch (e) { console.error('Formulario:', e.message); res.status(500).json({ error: 'No se pudo leer el formulario' }); }
 });
 app.get('/api/admin/formularios/:form', requiereSesionAsesor, async (req, res) => {
@@ -10199,7 +11538,8 @@ app.get('/api/admin/formularios/:form', requiereSesionAsesor, async (req, res) =
   try {
     const def = await leerDefinicion(req.params.form);
     const [hist] = await pool.query('SELECT f.version, f.creado_en, f.nota, a.nombre AS asesor FROM formularios_def f LEFT JOIN asesores a ON a.id = f.asesor_id WHERE f.formulario = ? ORDER BY f.version DESC LIMIT 30', [req.params.form]);
-    res.json({ definicion: def, historial: hist, puede_editar: tieneRol(req, 'encargado') });
+    // 13/11: los servicios, para poner sus tarifas (precio base y lo que suma cada respuesta)
+    res.json({ definicion: def, historial: hist, puede_editar: tieneRol(req, 'encargado'), servicios: Object.entries(TIPOS_SERVICIO).map(([tipo, d]) => ({ tipo, nombre: String(d.nombre.es('')).replace(/\(\s*\)/g, '').replace(/\s+/g, ' ').trim() })) });
   } catch (e) { res.status(500).json({ error: 'No se pudo leer el formulario' }); }
 });
 app.put('/api/admin/formularios/:form', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
@@ -10218,6 +11558,31 @@ app.put('/api/admin/formularios/:form', requiereSesionAsesor, requiereRol('encar
     res.json({ ok: true, version: ultima + 1 });
   } catch (e) { await conn.rollback().catch(() => {}); console.error('Guardar formulario:', e.message); res.status(500).json({ error: 'No se pudo guardar' }); }
   finally { conn.release(); }
+});
+// 13/11 (rehecha el 16/11): estimación de una solicitud por servicio, con lo que suma cada respuesta (baterías 1 y 2). Solo el equipo.
+app.get('/api/admin/solicitudes-presupuesto/:id/estimacion', requiereSesionAsesor, async (req, res) => {
+  try {
+    const [f] = await pool.query('SELECT id, servicios, cuestionario, correo FROM solicitudes_presupuesto WHERE id = ?', [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'Solicitud no encontrada' });
+    let lista; try { lista = JSON.parse(f[0].servicios); } catch (e) { lista = String(f[0].servicios || '').split(','); }
+    if (!Array.isArray(lista)) lista = [lista];
+    const nombres = lista.map(x => String(typeof x === 'string' ? x : (x && (x.nombre || x.id)) || '').trim()).filter(Boolean);
+    let c = null; try { c = JSON.parse(f[0].cuestionario || 'null'); } catch (e) {}
+    const v2 = c && c._v2, form = v2 && FORMULARIOS.includes(v2.formulario) ? v2.formulario : 'cripto';
+    const resp = Object.assign({}, (v2 && v2.respuestas) || {});
+    let resumen2 = null;
+    if (f[0].correo) {   // la batería 2 la responde en su Área: se busca por su correo
+      const [b2] = await pool.query("SELECT fc.respuestas, fc.resumen FROM formularios_cliente fc JOIN clientes cl ON cl.id = fc.cliente_id WHERE cl.correo = ? AND fc.formulario = ? AND fc.estado = 'respondida' ORDER BY fc.respondida_en DESC LIMIT 1", [f[0].correo, form]);
+      if (b2.length) { try { Object.assign(resp, JSON.parse(b2[0].respuestas || '{}')); resumen2 = JSON.parse(b2[0].resumen || 'null'); } catch (e) {} }
+    }
+    const def = await leerDefinicion(form);
+    const tipos = [...new Set(nombres.map(tipoServicioDeNombre))];
+    const est = estimarPresupuesto(def, resp, tipos);
+    est.servicios.forEach(s => { s.nombre = nombres.find(n => tipoServicioDeNombre(n) === s.tipo) || s.tipo; });
+    est.hay_tarifas = !!(def.precios_base && Object.keys(def.precios_base).length);
+    est.resumen_b2 = resumen2;
+    res.json(est);
+  } catch (e) { console.error('Estimación:', e.message); res.status(500).json({ error: 'No se pudo calcular la estimación' }); }
 });
 // Imágenes de las respuestas (burbujas del mapa): PNG, JPG o WebP; se guardan con las de la web y se sirven en /api/web/imagen/:id
 app.post('/api/admin/formularios/imagen', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
@@ -10316,7 +11681,7 @@ app.get('/api/clientes/formularios', requiereSesionCliente, async (req, res) => 
     const [filas] = await pool.query("SELECT id, formulario, bateria, version, enviada_en FROM formularios_cliente WHERE cliente_id = ? AND estado = 'enviada' ORDER BY id", [req.cliente.id]);
     if (!filas.length) return res.json({ pendientes: [] });
     const previas = await respuestasPreviasCliente(req.cliente.id), defs = {};
-    for (const f of filas) defs[f.version] = defs[f.version] || await leerDefinicion(f.formulario, f.version);
+    for (const f of filas) defs[f.version] = defs[f.version] || sinPrecios(await leerDefinicion(f.formulario, f.version));   // 13/11: sin tarifas
     res.json({ contexto: previas.respuestas, pendientes: filas.map(f => { const d = defs[f.version], b = d && d.flujo.find(p => p.id === f.bateria); return b ? { id: f.id, bateria: f.bateria, nombre: b.nombre, preguntas: b.preguntas.length, enviada_en: f.enviada_en, version: f.version } : null; }).filter(Boolean), definiciones: defs });
   } catch (e) { console.error('Formularios del Área:', e.message); res.status(500).json({ error: 'No se pudieron cargar tus preguntas' }); }
 });
@@ -10330,7 +11695,7 @@ app.post('/api/clientes/formularios/:fid', requiereSesionCliente, async (req, re
     const def = await leerDefinicion(f.formulario, f.version), previas = await respuestasPreviasCliente(req.cliente.id);
     const todo = Object.assign({}, previas.respuestas, limpio), resumen = (resumenRespuestas(def, f.bateria, todo) || []).filter(x => x.id in limpio);
     await pool.query("UPDATE formularios_cliente SET estado = 'respondida', respuestas = ?, resumen = ?, respondida_en = NOW() WHERE id = ?", [JSON.stringify(limpio), JSON.stringify(resumen), fid]);
-    avisarCliente(req.cliente.id, '📝', 'ha respondido sus preguntas', 'Las tienes en su ficha, en «Preguntas».');
+    if (!(await completarMedioCamino(req.cliente.id))) avisarCliente(req.cliente.id, '📝', 'ha respondido sus preguntas', 'Las tienes en su ficha, en «Preguntas».');   // 12/11
     res.json({ ok: true });
   } catch (e) { console.error('Responder batería:', e.message); res.status(500).json({ error: 'No se pudieron guardar tus respuestas' }); }
 });
@@ -10339,7 +11704,7 @@ let tareaFormEnMarcha = false;
 async function recordatoriosFormularios() {
   if (tareaFormEnMarcha) return; tareaFormEnMarcha = true;
   try {
-    const [filas] = await pool.query("SELECT id, cliente_id, formulario, bateria, version, recordatorios, aviso_asesor_en, TIMESTAMPDIFF(SECOND, enviada_en, NOW()) AS seg FROM formularios_cliente WHERE estado = 'enviada'");
+    const [filas] = await pool.query("SELECT id, cliente_id, formulario, bateria, version, recordatorios, aviso_asesor_en, TIMESTAMPDIFF(SECOND, enviada_en, NOW()) AS seg FROM formularios_cliente WHERE estado = 'enviada' AND cliente_id NOT IN (SELECT cliente_id FROM solicitudes_presupuesto WHERE cliente_id IS NOT NULL AND fase IN ('sin_cuenta', 'bateria2', 'descartada'))");   // 12/11: las de «a medio camino» tienen sus propios recordatorios
     for (const f of filas) {
       const toca = DIAS_RECORDATORIO[f.recordatorios];
       if (toca !== undefined && f.seg >= toca * SEG_DIA_FORM) { await pool.query('UPDATE formularios_cliente SET recordatorios = recordatorios + 1, ultimo_recordatorio = NOW() WHERE id = ?', [f.id]); await correoBateria(f.cliente_id, f, true); continue; }
@@ -10373,10 +11738,10 @@ async function estadoMapa(clienteId) {
   const previas = await respuestasPreviasCliente(clienteId);
   const [bs] = await pool.query("SELECT bateria, respuestas FROM formularios_cliente WHERE cliente_id = ? AND estado = 'respondida'", [clienteId]);
   const respondidas = new Set(bs.map(x => x.bateria)); const b3 = bs.find(x => x.bateria === 'b3');
-  const [[pago]] = await pool.query("SELECT COUNT(*) AS n FROM pagos pa JOIN propuestas p ON p.id = pa.propuesta_id WHERE p.cliente_id = ? AND pa.estado = 'confirmado'", [clienteId]);
+  const [[pago]] = await pool.query("SELECT COUNT(*) AS n, MIN(COALESCE(pa.confirmado_en, pa.creado_en)) AS primero FROM pagos pa JOIN propuestas p ON p.id = pa.propuesta_id WHERE p.cliente_id = ? AND pa.estado = 'confirmado'", [clienteId]);   // 16/11: el primer pago = cuándo contrató (imagen del año)
   const [[m]] = await pool.query('SELECT correccion, metricas, guardado_en FROM formularios_mapa WHERE cliente_id = ?', [clienteId]).then(r => [r[0].length ? r[0] : [null]]);
   const inicial = {}; Object.assign(inicial, (previas.b1 && previas.b1.respuestas) || {}); bs.filter(x => x.bateria === 'b2').forEach(x => { try { Object.assign(inicial, JSON.parse(x.respuestas)); } catch (e) {} });
-  return { previas, respondidas, b3: b3 ? JSON.parse(b3.respuestas || '{}') : null, pagado: pago.n > 0, inicial, correccion: m && m.correccion ? JSON.parse(m.correccion) : null, metricas: m && m.metricas ? JSON.parse(m.metricas) : null, guardado_en: m && m.guardado_en };
+  return { previas, respondidas, b3: b3 ? JSON.parse(b3.respuestas || '{}') : null, pagado: pago.n > 0, contratado_en: pago.primero || null, inicial, correccion: m && m.correccion ? JSON.parse(m.correccion) : null, metricas: m && m.metricas ? JSON.parse(m.metricas) : null, guardado_en: m && m.guardado_en };
 }
 app.get('/api/admin/clientes/:id/mapa', requiereSesionAsesor, async (req, res) => {
   const id = Number(req.params.id); const perm = await clientesPermitidos(req).catch(() => null); if (perm && !perm.has(id)) return res.status(403).json({ error: 'Este cliente no es tuyo' });
@@ -10397,7 +11762,10 @@ app.get('/api/clientes/mapa', requiereSesionCliente, async (req, res) => {
   try {
     const e = await estadoMapa(req.cliente.id), def = await leerDefinicion('cripto');
     const inicialLista = !!e.previas.b1 && e.respondidas.has('b2') && e.pagado;
-    const out = { definicion: def, inicial: inicialLista ? e.inicial : null, falta: inicialLista ? null : (!e.previas.b1 || !e.respondidas.has('b2') ? 'preguntas' : 'pago') };
+    const out = { definicion: def, contratado_en: e.contratado_en, inicial: inicialLista ? e.inicial : null, falta: inicialLista ? null : (!e.previas.b1 || !e.respondidas.has('b2') ? 'preguntas' : 'pago') };
+    // 19/11 (Vikn): el mapa de sus respuestas se ve SIEMPRE (pantalla «Gracias» y botoncito junto a su nombre en el Área), en cuanto ha
+    // respondido las baterías 1 y 2, haya pagado o no.
+    if (e.previas.b1 && e.respondidas.has('b2')) out.vista = e.inicial;
     if (inicialLista && e.correccion && e.metricas && e.b3) { const reales = realesDe(e.metricas, e.correccion); out.final = e.correccion; out.acertaste = { tuyas: e.b3, reales, metricas: e.metricas }; }
     else if (inicialLista && e.b3) out.esperando_final = true;
     res.json(out);
@@ -10540,6 +11908,130 @@ async function limpiarSubidasHuerfanas() {
   } catch (e) { console.error('Limpieza de subidas:', e.message); }
 }
 setInterval(limpiarSubidasHuerfanas, 6 * 60 * 60 * 1000).unref();
+
+// ================================================================
+// A MEDIO CAMINO (12/11, Vikn; rehecho el 16/11 tras perderse)
+// Batería 1 en la web → «Tus datos» con correo obligatorio → se crea su cliente, se le prepara la batería 2 en su Área (sin que la
+// suelte el asesor) y le llega «Termina tu solicitud de presupuesto en Acros» con un enlace personal de 7 días. La solicitud NO entra
+// en «Nuevas solicitudes» ni avisa al equipo hasta que termina la batería 2. Fases (solicitudes_presupuesto.fase):
+//   sin_cuenta (aún no ha entrado) · bateria2 (entró, sin responder) · lista (terminada: ya en «Nuevas solicitudes») · descartada.
+// Si el correo ya es de un cliente, la solicitud va directa a «Nuevas solicitudes» (Vikn, 16/11).
+// Recordatorios a los 2, 5 y 10 días con enlace nuevo; dos días después del último, aviso al equipo (una vez).
+// Panel: Clientes → «A medio camino» (recordar, llamar, pasar a solicitud, descartar; lo descartado se puede recuperar).
+// ================================================================
+const DIAS_ENLACE_MC = 7;
+const FASES_ABIERTAS_MC = ['sin_cuenta', 'bateria2'];
+async function prepararMedioCamino() {
+  for (const [c, t] of [['`nombre`', 'VARCHAR(80) NULL'], ['`apellidos`', 'VARCHAR(120) NULL'], ['`fase`', 'VARCHAR(20) NULL'], ['`fase_en`', 'DATETIME NULL'], ['`cliente_id`', 'INT NULL'],
+    ['`entro_en`', 'DATETIME NULL'], ['`mc_recordatorios`', 'INT NOT NULL DEFAULT 0'], ['`mc_ultimo`', 'DATETIME NULL'], ['`mc_aviso_en`', 'DATETIME NULL'], ['`mc_descartada_por`', 'INT NULL']])
+    await agregaColumnaSiFalta('solicitudes_presupuesto', c, t);
+}
+// La primera batería del Área que va detrás de la de la web (la «batería 2»)
+function bateriaSiguienteMC(def) {
+  const i = def.flujo.findIndex(p => p.id === 's-cuenta');
+  return def.flujo.slice(i + 1).find(p => p.tipo === 'bateria' && p.donde === 'area') || null;
+}
+async function correoMedioCamino(solId, esRecordatorio) {
+  const [[s]] = await pool.query('SELECT id, correo, nombre, cliente_id FROM solicitudes_presupuesto WHERE id = ?', [solId]);
+  if (!s || !s.correo || !s.cliente_id) return false;
+  const token = generarToken();
+  await pool.execute('INSERT INTO tokens_acceso (cliente_id, token, expira_en) VALUES (?, ?, ?)', [s.cliente_id, token, aSQLDatetime(sumarDias(ahora(), DIAS_ENLACE_MC))]);
+  if (!brevoActivo()) return false;
+  const enlace = enlaceArea('area', token, 'acceso');
+  const m = plantillaCorreo({
+    titulo: 'Termina tu solicitud',
+    parrafos: [s.nombre ? `Hola, ${ESC_HTML(s.nombre)}:` : 'Hola:',
+      esRecordatorio ? 'Tu solicitud de presupuesto sigue a medio camino: nos faltan unas pocas preguntas más para prepararlo.' : 'Gracias por tus respuestas. Para preparar tu presupuesto nos faltan unas pocas preguntas más.',
+      'Entra en tu área de cliente con el botón y las tendrás en «Te toca a ti». Se responden en unos minutos y, en cuanto las termines, tu asesor se pone con tu propuesta.'],
+    boton: enlace ? { texto: 'Entrar y terminar mi solicitud', url: enlace } : null,
+    nota: 'El enlace es personal y sirve durante ' + DIAS_ENLACE_MC + ' días. Si no has pedido tú este presupuesto, ignora este correo.',
+  });
+  await enviarCorreo(s.correo, 'Termina tu solicitud de presupuesto en Acros', m.html, m.texto);
+  return true;
+}
+// Tras guardar la solicitud: ¿va «a medio camino»? Devuelve true si sí (y entonces no se avisa aún al equipo)
+async function iniciarMedioCamino(solId, datos, cuestionario) {
+  const v2 = cuestionario && cuestionario._v2, correo = String(datos.correo || '').trim().toLowerCase();
+  if (!v2 || v2.bateria !== 'b1' || !correo) return false;
+  const [ya] = await pool.query('SELECT id FROM clientes WHERE correo = ?', [correo]);
+  if (ya.length) return false;   // ya es cliente: directa a «Nuevas solicitudes»
+  const def = await leerDefinicion(v2.formulario, v2.version) || await leerDefinicion(v2.formulario);
+  const b2 = def && bateriaSiguienteMC(def); if (!b2) return false;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [c] = await conn.execute('INSERT INTO clientes (correo, telefono, nombre, apellidos) VALUES (?, ?, ?, ?)',
+      [correo, String(datos.telefono || '').trim() || null, String(datos.nombre || '').trim().slice(0, 80) || null, String(datos.apellidos || '').trim().slice(0, 120) || null]);
+    await conn.execute("INSERT INTO formularios_cliente (cliente_id, formulario, bateria, version, estado) VALUES (?, ?, ?, ?, 'enviada')", [c.insertId, def.formulario || v2.formulario, b2.id, def.version]);
+    await conn.execute("UPDATE solicitudes_presupuesto SET fase = 'sin_cuenta', fase_en = NOW(), cliente_id = ? WHERE id = ?", [c.insertId, solId]);
+    await conn.commit();
+  } catch (e) { await conn.rollback().catch(() => {}); console.error('A medio camino:', e.message); return false; }
+  finally { conn.release(); }
+  await correoMedioCamino(solId, false).catch(e => console.error('Correo «Termina tu solicitud» no enviado:', e.message));
+  return true;
+}
+// Ha entrado en su área (con el enlace o con su sesión)
+async function marcarEntradaMedioCamino(clienteId) {
+  try { await pool.query("UPDATE solicitudes_presupuesto SET fase = 'bateria2', fase_en = NOW(), entro_en = COALESCE(entro_en, NOW()) WHERE cliente_id = ? AND fase = 'sin_cuenta'", [clienteId]); }
+  catch (e) { console.error('A medio camino (entrada):', e.message); }
+}
+// Ha respondido una batería en su área: si tenía una solicitud a medio camino, pasa a «Nuevas solicitudes» y se avisa al equipo
+async function completarMedioCamino(clienteId) {
+  const [r] = await pool.query("UPDATE solicitudes_presupuesto SET fase = 'lista', fase_en = NOW() WHERE cliente_id = ? AND fase IN ('sin_cuenta', 'bateria2')", [clienteId]);
+  if (!r.affectedRows) return false;
+  avisarCaptacion('📝 Nueva solicitud de presupuesto', 'Ha terminado sus preguntas: está en «Nuevas solicitudes» del panel, con las dos baterías.', { etiqueta: 'memo' });
+  return true;
+}
+// Recordatorios (2, 5 y 10 días, con enlace nuevo) y, dos días después del último, aviso al equipo
+let tareaMCEnMarcha = false;
+async function recordatoriosMedioCamino() {
+  if (tareaMCEnMarcha) return; tareaMCEnMarcha = true;
+  try {
+    const [filas] = await pool.query("SELECT id, nombre, correo, mc_recordatorios, mc_aviso_en, TIMESTAMPDIFF(SECOND, creado_en, NOW()) AS seg FROM solicitudes_presupuesto WHERE fase IN ('sin_cuenta', 'bateria2')");
+    for (const f of filas) {
+      const toca = DIAS_RECORDATORIO[f.mc_recordatorios];
+      if (toca !== undefined && f.seg >= toca * SEG_DIA_FORM) {
+        await pool.query('UPDATE solicitudes_presupuesto SET mc_recordatorios = mc_recordatorios + 1, mc_ultimo = NOW() WHERE id = ?', [f.id]);
+        await correoMedioCamino(f.id, true).catch(e => console.error('Recordatorio a medio camino:', e.message));
+      }
+      if (toca === undefined && !f.mc_aviso_en && f.seg >= (DIAS_RECORDATORIO[DIAS_RECORDATORIO.length - 1] + 2) * SEG_DIA_FORM) {
+        await pool.query('UPDATE solicitudes_presupuesto SET mc_aviso_en = NOW() WHERE id = ?', [f.id]);
+        avisarCaptacion('⏳ Solicitud a medio camino', (f.nombre || f.correo) + ' lleva ' + Math.round(f.seg / SEG_DIA_FORM) + ' días sin terminar sus preguntas pese a los recordatorios. Está en Clientes → «A medio camino»: quizá convenga llamarle.', { etiqueta: 'hourglass' });
+      }
+    }
+  } catch (e) { console.error('Recordatorios a medio camino:', e.message); } finally { tareaMCEnMarcha = false; }
+}
+setInterval(recordatoriosMedioCamino, Math.max(5000, Number(process.env.FORM_TAREA_MS) || 60 * 60 * 1000)).unref();
+app.post('/api/admin/medio-camino/tarea-recordatorios', requiereSesionAsesor, requiereRol('admin'), async (req, res) => { await recordatoriosMedioCamino(); res.json({ ok: true }); });
+// Panel
+app.get('/api/admin/medio-camino', requiereSesionAsesor, requiereRol('jefe', 'encargado'), async (req, res) => {
+  const fases = req.query.descartadas === '1' ? ['descartada'] : FASES_ABIERTAS_MC;
+  const [f] = await pool.query('SELECT id, nombre, apellidos, correo, telefono, servicios, cuestionario, fase, fase_en, creado_en, entro_en, mc_recordatorios, mc_ultimo, cliente_id FROM solicitudes_presupuesto WHERE fase IN (?) ORDER BY creado_en DESC', [fases]);
+  res.json(f.map(x => { let r = []; try { r = (JSON.parse(x.cuestionario || 'null') || {})._v2.resumen || []; } catch (e) {} delete x.cuestionario; x.resumen_b1 = r; return x; }));
+});
+const accionMC = (nombre, fn) => app.post('/api/admin/medio-camino/:id/' + nombre, requiereSesionAsesor, requiereRol('jefe', 'encargado'), async (req, res) => {
+  const [[s]] = await pool.query('SELECT id, fase, entro_en FROM solicitudes_presupuesto WHERE id = ?', [Number(req.params.id)]);
+  if (!s) return res.status(404).json({ error: 'Solicitud no encontrada' });
+  try { const r = await fn(s, req); if (r && r.error) return res.status(r.status || 409).json(r); res.json(Object.assign({ ok: true }, r || {})); }
+  catch (e) { console.error('A medio camino (' + nombre + '):', e.message); res.status(500).json({ error: 'No se pudo' }); }
+});
+accionMC('recordar', async s => {
+  if (!FASES_ABIERTAS_MC.includes(s.fase)) return { error: 'Esta solicitud ya no está a medio camino' };
+  const enviado = await correoMedioCamino(s.id, true); await pool.query('UPDATE solicitudes_presupuesto SET mc_ultimo = NOW() WHERE id = ?', [s.id]);
+  return { enviado };
+});
+accionMC('pasar', async s => {
+  if (!FASES_ABIERTAS_MC.includes(s.fase)) return { error: 'Esta solicitud ya no está a medio camino' };
+  await pool.query("UPDATE solicitudes_presupuesto SET fase = 'lista', fase_en = NOW() WHERE id = ?", [s.id]);
+});
+accionMC('descartar', async (s, req) => {
+  if (!FASES_ABIERTAS_MC.includes(s.fase)) return { error: 'Esta solicitud ya no está a medio camino' };
+  await pool.query("UPDATE solicitudes_presupuesto SET fase = 'descartada', fase_en = NOW(), mc_descartada_por = ? WHERE id = ?", [req.asesor.id, s.id]);
+});
+accionMC('recuperar', async s => {
+  if (s.fase !== 'descartada') return { error: 'Esta solicitud no está descartada' };
+  await pool.query('UPDATE solicitudes_presupuesto SET fase = ?, fase_en = NOW(), mc_descartada_por = NULL WHERE id = ?', [s.entro_en ? 'bateria2' : 'sin_cuenta', s.id]);
+});
 
 // Middleware de error genérico (10/09): un payload que supera el límite de
 // express.json() (15mb) llegaba antes como una página HTML cruda de
