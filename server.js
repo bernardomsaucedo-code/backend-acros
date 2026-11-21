@@ -955,6 +955,7 @@ async function asegurarEsquema() {
       await prepararPlataformas();   // 11/11: catálogo de plataformas y sus logos
       await prepararFormatosArchivo();
       await prepararTemporadas();   // 06/11: temporadas de la web y codigo_promo
+      await prepararApariencia();   // 21/11: modo oscuro (bosque o grafito) y tema secreto
       await prepararFormularios();  // 11/11: preguntas dinámicas
       await prepararFormulariosCliente();  // 11/11: baterías del Área
       await prepararMapas();  // 11/11: mapa cripto (inicial, final y diferencias)
@@ -7798,7 +7799,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-11-21.2';
+const VERSION_ACROS = '2026-11-21.4';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -11193,6 +11194,68 @@ const TEMPORADAS = ['navidad', 'semana-santa', 'renta', 'pizza', 'halving'];
 const CODIGOS_PROMO = { PIZZA22: 'Pizza Day' };
 const codigoPromoValido = c => { const k = String(c || '').trim().toUpperCase(); return CODIGOS_PROMO[k] ? k : null; };
 const TEMPORADA_POR_DEFECTO = { modo: 'auto', forzada: null, apagadas: [], halving_fecha: null };
+// ================================================================
+// APARIENCIA DEL MODO OSCURO (21/11, Vikn): el de siempre (bosque o grafito), el tema secreto, su palabra, los 7 toques
+// al logo y los colores de cada paleta. Lo lee acros_apariencia.js en la web, el Área y el panel. Lo cambian
+// administradores y marketing (Escaparate → Apariencia).
+// ================================================================
+const APAR_TEMAS = ['bosque', 'grafito'];
+const APAR_TOKENS = ['fondo', 'superficie', 'cabecera', 'linea', 'circulo', 'texto', 'texto_suave', 'acento', 'boton', 'boton_texto'];
+const APAR_BASE = {
+  oscuro: 'bosque',
+  secreto: { tema: 'grafito', palabra: 'grafito', toques_logo: true },
+  paletas: {
+    bosque:  { fondo: '#17302A', superficie: '#20402F', cabecera: '#1B362D', linea: '#36584A', circulo: '#2A4A3B', texto: '#F2ECE1', texto_suave: '#CFC6B8', acento: '#D9A066', boton: '#F1E6D8', boton_texto: '#032617' },
+    grafito: { fondo: '#1A1D1B', superficie: '#262B28', cabecera: '#202421', linea: '#3A403C', circulo: '#30362F', texto: '#F2ECE1', texto_suave: '#CFC6B8', acento: '#D9A066', boton: '#F1E6D8', boton_texto: '#032617' }
+  }
+};
+function aparLimpia(c, estricto) {
+  c = c && typeof c === 'object' ? c : {};
+  const err = m => { if (estricto) { const e = new Error(m); e.esValidacion = true; throw e; } };
+  const r = { oscuro: APAR_TEMAS.includes(c.oscuro) ? c.oscuro : (err('Elige el modo oscuro de siempre'), APAR_BASE.oscuro), secreto: {}, paletas: {} };
+  const s = c.secreto && typeof c.secreto === 'object' ? c.secreto : {};
+  r.secreto.tema = s.tema === null || s.tema === 'ninguno' ? null : (APAR_TEMAS.includes(s.tema) ? s.tema : APAR_BASE.secreto.tema);
+  if (r.secreto.tema === r.oscuro) { err('El tema secreto no puede ser el mismo que el de siempre'); r.secreto.tema = null; }
+  const pal = String(s.palabra || '').trim().toLowerCase();
+  if (r.secreto.tema && !/^[a-zñ]{3,20}$/.test(pal)) err('La palabra secreta: de 3 a 20 letras, sin espacios ni tildes');
+  r.secreto.palabra = /^[a-zñ]{3,20}$/.test(pal) ? pal : (r.secreto.tema || APAR_BASE.secreto.palabra);
+  r.secreto.toques_logo = s.toques_logo !== false;
+  APAR_TEMAS.forEach(t => {
+    const p = (c.paletas && c.paletas[t]) || {}, o = {};
+    APAR_TOKENS.forEach(k => {
+      const v = String(p[k] || '');
+      if (/^#[0-9a-fA-F]{6}$/.test(v)) o[k] = v.toUpperCase(); else { if (p[k]) err('Color no válido en ' + t + ': ' + k); o[k] = APAR_BASE.paletas[t][k]; }
+    });
+    r.paletas[t] = o;
+  });
+  return r;
+}
+async function prepararApariencia() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS web_apariencia (
+    id TINYINT PRIMARY KEY, datos TEXT NOT NULL, asesor_id INT NULL, actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+async function leerApariencia() {
+  const [f] = await pool.query('SELECT datos FROM web_apariencia WHERE id = 1');
+  if (!f.length) return aparLimpia(APAR_BASE);
+  try { return aparLimpia(JSON.parse(f[0].datos)); } catch (e) { return aparLimpia(APAR_BASE); }
+}
+app.get('/api/web/apariencia', async (req, res) => {
+  try { res.set('Cache-Control', 'no-cache'); res.json(await leerApariencia()); }
+  catch (e) { res.json(aparLimpia(APAR_BASE)); }   // si falla, la web sigue con lo de siempre
+});
+app.get('/api/admin/web-apariencia', requiereSesionAsesor, async (req, res) => {
+  try { res.json({ config: await leerApariencia(), base: APAR_BASE, puede_editar: tieneRol(req, 'marketing') }); }
+  catch (e) { res.status(500).json({ error: 'No se pudo leer' }); }
+});
+app.put('/api/admin/web-apariencia', requiereSesionAsesor, requiereRol('marketing'), async (req, res) => {
+  let datos; try { datos = aparLimpia(req.body, true); } catch (e) { return res.status(400).json({ error: e.message }); }
+  try {
+    await pool.query('INSERT INTO web_apariencia (id, datos, asesor_id) VALUES (1, ?, ?) ON DUPLICATE KEY UPDATE datos = VALUES(datos), asesor_id = VALUES(asesor_id)', [JSON.stringify(datos), req.asesor.id]);
+    res.json({ ok: true, config: datos });
+  } catch (e) { console.error('Apariencia:', e); res.status(500).json({ error: 'No se pudo guardar' }); }
+});
+
 async function prepararTemporadas() {
   await pool.query(`CREATE TABLE IF NOT EXISTS web_temporadas (
     id TINYINT PRIMARY KEY, datos TEXT NOT NULL, asesor_id INT NULL, actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -11953,17 +12016,22 @@ async function correoMedioCamino(solId, esRecordatorio) {
 async function iniciarMedioCamino(solId, datos, cuestionario) {
   const v2 = cuestionario && cuestionario._v2, correo = String(datos.correo || '').trim().toLowerCase();
   if (!v2 || v2.bateria !== 'b1' || !correo) return false;
-  const [ya] = await pool.query('SELECT id FROM clientes WHERE correo = ?', [correo]);
-  if (ya.length) return false;   // ya es cliente: directa a «Nuevas solicitudes»
+  const [ya] = await pool.query('SELECT id FROM clientes WHERE correo = ?', [correo]);   // 21/11 (Vikn): aunque ya sea cliente, primero la batería 2 en su Área
   const def = await leerDefinicion(v2.formulario, v2.version) || await leerDefinicion(v2.formulario);
   const b2 = def && bateriaSiguienteMC(def); if (!b2) return false;
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [c] = await conn.execute('INSERT INTO clientes (correo, telefono, nombre, apellidos) VALUES (?, ?, ?, ?)',
-      [correo, String(datos.telefono || '').trim() || null, String(datos.nombre || '').trim().slice(0, 80) || null, String(datos.apellidos || '').trim().slice(0, 120) || null]);
-    await conn.execute("INSERT INTO formularios_cliente (cliente_id, formulario, bateria, version, estado) VALUES (?, ?, ?, ?, 'enviada')", [c.insertId, def.formulario || v2.formulario, b2.id, def.version]);
-    await conn.execute("UPDATE solicitudes_presupuesto SET fase = 'sin_cuenta', fase_en = NOW(), cliente_id = ? WHERE id = ?", [c.insertId, solId]);
+    let clienteId;
+    if (ya.length) clienteId = ya[0].id;
+    else {
+      const [c] = await conn.execute('INSERT INTO clientes (correo, telefono, nombre, apellidos) VALUES (?, ?, ?, ?)',
+        [correo, String(datos.telefono || '').trim() || null, String(datos.nombre || '').trim().slice(0, 80) || null, String(datos.apellidos || '').trim().slice(0, 120) || null]);
+      clienteId = c.insertId;
+    }
+    const [pend] = await conn.execute("SELECT id FROM formularios_cliente WHERE cliente_id = ? AND formulario = ? AND bateria = ? AND estado = 'enviada'", [clienteId, def.formulario || v2.formulario, b2.id]);
+    if (!pend.length) await conn.execute("INSERT INTO formularios_cliente (cliente_id, formulario, bateria, version, estado) VALUES (?, ?, ?, ?, 'enviada')", [clienteId, def.formulario || v2.formulario, b2.id, def.version]);
+    await conn.execute("UPDATE solicitudes_presupuesto SET fase = 'sin_cuenta', fase_en = NOW(), cliente_id = ? WHERE id = ?", [clienteId, solId]);
     await conn.commit();
   } catch (e) { await conn.rollback().catch(() => {}); console.error('A medio camino:', e.message); return false; }
   finally { conn.release(); }
