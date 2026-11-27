@@ -77,7 +77,7 @@ process.on('unhandledRejection', err => {
 // comprimidos) pasaban. No era un problema de tipo de archivo, era de
 // tamaño. 15mb cubre con margen una foto de cámara de móvil típica ya en
 // base64.
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '15mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/stripe/')) req.rawBody = buf; } }));   // 26/11: la firma de Stripe va sobre el cuerpo tal cual llega
 
 // ================================================================
 // REGISTRO MAESTRO (30/10, Vikn)
@@ -422,7 +422,7 @@ function plantillaCorreo({ titulo, parrafos = [], boton, nota, hilo }) {
   const logo = img('correo-logo.png');
   const icono = img('correo-boton.png');
   const web = SITE_URL || 'https://acrosfi.es';
-  const bloqueHilo = h => `<tr><td style="padding:14px 30px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${h.propio ? '#EEF4EF' : '#F6F2EA'}; border-left:4px solid ${h.propio ? '#2E7A4E' : '#C9BBA3'}; border-radius:8px;"><tr><td style="padding:12px 16px; font-family:${fuente};"><div style="font-size:11.5px; letter-spacing:.04em; text-transform:uppercase; color:#8A8378; padding-bottom:5px;">${ESC_HTML(h.quien)}${h.fecha ? ' · ' + ESC_HTML(h.fecha) : ''}</div><div style="font-size:15px; line-height:1.5; color:#423F3A;">${ESC_HTML(h.texto).replace(/\n/g, '<br>')}</div></td></tr></table></td></tr>`;
+  const bloqueHilo = h => `<tr><td style="padding:14px 30px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${h.propio ? '#EEF4EF' : '#F6F2EA'}; border-left:4px solid ${h.propio ? '#2E7A4E' : '#C9BBA3'}; border-radius:8px;"><tr><td style="padding:12px 16px; font-family:${fuente};"><div style="font-size:11.5px; letter-spacing:.04em; text-transform:uppercase; color:#8A8378; padding-bottom:5px;">${ESC_HTML(h.quien)}${h.fecha ? ', ' + ESC_HTML(h.fecha) : ''}</div><div style="font-size:15px; line-height:1.5; color:#423F3A;">${ESC_HTML(h.texto).replace(/\n/g, '<br>')}</div></td></tr></table></td></tr>`;
   const html = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${ESC_HTML(titulo)}</title></head>
 <body style="margin:0; padding:0; background:#FBF8F2;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBF8F2;"><tr><td align="center" style="padding:28px 14px;">
@@ -450,7 +450,7 @@ function plantillaCorreo({ titulo, parrafos = [], boton, nota, hilo }) {
 </td></tr></table>
 </body></html>`;
   const sinEtiquetas = t => String(t).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
-  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), ...(hilo || []).flatMap(h => ['', '> ' + h.quien + (h.fecha ? ' · ' + h.fecha : '') + ':', ...String(h.texto).split('\n').map(l => '> ' + l)]), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros, tu asesoría fiscal de criptoactivos. Contacta en: acrosfi.es / 668 17 00 20'].join('\n');
+  const texto = [titulo, '', ...parrafos.map(sinEtiquetas), ...(hilo || []).flatMap(h => ['', '> ' + h.quien + (h.fecha ? ', ' + h.fecha : '') + ':', ...String(h.texto).split('\n').map(l => '> ' + l)]), '', boton ? boton.texto + ': ' + boton.url : '', nota ? '\n' + sinEtiquetas(nota) : '', '', '— Acros, tu asesoría fiscal de criptoactivos. Contacta en: acrosfi.es / 668 17 00 20'].join('\n');
   return { html, texto };
 }
 
@@ -465,10 +465,10 @@ function plantillaCorreo({ titulo, parrafos = [], boton, nota, hilo }) {
 // ================================================================
 const NTFY_TOPIC = (process.env.NTFY_TOPIC || '').trim();
 const NTFY_SERVER = (process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '');
-function avisarEn(topic, titulo, mensaje, { prioridad = 3, etiqueta = 'bell' } = {}) {
+function avisarEn(topic, titulo, mensaje, { prioridad = 3, etiqueta = 'bell', enlace = null } = {}) {   // 27/11: «enlace», a dónde lleva al tocarlo en el móvil
   if (!topic) return Promise.resolve(false);
   anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Sistema', tipo: 'sistema', accion: 'Aviso al móvil (ntfy)', detalle: { titulo: String(titulo || '').slice(0, 150) } });   // 30/10: sin el nombre del canal
-  return axios.post(NTFY_SERVER + '/', { topic, title: titulo, message: mensaje || 'Ábrelo en el panel de Acros.', priority: prioridad, tags: [etiqueta] }, { timeout: 5000 })
+  return axios.post(NTFY_SERVER + '/', { topic, title: titulo, message: mensaje || 'Ábrelo en el panel de Acros.', priority: prioridad, tags: [etiqueta], click: enlace || PANEL_URL + '/' }, { timeout: 5000 })
     .then(() => true)
     .catch(err => { console.error('Aviso ntfy no enviado:', err.message); return false; });
 }
@@ -496,7 +496,7 @@ const avisarCaptacion = (t, m, o) => avisarEn(canalDe('captacion'), t, m, o);
 const avisarEquipo = (t, m, o) => avisarEn(canalDe('equipo'), t, m, o);
 const avisarAdminClientes = (t, m, o) => avisarEn(canalDe('admin_clientes'), t, m, o);
 const avisarAlerta = (t, m, o) => avisarEn(canalDe('alertas'), t, m, o);
-const avisarPagos = (t, m, o) => avisarEn(canalDe('pagos'), t, m, o);   // 15/10: canal 7
+const avisarPagos = (t, m, o) => avisarEn(canalDe('pagos'), t, m, Object.assign({ enlace: PANEL_URL + '/?s=cobros' }, o || {}));   // 27/11: al tocarlo, Cobros   // 15/10: canal 7
 function avisarAdmin(titulo, mensaje, opciones) { return avisarEquipo(titulo, mensaje, opciones); }
 // Fase B (10/10): lo de un cliente concreto va con el nombre de su asesor
 // («💬 Bernardo, un cliente te ha escrito») al canal general (el admin lo
@@ -508,12 +508,13 @@ async function personaDeCliente(clienteId, conn) {
   return f[0] || null;
 }
 function avisarCliente(clienteId, emoji, accion, mensaje, opciones) {
+  if (clienteId) opciones = Object.assign({ enlace: PANEL_URL + '/?cliente=' + clienteId }, opciones || {});   // 27/11: al tocarlo, su ficha
   (async () => {
     let q = null;
     try { q = clienteId ? await personaDeCliente(clienteId) : null; } catch (e) { q = null; }
     const accionM = accion.charAt(0).toUpperCase() + accion.slice(1), ini = q ? await inicialesDePersona(q.id) : '';
-    const titulo = emoji + ' ' + (ini ? ini + ' · ' : '') + accionM;   // 20/10: en los canales generales, las iniciales del asesor (nunca nombres)
-    const tituloPropio = emoji + ' ' + accionM;                       // en su propio canal ya sabe que es para él
+    const titulo = (emoji ? emoji + ' ' : '') + (ini ? ini + ': ' : '') + accionM;   // 20/10: en los canales generales, las iniciales del asesor (nunca nombres)
+    const tituloPropio = (emoji ? emoji + ' ' : '') + accionM;                       // en su propio canal ya sabe que es para él
     if (!(opciones && opciones.soloAsesor)) await avisar(titulo, mensaje, opciones);
     if (q && q.ntfy_topic && q.ntfy_topic !== NTFY_TOPIC) await avisarEn(q.ntfy_topic, tituloPropio, mensaje, opciones);
     // 15/10: y al canal de su equipo (2b), si lo tiene
@@ -701,6 +702,13 @@ async function asegurarEsquema() {
       `);
       await creaIndiceSiFalta('idx_documentos_fiscales_propuesta ON documentos_fiscales (propuesta_id, estado)');
       await creaIndiceSiFalta('idx_documentos_fiscales_estado ON documentos_fiscales (estado, creado_en)');
+      // 26/11 (Vikn): el archivo anterior de un documento que se vuelve a subir (solo lo ve el equipo)
+      await pool.execute(`CREATE TABLE IF NOT EXISTS documentos_versiones (
+          id INT AUTO_INCREMENT PRIMARY KEY, documento_id INT NOT NULL, cliente_id INT NOT NULL,
+          documento_ref VARCHAR(300) NOT NULL, documento_iv VARCHAR(50) NULL, documento_clave_cifrada VARCHAR(1000) NULL, documento_tipo_mime VARCHAR(100) NULL,
+          nombre_original VARCHAR(255) NULL, huella_sha256 VARCHAR(64) NULL, tamano_original BIGINT NULL, subido_en DATETIME NULL,
+          estado_previo VARCHAR(20) NULL, razon_rechazo VARCHAR(300) NULL, reemplazado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_docv_doc (documento_id))`);
 
       // --- Cuentas individuales de asesor (10/09) ---
       // Sustituye la ADMIN_KEY compartida para el uso diario del panel.
@@ -953,6 +961,7 @@ async function asegurarEsquema() {
       await prepararSimulacros();   // 05/11: simulador público «SimulAcros» (contactos y usos)
       await prepararArticulos();   // 11/11: artículos, guías y biblioteca de recuadros
       await prepararPlataformas();   // 11/11: catálogo de plataformas y sus logos
+      await prepararFlujo();   // 24/11: flujo del cliente
       await prepararFormatosArchivo();
       await prepararTemporadas();   // 06/11: temporadas de la web y codigo_promo
       await prepararApariencia();   // 21/11: modo oscuro (bosque o grafito) y tema secreto
@@ -971,6 +980,7 @@ async function asegurarEsquema() {
         'CREATE TABLE IF NOT EXISTS llaves_documento (' +
         " `id` INT AUTO_INCREMENT PRIMARY KEY, `tipo` ENUM('fiscal','identidad') NOT NULL, `objeto_id` INT NOT NULL, `asesor_id` INT NOT NULL," +
         ' `clave_envuelta` VARCHAR(1200) NOT NULL, `creado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY u_llave (`tipo`, `objeto_id`, `asesor_id`))');
+      { const [[ct]] = await pool.query("SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'llaves_documento' AND COLUMN_NAME = 'tipo'"); if (ct && !String(ct.t).includes('fiscal_v')) await pool.execute("ALTER TABLE llaves_documento MODIFY `tipo` ENUM('fiscal','identidad','fiscal_v') NOT NULL"); }   // 26/11: llaves de los archivos anteriores
       // 14/10: enlaces para crear o restablecer la contraseña de un asesor
       await pool.execute(
         'CREATE TABLE IF NOT EXISTS enlaces_contrasena (' +
@@ -1253,8 +1263,8 @@ async function migrarEquipoAPersonas() {
   const [filas] = await pool.execute("SELECT datos, version FROM web_contenido WHERE clave = 'marca'");
   let marca = null; try { marca = filas.length ? JSON.parse(filas[0].datos) : null; } catch (e) { marca = null; }
   const equipo = (marca && Array.isArray(marca.equipo) && marca.equipo.length) ? marca.equipo : [
-    { nombre: 'Bernardo', puesto: { es: 'Asesor fiscal cripto · cofundador', en: 'Crypto tax advisor · co-founder' }, bio: { es: 'Lleva todos los casos: tu declaración, tu presupuesto y tus dudas pasan siempre por sus manos.', en: 'Handles every case: your return, your quote and your questions always go through him.' } },
-    { nombre: 'Jorge', puesto: { es: 'Asesor financiero · cofundador', en: 'Financial advisor · co-founder' }, bio: { es: 'Se asegura de que Acros sea rápido y cercano.', en: 'Makes sure Acros is fast and close to you.' } },
+    { nombre: 'Bernardo', puesto: { es: 'Asesor fiscal cripto y cofundador', en: 'Crypto tax advisor and co-founder' }, bio: { es: 'Lleva todos los casos: tu declaración, tu presupuesto y tus dudas pasan siempre por sus manos.', en: 'Handles every case: your return, your quote and your questions always go through him.' } },
+    { nombre: 'Jorge', puesto: { es: 'Asesor financiero y cofundador', en: 'Financial advisor and co-founder' }, bio: { es: 'Se asegura de que Acros sea rápido y cercano.', en: 'Makes sure Acros is fast and close to you.' } },
   ];
   for (let i = 0; i < equipo.length; i++) {
     const q = equipo[i] || {};
@@ -1380,7 +1390,7 @@ app.post('/api/clientes/2fa/token', async (req, res) => {
   try {
     const [f] = await conn.execute('SELECT c.* FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.token = ?', [String(b.propuesta_token || '')]);
     if (!f.length || !f[0].totp_activo) return res.status(404).json({ error: 'No encontrado' });
-    if (f[0].estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
+    if (!clienteConAcceso(f[0])) return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
     const err = await comprobarCodigoCliente(conn, f[0], b);
     if (err) return res.status(401).json({ error: err });
     const r = { ok: true, sesion: await crearSesionCliente(conn, f[0].id, 1) };
@@ -1570,8 +1580,8 @@ app.get('/api/propuestas/:token/historial', async (req, res) => {
     if (p.inicio_inmediato_en) add(p.inicio_inmediato_en, 'aceptada');
     else if (p.estado === 'aceptada') add(p.actualizado_en || p.creado_en, 'aceptada');
     if (p.estado === 'rechazada') add(p.actualizado_en || p.creado_en, 'rechazada', { motivo: p.motivo_rechazo });
-    const [pagos] = await conn.execute('SELECT metodo, estado, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ?', [p.id]);
-    pagos.forEach(x => { add(x.creado_en, 'pago_declarado', { metodo: x.metodo }); if (x.estado === 'confirmado') add(x.confirmado_en, 'pago_confirmado'); });
+    const [pagos] = await conn.execute('SELECT metodo, estado, creado_en, confirmado_en, rechazado_en FROM pagos WHERE propuesta_id = ?', [p.id]);
+    pagos.forEach(x => { add(x.creado_en, 'pago_declarado', { metodo: x.metodo }); if (x.estado === 'confirmado') add(x.confirmado_en, 'pago_confirmado'); if (x.estado === 'rechazado') add(x.rechazado_en, 'pago_rechazado'); });
     const [dils] = await conn.execute('SELECT estado, creado_en, resuelto_en FROM diligencias WHERE propuesta_id = ?', [p.id]);
     dils.forEach(x => { add(x.creado_en, 'alta_enviada'); if (x.resuelto_en) add(x.resuelto_en, x.estado === 'aprobado' ? 'alta_aprobada' : 'alta_rechazada'); });
     const [docs] = await conn.execute('SELECT nombre, servicio, estado, razon_rechazo, creado_en, subido_en, revisado_en FROM documentos_fiscales WHERE propuesta_id = ?', [p.id]);
@@ -1753,7 +1763,7 @@ app.post('/api/presupuesto', async (req, res) => {
           '<strong>' + lista.map(ESC_HTML).join('<br>') + '</strong>',
           enlaceCuest ? 'Tu asesor te llamará en breve. Si quieres que tu presupuesto llegue antes, cuéntanos un poco más de tu caso: son unas pocas preguntas y no te llevará más de un minuto.'
                       : 'Tu asesor te llamará en breve para comentar tu caso y te enviará tu propuesta a medida en menos de 24 horas.'],
-        boton: enlaceCuest ? { texto: 'Completar el cuestionario · 1 min', url: enlaceCuest } : null,
+        boton: enlaceCuest ? { texto: 'Completar el cuestionario (1 min)', url: enlaceCuest } : null,
         nota: 'Si no has pedido tú este presupuesto, ignora este correo.',
       });
       enviarCorreo(String(correo).trim(), 'Hemos recibido tu solicitud de presupuesto', c.html, c.texto)
@@ -2759,19 +2769,19 @@ app.get('/api/admin/mis-canales', requiereSesionAsesor, async (req, res) => {
   const R = req.asesor.roles, lista = [];
   const add = (clave, titulo, canal, desc) => { if (canal && !lista.some(x => x.clave === clave)) lista.push({ clave, titulo, canal, desc }); };
   const admin = R.has('admin');
-  if (admin || R.has('jefe') || R.has('encargado')) add('captacion', '1 · Clientes · captación', canalDe('captacion'), 'Solicitudes, cuestionarios, llamadas y empresas.');
-  if (admin) add('actividad', '2 · Clientes · actividad (general)', canalDe('actividad'), 'Todo lo de todos los clientes.');
+  if (admin || R.has('jefe') || R.has('encargado')) add('captacion', '1. Clientes: captación', canalDe('captacion'), 'Solicitudes, cuestionarios, llamadas y empresas.');
+  if (admin) add('actividad', '2. Clientes: actividad (general)', canalDe('actividad'), 'Todo lo de todos los clientes.');
   const [mias] = await pool.execute('SELECT id, ntfy_topic, equipo_id FROM personas WHERE asesor_id = ?', [req.asesor.id]);
   const misIds = mias.map(x => x.id);
   if (misIds.length && (admin || R.has('jefe') || R.has('encargado'))) {
     const [eqs] = await pool.query('SELECT nombre, ntfy_topic FROM equipos WHERE activo = 1 AND ntfy_topic IS NOT NULL AND (' + (admin ? '1' : '0') + ' OR ' + (R.has('jefe') ? 'jefe_persona_id IN (?)' : '0') + ' OR ' + (R.has('encargado') ? 'encargado_persona_id IN (?)' : '0') + ')', [misIds, misIds]);
-    eqs.forEach(e => add('equipo_' + e.nombre, '2b · Equipo ' + e.nombre, e.ntfy_topic, 'La actividad de los clientes de ese equipo.'));
-  } else if (admin) { const [eqs] = await pool.execute('SELECT nombre, ntfy_topic FROM equipos WHERE activo = 1 AND ntfy_topic IS NOT NULL'); eqs.forEach(e => add('equipo_' + e.nombre, '2b · Equipo ' + e.nombre, e.ntfy_topic, 'La actividad de los clientes de ese equipo.')); }
-  if (admin || R.has('encargado')) { add('equipo', '3 · Admin · equipo', canalDe('equipo'), 'Cuentas de los asesores.'); add('admin_clientes', '4 · Admin · clientes', canalDe('admin_clientes'), 'Sugerencias, cambios de asesor y valoraciones.'); }
-  if (admin || R.has('informatico')) add('alertas', '5 · Admin · alertas', canalDe('alertas'), 'Lo técnico.');
-  if (['asesor', 'jefe', 'encargado', 'admin'].some(x => R.has(x))) mias.forEach(m => add('propio', '6 · Tu canal de asesor', m.ntfy_topic, 'Lo de tus clientes.'));
-  if (admin) { const [todos] = await pool.execute('SELECT nombre, ntfy_topic FROM personas WHERE ntfy_topic IS NOT NULL AND activa = 1 AND asesor_id <> ?', [req.asesor.id]); todos.forEach(t => add('asesor_' + t.nombre, '6 · Canal de ' + t.nombre, t.ntfy_topic, 'Lo de los clientes de ' + t.nombre + '.')); }
-  if (admin || R.has('encargado')) add('pagos', '7 · Pagos', canalDe('pagos'), 'Pagos declarados, con tarjeta y confirmaciones.');
+    eqs.forEach(e => add('equipo_' + e.nombre, '2b. Equipo ' + e.nombre, e.ntfy_topic, 'La actividad de los clientes de ese equipo.'));
+  } else if (admin) { const [eqs] = await pool.execute('SELECT nombre, ntfy_topic FROM equipos WHERE activo = 1 AND ntfy_topic IS NOT NULL'); eqs.forEach(e => add('equipo_' + e.nombre, '2b. Equipo ' + e.nombre, e.ntfy_topic, 'La actividad de los clientes de ese equipo.')); }
+  if (admin || R.has('encargado')) { add('equipo', '3. Admin: equipo', canalDe('equipo'), 'Cuentas de los asesores.'); add('admin_clientes', '4. Admin: clientes', canalDe('admin_clientes'), 'Sugerencias, cambios de asesor y valoraciones.'); }
+  if (admin || R.has('informatico')) add('alertas', '5. Admin: alertas', canalDe('alertas'), 'Lo técnico.');
+  if (['asesor', 'jefe', 'encargado', 'admin'].some(x => R.has(x))) mias.forEach(m => add('propio', '6. Tu canal de asesor', m.ntfy_topic, 'Lo de tus clientes.'));
+  if (admin) { const [todos] = await pool.execute('SELECT nombre, ntfy_topic FROM personas WHERE ntfy_topic IS NOT NULL AND activa = 1 AND asesor_id <> ?', [req.asesor.id]); todos.forEach(t => add('asesor_' + t.nombre, '6. Canal de ' + t.nombre, t.ntfy_topic, 'Lo de los clientes de ' + t.nombre + '.')); }
+  if (admin || R.has('encargado')) add('pagos', '7. Pagos', canalDe('pagos'), 'Pagos declarados, con tarjeta y confirmaciones.');
   res.json({ servidor: NTFY_SERVER, canales: lista, roles: [...R] });
 });
 
@@ -2794,8 +2804,8 @@ app.put('/api/admin/canales', requiereSesionAsesor, requiereAdminWeb, async (req
 app.post('/api/admin/canales/prueba', requiereSesionAsesor, requiereAdminWeb, async (req, res) => {
   const k = String((req.body && req.body.canal) || '');
   if (!(k in CANALES)) return res.status(400).json({ error: 'Canal desconocido' });
-  const nombres = { captacion: 'Clientes · captación', actividad: 'Clientes · actividad', equipo: 'Admin · equipo', admin_clientes: 'Admin · clientes', alertas: 'Admin · alertas', pagos: 'Pagos' };
-  const ok = await avisarEn(canalDe(k), '🔔 Prueba · ' + nombres[k], 'Si ves esto, este canal funciona.', { etiqueta: 'tada' });
+  const nombres = { captacion: 'Clientes: captación', actividad: 'Clientes: actividad', equipo: 'Admin: equipo', admin_clientes: 'Admin: clientes', alertas: 'Admin: alertas', pagos: 'Pagos' };
+  const ok = await avisarEn(canalDe(k), '🔔 Prueba: ' + nombres[k], 'Si ves esto, este canal funciona.', { etiqueta: 'tada' });
   if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso.' });
   res.json({ ok: true, canal: canalDe(k) });
 });
@@ -2969,7 +2979,8 @@ app.post('/api/admin/mi-maestra', requiereSesionAsesor, requiereAdminWeb, async 
 });
 // Quién tiene derecho a cada documento (sus asesores, sin contar admins)
 const SQL_DOCS = "SELECT 'fiscal' AS tipo, d.id AS objeto_id, d.cliente_id, d.documento_clave_cifrada AS clave_cifrada FROM documentos_fiscales d WHERE d.documento_clave_cifrada IS NOT NULL " +
-  "UNION ALL SELECT 'identidad', g.id, g.cliente_id, g.documento_clave_cifrada FROM diligencias g WHERE g.documento_clave_cifrada IS NOT NULL";
+  "UNION ALL SELECT 'identidad', g.id, g.cliente_id, g.documento_clave_cifrada FROM diligencias g WHERE g.documento_clave_cifrada IS NOT NULL " +
+  "UNION ALL SELECT 'fiscal_v', v.id, v.cliente_id, v.documento_clave_cifrada FROM documentos_versiones v WHERE v.documento_clave_cifrada IS NOT NULL";   // 26/11: versiones anteriores
 const SQL_DERECHO = 'SELECT c.id AS cliente_id, q.asesor_id FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id WHERE q.asesor_id IS NOT NULL ' +
   'UNION SELECT p.cliente_id, q.asesor_id FROM colaboraciones co JOIN personas q ON q.id = co.persona_id JOIN propuestas p ON p.id = co.propuesta_id WHERE q.asesor_id IS NOT NULL ' +
   // 20/10 (fase 4): el jefe del equipo del titular y el encargado de ese equipo (los que ya ven al cliente en el panel)
@@ -3323,6 +3334,8 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
   const { correo, telefono, servicios, importe_centimos } = req.body;
   const cobro = (req.body && req.body.cobro === 'despues') ? 'despues' : 'antes';   // 29/10: cobrar antes de empezar o pagar después
   const normalizado = correo ? normalizarServiciosPropuesta(servicios, importe_centimos) : null;
+  { const fuera = normalizado ? normalizado.servicios.map(x => typeof x === 'object' ? x.id : x).filter(id => !Object.entries(TIPOS_SERVICIO).some(([t, d]) => t === id || d.legacy === id)) : [];   // 26/11 (menor)
+    if (fuera.length) return res.status(400).json({ error: 'Servicio que no está en el catálogo: ' + fuera.join(', ') }); }
   if (!correo || !normalizado) {
     return res.status(400).json({ error: 'Faltan datos: correo, y servicios — o bien un array de ids + importe_centimos, o bien un array de {id, precio_centimos} con el desglose' });
   }
@@ -3355,6 +3368,8 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
       'INSERT INTO propuestas (cliente_id, servicios, importe_centimos, token, token_expira_en, creado_por_asesor_id, servicios_detalle, cobro, amplia_a) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [cliente.id, JSON.stringify(normalizado.servicios), normalizado.importe_centimos, token, aSQLDatetime(expira), req.asesor.id, ejerciciosN.detalle ? JSON.stringify(ejerciciosN.detalle) : null, cobro, ampliaA]
     );
+    { const nota = String((req.body || {}).nota || '').trim().slice(0, 1500), pl = String((req.body || {}).nota_plantilla || '').slice(0, 40);   // 24/11: la nota de la carta
+      if (nota) await conn.execute('UPDATE propuestas SET nota = ?, nota_plantilla = ? WHERE id = ?', [nota, pl || null, r.insertId]); }
     const retirar = (Array.isArray(req.body.retirar) ? req.body.retirar : []).map(Number).filter(n => Number.isInteger(n) && n > 0 && n !== r.insertId);   // 21/10
     if (retirar.length) await conn.query("UPDATE propuestas SET estado = 'caducada', token_expira_en = NOW() WHERE id IN (?) AND cliente_id = ? AND estado = 'enviada'", [retirar, cliente.id]);
     await conn.commit();
@@ -3366,14 +3381,14 @@ app.post('/api/propuestas', requiereSesionAsesor, async (req, res) => {
       const correoP = plantillaCorreo(enlace ? {
         titulo: encargoAmpliado ? 'Ampliación de tu encargo' : 'Tu propuesta está lista',
         parrafos: [
-          'Hola:',
+          cliente.nombre ? `Hola, ${ESC_HTML(cliente.nombre)}:` : 'Hola:',
           `${quienP} ha preparado ${encargoAmpliado ? 'una ampliación de tu encargo del ' + fechaLargaES(new Date(encargoAmpliado.creado_en)) + ' (solo lo que se añade)' : 'tu propuesta'}, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Ábrela para ver qué incluye y, si te encaja, acéptala en un par de clics.`,
         ],
-        boton: { texto: 'Ver mi propuesta', url: enlace },
+        boton: { texto: 'Entrar en mi área', url: enlace },
         nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido. Si tienes cualquier duda, escríbenos a <a href="mailto:hola@acrosfi.es" style="color:#A84C18;">hola@acrosfi.es</a> o llámanos al 668 17 00 20.`,
       } : {
         titulo: encargoAmpliado ? 'Ampliación de tu encargo' : 'Tu propuesta está lista',
-        parrafos: ['Hola:', `${quienP} ha preparado ${encargoAmpliado ? 'una ampliación de tu encargo del ' + fechaLargaES(new Date(encargoAmpliado.creado_en)) + ' (solo lo que se añade)' : 'tu propuesta'}, por <strong>${ESC_HTML(importeTexto)}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
+        parrafos: [cliente.nombre ? `Hola, ${ESC_HTML(cliente.nombre)}:` : 'Hola:', `${quienP} ha preparado ${encargoAmpliado ? 'una ampliación de tu encargo del ' + fechaLargaES(new Date(encargoAmpliado.creado_en)) + ' (solo lo que se añade)' : 'tu propuesta'}, por <strong>${ESC_HTML(importeTexto.replace('.', ','))}</strong>. Tu código de acceso es: <strong>${ESC_HTML(token)}</strong>`],
         nota: `La propuesta es válida 15 días: hasta el ${fechaLargaES(expira)}, incluido.`,
       });
       try {
@@ -3428,7 +3443,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [clientes] = await conn.execute('SELECT correo, telefono, nombre, apellidos, tipo_documento, numero_documento, creado_en, codigo FROM clientes WHERE id = ?', [p.cliente_id]);
-    const [pagos] = await conn.execute('SELECT metodo, estado, hash_transaccion, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
+    const [pagos] = await conn.execute("SELECT metodo, estado, hash_transaccion, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? AND estado <> 'rechazado' ORDER BY (estado = 'confirmado') DESC, id DESC LIMIT 1", [p.id]);
     const [diligencias] = await conn.execute('SELECT estado, coherencia, resuelto_en FROM diligencias WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1', [p.id]);
     // Solo interesa mandar la lista de documentos una vez la diligencia está
     // aprobada — antes de eso la sección sigue bloqueada en el navegador, y
@@ -3436,7 +3451,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
     // aquí (solo referencia/estado): el archivo se pide aparte, igual que
     // el del DNI.
     let documentos = [];
-    if (diligencias[0] && diligencias[0].estado === 'aprobado') {
+    if (diligencias[0] && ['revision', 'examen', 'aprobado'].includes(diligencias[0].estado)) {   // 26/11 (Vikn, M7): con el alta enviada, ya
       const [filas] = await conn.execute(
         'SELECT id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en FROM documentos_fiscales WHERE propuesta_id = ? ORDER BY creado_en',
         [p.id]
@@ -3445,7 +3460,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
     }
     const subidasHoy = await subidasDeHoy(conn, p.cliente_id);   // 15/10
     const [entregasCli] = await conn.execute(
-      'SELECT e.`id`, e.`propuesta_id`, e.`servicio`, e.`version`, e.`nombre_archivo`, e.`bytes`, e.`subido_en`, e.`estado`, e.`comentario`, e.`respondido_en`, p2.`creado_en` AS propuesta_creada ' +
+      'SELECT e.`id`, e.`propuesta_id`, e.`servicio`, e.`version`, e.`nombre_archivo`, e.`bytes`, e.`subido_en`, e.`estado`, e.`comentario`, e.`respondido_en`, e.`resumen`, p2.`creado_en` AS propuesta_creada ' +   // 25/11: el resumen
       'FROM entregas e JOIN propuestas p2 ON p2.`id` = e.`propuesta_id` ' +
       'WHERE e.`cliente_id` = ? AND e.`id` = (SELECT MAX(e2.`id`) FROM entregas e2 WHERE e2.`propuesta_id` = e.`propuesta_id` AND e2.`servicio` = e.`servicio`) ' +
       'ORDER BY e.`subido_en` DESC', [p.cliente_id]);
@@ -3453,13 +3468,14 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
     const [dispoTodas] = await conn.query('SELECT * FROM personas WHERE `activa` = 1 AND `atiende_clientes` = 1 ORDER BY `orden`, `id`');
     const [camb] = await conn.execute("SELECT `a_persona_id`, `creado_en` FROM cambios_asesor WHERE `cliente_id` = ? AND `estado` = 'pendiente' ORDER BY `id` DESC LIMIT 1", [p.cliente_id]);
     const personaPublica = q => { if (!q) return null; let esp = []; try { esp = JSON.parse(q.especialidades || '[]'); } catch (e) {} return { id: q.id, nombre: q.nombre, puesto: { es: q.puesto_es || '', en: q.puesto_en || '' }, bio: { es: q.bio_es || '', en: q.bio_en || '' }, foto: q.foto, especialidades: Array.isArray(esp) ? esp : [] }; };
-    const [valor] = await conn.execute('SELECT `estado` FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
+    const [valor] = await conn.execute('SELECT `estado`, `atencion`, `calidad`, `rapidez`, `comentario`, `nombre_publico`, (`creado_en` >= NOW() - INTERVAL 7 DAY) AS cambiable, DATE_ADD(`creado_en`, INTERVAL 7 DAY) AS cambiable_hasta FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
     res.json({
       asesor: personaPublica(asesorCli),
       asesores_disponibles: dispoTodas.filter(x => !asesorCli || !asesorCli.equipo_id || x.equipo_id === asesorCli.equipo_id || x.id === asesorCli.id || (camb[0] && camb[0].a_persona_id === x.id)).map(personaPublica),   // 29/10: los de su equipo
       cambio_asesor_pendiente: camb[0] || null,
       cambio_discreto: !(asesorCli && asesorCli.asesor_id && ((await conn.execute('SELECT es_admin, roles FROM asesores WHERE id = ?', [asesorCli.asesor_id]))[0].some(x => x.es_admin || /admin/.test(String(x.roles || ''))))),   // 21/11: el asesor actual no recibe el aviso salvo que sea administrador
       valoracion: valor[0] ? valor[0].estado : null,
+      valoracion_mia: valor[0] && valor[0].estado !== 'omitida' ? { atencion: valor[0].atencion, calidad: valor[0].calidad, rapidez: valor[0].rapidez, comentario: valor[0].comentario || '', nombre_publico: valor[0].nombre_publico, cambiable: !!valor[0].cambiable, cambiable_hasta: valor[0].cambiable_hasta } : null,   // 27/11
       dos_pasos_activo: !!(await conn.execute('SELECT totp_activo FROM clientes WHERE id = ?', [p.cliente_id]))[0][0].totp_activo,
       colaboradores: (await conn.execute("SELECT q.nombre FROM colaboraciones co JOIN personas q ON q.id = co.persona_id WHERE co.propuesta_id = ? AND co.estado = 'confirmada' ORDER BY co.id", [p.id]))[0].map(x => x.nombre),
       entregas: pagos.some(g => g.estado === 'confirmado') ? entregasCli.filter(e => e.propuesta_id === p.id) : [],
@@ -3470,6 +3486,7 @@ app.get('/api/propuestas/:token/estado', async (req, res) => {
       propuesta: { estado: p.estado, servicios: JSON.parse(p.servicios), importe_centimos: p.importe_centimos, motivo_rechazo: p.motivo_rechazo, expira_en: p.token_expira_en, creado_en: p.creado_en, inicio_inmediato_en: p.inicio_inmediato_en },
       cliente: clientes[0] || null,
       pago: pagos[0] || null,
+      tarjeta: stripeActivo(),   // 26/11: sin Stripe conectado, la tarjeta no aparece
       diligencia: diligencias[0] || null,
       documentos, subidas_hoy: subidasHoy, limite_subidas: LIMITE_SUBIDAS_DIA,
     });
@@ -3528,7 +3545,7 @@ app.post('/api/propuestas/:token/aceptar', async (req, res) => {
     // (art. 98.8 y 103.a TRLGDCU: es lo que permite empezar antes de que
     // acaben los 14 días de desistimiento). Se guarda cuándo lo marcó.
     if (!(req.body && req.body.inicio_inmediato === true)) return res.status(400).json({ error: 'Para aceptar, marca la casilla de inicio inmediato del servicio' });
-    await conn.execute('UPDATE propuestas SET estado = ?, `inicio_inmediato_en` = NOW() WHERE id = ?', ['aceptada', p.id]);
+    await conn.execute('UPDATE propuestas SET estado = ?, `inicio_inmediato_en` = NOW(), `aceptada_en` = NOW() WHERE id = ?', ['aceptada', p.id]);
     // 20/10: cada servicio contratado pasa a tener su ejercicio, plazo y estado (si falla, se completa al reiniciar)
     await crearServiciosDePropuesta(conn, p).catch(err => console.error('Servicios del encargo ' + p.id + ':', err.message));
     await heredarAlta(conn, Object.assign({}, p, { estado: 'aceptada' })).catch(err => console.error('Alta heredada del encargo ' + p.id + ':', err.message));   // 21/10
@@ -3540,14 +3557,16 @@ app.post('/api/propuestas/:token/aceptar', async (req, res) => {
 });
 
 app.post('/api/propuestas/:token/rechazar', async (req, res) => {
-  const motivo = (req.body.motivo || '').trim().slice(0, 500) || null;
+  const tipo = MOTIVOS_RECHAZO[(req.body || {}).motivo_tipo] ? req.body.motivo_tipo : null;   // 24/11: motivo de la lista
+  const texto = String((req.body || {}).motivo || '').trim().slice(0, 500);
+  const motivo = texto || (tipo ? MOTIVOS_RECHAZO[tipo] : '') || null;
   const conn = await pool.getConnection();
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'enviada') return res.status(409).json({ error: `No se puede rechazar: estado actual "${p.estado}"` });
-    await conn.execute('UPDATE propuestas SET estado = ?, motivo_rechazo = ? WHERE id = ?', ['rechazada', motivo, p.id]);
-    avisarCliente(p.cliente_id, '❌', 'un cliente ha rechazado su propuesta', 'Mira el motivo en su ficha.', { etiqueta: 'x' });
+    await conn.execute('UPDATE propuestas SET estado = ?, motivo_rechazo = ?, motivo_tipo = ?, rechazada_en = NOW() WHERE id = ?', ['rechazada', motivo, tipo, p.id]);
+    avisarCliente(p.cliente_id, '❌', 'un cliente ha rechazado su propuesta', (tipo ? 'Motivo: ' + MOTIVOS_RECHAZO[tipo] + (texto ? '. ' : '') : '') + (texto ? '«' + texto.slice(0, 160) + '»' : '') + (tipo || texto ? '' : 'No ha dicho por qué.') + ' Desde su ficha puedes prepararle otra propuesta o escribirle un correo (su respuesta vuelve a la ficha).', { etiqueta: 'x' });
     res.json({ ok: true, estado: 'rechazada' });
   } finally {
     conn.release();
@@ -3564,6 +3583,7 @@ const MONEDAS_CRIPTO = ['btc', 'eth', 'sol', 'usdc', 'usdt'];
 
 app.post('/api/propuestas/:token/pago', async (req, res) => {
   const { metodo, hash_transaccion, red, moneda_cripto, importe_cripto } = req.body;
+  if (metodo === 'tarjeta' && stripeActivo()) return res.status(409).json({ error: 'El pago con tarjeta se hace en la página segura de Stripe.', codigo: 'usa_stripe' });   // 26/11
   if (!METODOS_PAGO.includes(metodo)) {
     return res.status(400).json({ error: `Método no válido. Debe ser uno de: ${METODOS_PAGO.join(', ')}` });
   }
@@ -3586,11 +3606,22 @@ app.post('/api/propuestas/:token/pago', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (p.estado !== 'aceptada') return res.status(409).json({ error: `No se puede declarar el pago: la propuesta está "${p.estado}", no "aceptada"` });
     if (p.importe_corregido_en && !p.importe_aceptado_en) return res.status(409).json({ error: 'Antes de pagar, acepta el importe corregido', codigo: 'importe_sin_aceptar' });   // 18/11
-    const [r] = await conn.execute(
+    // 26/11 (auditoría G5): un solo pago por encargo. Antes se aceptaban todos los «Ya he pagado», incluso con el pago confirmado.
+    let r; await conn.beginTransaction();
+    try {
+    await conn.execute('SELECT id FROM propuestas WHERE id = ? FOR UPDATE', [p.id]);
+    const [yaPg] = await conn.execute("SELECT estado FROM pagos WHERE propuesta_id = ? AND estado IN ('autodeclarado', 'confirmado')", [p.id]);
+    if (yaPg.some(x => x.estado === 'confirmado')) { await conn.rollback(); return res.status(409).json({ error: 'Este encargo ya está pagado.', codigo: 'ya_pagado' }); }
+    if (yaPg.length) { await conn.rollback(); return res.status(409).json({ error: 'Ya nos dijiste que habías pagado este encargo. Lo estamos confirmando.', codigo: 'pago_en_revision' }); }
+    // 26/11 (auditoría G8): el importe en cripto lo calcula el servidor con el precio del catálogo (el que manda el navegador no vale para verificar)
+    const impCripto = metodo === 'cripto' ? await importeCriptoEsperado(conn, p.importe_centimos, moneda_cripto) : null;
+    [r] = await conn.execute(
       'INSERT INTO pagos (propuesta_id, metodo, hash_transaccion, red, moneda_cripto, importe_cripto) VALUES (?, ?, ?, ?, ?, ?)',
       [p.id, metodo, (hash_transaccion || '').trim() || null, metodo === 'cripto' ? red : null,
-       metodo === 'cripto' ? moneda_cripto : null, metodo === 'cripto' ? String(importe_cripto) : null]
+       metodo === 'cripto' ? moneda_cripto : null, impCripto]   // 26/11: lo calcula el servidor; sin precio, NULL (antes guardaba «undefined»)
     );
+    await conn.commit();
+    } catch (e) { await conn.rollback().catch(() => {}); throw e; }
     avisarPagos('💶 Un cliente ha declarado un pago', 'Confírmalo en «Pagos pendientes de confirmar».', { prioridad: 4, etiqueta: 'euro' });
     avisarCliente(p.cliente_id, '💶', 'un cliente ha declarado un pago', 'Lo confirmará un encargado o un administrador.', { prioridad: 4, etiqueta: 'euro' });
     res.status(201).json({ ok: true, pago_id: r.insertId, estado: 'autodeclarado' });
@@ -3605,12 +3636,12 @@ app.get('/api/admin/pagos', requiereSesionAsesor, async (req, res) => {
   try {
     const [filas] = estado
       ? await conn.execute(
-          `SELECT pg.*, p.token, c.correo, c.id AS cliente_id FROM pagos pg
+          `SELECT pg.*, p.token, p.importe_centimos, p.servicios, c.correo, c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.id AS cliente_id FROM pagos pg
            JOIN propuestas p ON p.id = pg.propuesta_id
            JOIN clientes c ON c.id = p.cliente_id
            WHERE pg.estado = ? ORDER BY pg.creado_en`, [estado])
       : await conn.execute(
-          `SELECT pg.*, p.token, c.correo, c.id AS cliente_id FROM pagos pg
+          `SELECT pg.*, p.token, p.importe_centimos, p.servicios, c.correo, c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.id AS cliente_id FROM pagos pg
            JOIN propuestas p ON p.id = pg.propuesta_id
            JOIN clientes c ON c.id = p.cliente_id
            ORDER BY pg.creado_en`);
@@ -3620,13 +3651,410 @@ app.get('/api/admin/pagos', requiereSesionAsesor, async (req, res) => {
   }
 });
 
+// 26/11 (auditoría G4): «No ha llegado»
+// 26/11 (Vikn): devoluciones. Las registra quien lleva los cobros (encargado o administrador); el cliente las pide por soporte.
+let tablaDevoluciones = null;
+const asegurarDevoluciones = () => tablaDevoluciones || (tablaDevoluciones = pool.execute(`CREATE TABLE IF NOT EXISTS devoluciones (
+  id INT AUTO_INCREMENT PRIMARY KEY, pago_id INT NOT NULL, propuesta_id INT NOT NULL, cliente_id INT NOT NULL,
+  importe_centimos INT NOT NULL, motivo VARCHAR(300) NULL, origen ENUM('asesor','alta_no_aprobada') NOT NULL DEFAULT 'asesor',
+  estado ENUM('pendiente','hecha') NOT NULL DEFAULT 'pendiente', creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, creado_por INT NULL,
+  hecha_en DATETIME NULL, hecha_por INT NULL, INDEX idx_dev_estado (estado), INDEX idx_dev_propuesta (propuesta_id))`)
+  .then(async () => {   // 26/11 (Vikn): con la devolución total, el pago pasa a «devuelto» y los servicios a «cancelado»
+    const tipo = async (t, c) => { const [[x]] = await pool.query('SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?', [t, c]); return x ? String(x.t) : ''; };
+    const tp = await tipo('pagos', 'estado'); if (tp && !tp.includes('devuelto')) await pool.query("ALTER TABLE pagos MODIFY estado ENUM('autodeclarado','confirmado','rechazado','devuelto') NOT NULL DEFAULT 'autodeclarado'");
+    const ts = await tipo('servicios_cliente', 'estado'); if (ts && !ts.includes('cancelado')) await pool.query("ALTER TABLE servicios_cliente MODIFY estado ENUM('abierto','por_confirmar','terminado','cerrado_sin_respuesta','cancelado') NOT NULL DEFAULT 'abierto'");
+  }).catch(e => { tablaDevoluciones = null; throw e; }));
+// 26/11 (Vikn): devuelto entero (lo devuelto y lo pendiente de devolver cubren el importe): el cliente no puede acceder a nada de ese encargo,
+// porque nos ha hecho trabajar gratis. El pago queda «devuelto» (todo lo que pide un pago confirmado deja de abrirse) y sus servicios, cancelados.
+async function cerrarSiDevueltoEntero(conn, propuestaId, asesorId) {
+  await asegurarDevoluciones();
+  const [[p]] = await conn.execute('SELECT importe_centimos FROM propuestas WHERE id = ?', [propuestaId]);
+  if (!p || await devueltoDe(conn, propuestaId) < Number(p.importe_centimos)) return false;
+  await conn.execute("UPDATE pagos SET estado = 'devuelto' WHERE propuesta_id = ? AND estado = 'confirmado'", [propuestaId]);
+  const [svs] = await conn.execute("SELECT id FROM servicios_cliente WHERE propuesta_id = ? AND estado <> 'cancelado'", [propuestaId]);
+  for (const x of svs) {
+    await conn.execute("UPDATE servicios_cliente SET estado = 'cancelado', cerrado_en = NOW(), propuesto_en = NULL, propuesto_por = NULL WHERE id = ?", [x.id]);
+    await apuntarServicio(conn, x.id, 'cancelado', 'asesor', asesorId || null, 'devolución total del encargo').catch(() => {});
+  }
+  return true;
+}
+async function devueltoDe(conn, propuestaId) {   // lo devuelto o pendiente de devolver de un encargo
+  await asegurarDevoluciones();
+  const [[r]] = await conn.execute('SELECT COALESCE(SUM(importe_centimos), 0) AS n FROM devoluciones WHERE propuesta_id = ?', [propuestaId]);
+  return Number(r.n) || 0;
+}
+async function correoDevolucion(devId) {
+  if (!brevoActivo()) return 'sin_servicio';
+  const conn = await pool.getConnection();
+  try {
+    const [[x]] = await conn.execute('SELECT d.importe_centimos, d.cliente_id, p.token, c.correo, c.nombre FROM devoluciones d JOIN propuestas p ON p.id = d.propuesta_id JOIN clientes c ON c.id = d.cliente_id WHERE d.id = ?', [devId]);
+    if (!x || !x.correo) return 'sin_correo';
+    const asesor = await personaDeCliente(x.cliente_id, conn).catch(() => null), enlace = enlaceArea('area', x.token), cuanto = eurosCorreo(x.importe_centimos);
+    const c = plantillaCorreo({ titulo: 'Te hemos devuelto ' + cuanto,
+      parrafos: [x.nombre ? `Hola, ${ESC_HTML(x.nombre)}:` : 'Hola:', `Te hemos devuelto <strong>${cuanto}</strong> de tu encargo. Según cómo pagaste, puede tardar unos días en aparecer en tu cuenta.`,
+        'Si tienes cualquier duda, ' + (asesor ? 'escribe a ' + ESC_HTML(asesor.nombre) : 'escríbenos') + ' desde tu área.'],
+      boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null });
+    await enviarCorreo(x.correo, 'Te hemos devuelto ' + cuanto, c.html, c.texto, { desde: 'asesor' });
+    return 'enviado';
+  } catch (err) { console.error('Correo de devolución no enviado:', err.message); return 'error'; } finally { conn.release(); }
+}
+app.post('/api/admin/pagos/:id(\\d+)/devolucion', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const b = req.body || {}, motivo = String(b.motivo || '').trim().slice(0, 300), importe = Math.round(Number(b.importe_centimos));
+  if (motivo.length < 3) return res.status(400).json({ error: 'Escribe el motivo de la devolución' });
+  if (!(importe > 0)) return res.status(400).json({ error: 'Revisa el importe' });
+  await asegurarStripe();   // 26/11: Stripe (incluye las devoluciones)
+  const conn = await pool.getConnection();
+  try {
+    const [[pg]] = await conn.execute('SELECT pg.id, pg.estado, pg.propuesta_id, pg.stripe_pi, p.cliente_id, p.importe_centimos FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(req.params.id)]);
+    if (!pg) return res.status(404).json({ error: 'Pago no encontrado' });
+    if (pg.estado !== 'confirmado') return res.status(409).json({ error: 'Solo se puede devolver un pago confirmado' });
+    const queda = Number(pg.importe_centimos) - await devueltoDe(conn, pg.propuesta_id);
+    if (importe > queda) return res.status(409).json({ error: queda > 0 ? 'Como mucho se pueden devolver ' + eurosCorreo(queda) : 'Ese encargo ya está devuelto entero' });
+    const porStripe = !!pg.stripe_pi && stripeActivo(), hecha = !porStripe && b.hecha !== false;   // 26/11: un pago con tarjeta lo devuelve Stripe
+    const [r] = await conn.execute("INSERT INTO devoluciones (pago_id, propuesta_id, cliente_id, importe_centimos, motivo, origen, estado, creado_por, hecha_en, hecha_por) VALUES (?, ?, ?, ?, ?, 'asesor', ?, ?, ?, ?)",
+      [pg.id, pg.propuesta_id, pg.cliente_id, importe, motivo, hecha ? 'hecha' : 'pendiente', req.asesor.id, hecha ? aSQLDatetime(ahora()) : null, hecha ? req.asesor.id : null]);
+    const [cl] = await conn.execute('SELECT nombre, apellidos, correo FROM clientes WHERE id = ?', [pg.cliente_id]);
+    req.body = Object.assign({}, req.body, { cliente: cl.length ? ([cl[0].nombre, cl[0].apellidos].filter(Boolean).join(' ') || cl[0].correo) : '' });   // para el registro de actividad
+    let rs = null;
+    if (porStripe) {
+      try { rs = await devolverConStripe(r.insertId, req.asesor.id); }
+      catch (e) { if (!e.stripe) throw e; await conn.execute('DELETE FROM devoluciones WHERE id = ?', [r.insertId]); return res.status(502).json({ error: 'Stripe no ha aceptado la devolución: ' + e.message }); }
+    }
+    const cerrado = await cerrarSiDevueltoEntero(conn, pg.propuesta_id, req.asesor.id);   // 26/11: devuelto entero, sin acceso a nada
+    res.status(201).json({ ok: true, id: r.insertId, estado: rs ? rs.estado : hecha ? 'hecha' : 'pendiente', stripe: !!rs, encargo_cancelado: cerrado, correo: rs ? rs.correo || 'no_hace_falta' : hecha ? await correoDevolucion(r.insertId) : 'no_hace_falta' });
+  } finally { conn.release(); }
+});
+app.get('/api/admin/devoluciones', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  await asegurarStripe();
+  const hechas = req.query.estado === 'hecha';
+  const [f] = await pool.query('SELECT d.*, c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos, c.correo, pg.metodo, (pg.stripe_pi IS NOT NULL) AS por_stripe FROM devoluciones d JOIN clientes c ON c.id = d.cliente_id JOIN pagos pg ON pg.id = d.pago_id WHERE d.estado = ? ORDER BY d.creado_en' + (hechas ? ' DESC LIMIT 100' : ''), [hechas ? 'hecha' : 'pendiente']);
+  res.json(f);
+});
+app.post('/api/admin/devoluciones/:id(\\d+)/hecha', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  await asegurarStripe();
+  const id = Number(req.params.id), aMano = !!(req.body || {}).a_mano;
+  const [[d]] = await pool.execute('SELECT d.estado, d.stripe_refund, pg.stripe_pi FROM devoluciones d JOIN pagos pg ON pg.id = d.pago_id WHERE d.id = ?', [id]);
+  if (!d || d.estado !== 'pendiente') return res.status(409).json({ error: 'Esa devolución ya estaba hecha o no existe' });
+  if (d.stripe_pi && stripeActivo() && !aMano) {   // 26/11: con tarjeta, la hace Stripe (o se comprueba la que ya está en marcha)
+    try { return res.json(Object.assign({ ok: true, stripe: true }, await devolverConStripe(id, req.asesor.id))); }
+    catch (e) { if (!e.stripe) throw e; return res.status(502).json({ error: 'Stripe no ha aceptado la devolución: ' + e.message }); }
+  }
+  if (d.stripe_refund) return res.status(409).json({ error: 'Esa devolución está en marcha en Stripe: se marcará sola cuando la confirme' });
+  const [r] = await pool.execute("UPDATE devoluciones SET estado = 'hecha', hecha_en = NOW(), hecha_por = ? WHERE id = ? AND estado = 'pendiente'", [req.asesor.id, id]);
+  if (!r.affectedRows) return res.status(409).json({ error: 'Esa devolución ya estaba hecha o no existe' });
+  res.json({ ok: true, estado: 'hecha', correo: await correoDevolucion(id) });
+});
+// ================================================================
+// 26/11 (Vikn): STRIPE. Pago con tarjeta (Apple Pay y Google Pay van con ella) en la página de pago de Stripe (Checkout).
+// Claves, en las variables de Railway: STRIPE_SECRET_KEY (la clave restringida, rk_) y STRIPE_WEBHOOK_SECRET (whsec_).
+// Sin la primera, la tarjeta no aparece en el área. El pago se confirma solo: con el aviso de Stripe (webhook) y, por si
+// este tarda, cuando el cliente vuelve de Stripe a su área. Las devoluciones de un pago con tarjeta se hacen en Stripe
+// desde el panel; si alguien devuelve desde el panel de Stripe, también queda apuntada aquí. Bizum, por ahora, a mano.
+// ================================================================
+const STRIPE_API_URL = (process.env.STRIPE_API_URL || 'https://api.stripe.com').replace(/\/+$/, '');
+const stripeClave = () => process.env.STRIPE_SECRET_KEY || '';
+const stripeActivo = () => !!stripeClave();
+let tablasStripe = null;
+const asegurarStripe = () => tablasStripe || (tablasStripe = (async () => {
+  await agregaColumnaSiFalta('pagos', 'stripe_sesion', 'VARCHAR(255) NULL');
+  await agregaColumnaSiFalta('pagos', 'stripe_pi', 'VARCHAR(255) NULL');
+  await pool.query("CREATE TABLE IF NOT EXISTS stripe_sesiones (id VARCHAR(255) PRIMARY KEY, propuesta_id INT NOT NULL, importe_centimos INT NOT NULL, url TEXT NOT NULL, expira_en DATETIME NOT NULL, estado ENUM('abierta','pagada') NOT NULL DEFAULT 'abierta', creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_ss_propuesta (propuesta_id))");
+  await pool.query('CREATE TABLE IF NOT EXISTS stripe_eventos (id VARCHAR(255) PRIMARY KEY, tipo VARCHAR(80) NOT NULL, recibido_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+  await asegurarDevoluciones();
+  await agregaColumnaSiFalta('devoluciones', 'stripe_refund', 'VARCHAR(255) NULL');
+  await agregaColumnaSiFalta('devoluciones', 'nota', 'VARCHAR(300) NULL');
+})().catch(e => { tablasStripe = null; throw e; }));
+
+// Stripe recibe los datos como un formulario, con los objetos anidados entre corchetes: line_items[0][price_data][currency]=eur
+function formStripe(obj, pre, out = []) {
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null || v === '') continue;
+    const clave = pre ? pre + '[' + k + ']' : k;
+    if (typeof v === 'object') formStripe(v, clave, out); else out.push(encodeURIComponent(clave) + '=' + encodeURIComponent(String(v)));
+  }
+  return out.join('&');
+}
+async function stripeLlamar(metodo, ruta, datos, idem) {
+  const r = await axios({ method: metodo, url: STRIPE_API_URL + ruta, data: datos ? formStripe(datos) : undefined, timeout: 20000, validateStatus: () => true,
+    headers: Object.assign({ Authorization: 'Bearer ' + stripeClave(), 'Content-Type': 'application/x-www-form-urlencoded' }, idem ? { 'Idempotency-Key': idem } : {}) });
+  if (r.status >= 400) { const e = new Error((r.data && r.data.error && r.data.error.message) || ('Stripe ha respondido ' + r.status)); e.stripe = r.status; throw e; }
+  return r.data;
+}
+// La firma del aviso de Stripe: HMAC-SHA256 de «t.cuerpo» con el secreto del webhook, y como mucho 5 minutos de antigüedad
+function firmaStripeValida(crudo, cabecera, secreto) {
+  if (!crudo || !cabecera || !secreto) return false;
+  const partes = String(cabecera).split(','), t = (partes.find(x => x.startsWith('t=')) || '').slice(2), firmas = partes.filter(x => x.startsWith('v1=')).map(x => x.slice(3));
+  if (!/^\d+$/.test(t) || !firmas.length || Math.abs(Date.now() / 1000 - Number(t)) > 300) return false;
+  const esperada = crypto.createHmac('sha256', secreto).update(Buffer.concat([Buffer.from(t + '.'), Buffer.isBuffer(crudo) ? crudo : Buffer.from(String(crudo))])).digest();
+  return firmas.some(f => { const a = Buffer.from(f, 'hex'); return a.length === esperada.length && crypto.timingSafeEqual(a, esperada); });
+}
+function vueltaDeStripe(req, token) {   // a dónde vuelve el cliente al terminar o cancelar el pago
+  let base = SITE_URL ? SITE_URL + '/area' : null;
+  if (!base) { const o = String(req.get('origin') || '').replace(/\/+$/, ''); if (/^https?:\/\/[^/\s]+$/.test(o)) base = o + '/area.html'; }
+  return base ? base + '?token=' + encodeURIComponent(token) : null;
+}
+
+// Confirma el pago de una sesión de Checkout ya pagada. Sirve tanto al webhook como a la comprobación al volver: lo que llega dos veces se apunta una
+async function confirmarPagoStripe(s) {
+  if (!s || s.object !== 'checkout.session' || s.payment_status !== 'paid') return { estado: 'sin_pagar' };
+  const propuestaId = Number((s.metadata || {}).propuesta_id || s.client_reference_id) || 0;
+  if (!propuestaId) return { estado: 'ajena' };
+  await asegurarStripe();
+  const pi = typeof s.payment_intent === 'string' ? s.payment_intent : (s.payment_intent && s.payment_intent.id) || null;
+  const conn = await pool.getConnection();
+  let p, pagoId, otros = [];
+  try {
+    await conn.beginTransaction();
+    [[p]] = await conn.execute('SELECT id, cliente_id, importe_centimos FROM propuestas WHERE id = ? FOR UPDATE', [propuestaId]);
+    if (!p) { await conn.rollback(); return { estado: 'ajena' }; }
+    const [ya] = await conn.execute('SELECT id FROM pagos WHERE stripe_sesion = ?', [s.id]);
+    if (ya.length) { await conn.commit(); return { estado: 'confirmado', pago_id: ya[0].id, nuevo: false }; }
+    [otros] = await conn.execute("SELECT metodo, estado FROM pagos WHERE propuesta_id = ? AND estado IN ('autodeclarado', 'confirmado')", [p.id]);
+    const [r] = await conn.execute("INSERT INTO pagos (propuesta_id, metodo, estado, confirmado_en, stripe_sesion, stripe_pi, verificado_auto) VALUES (?, 'tarjeta', 'confirmado', ?, ?, ?, 1)",
+      [p.id, aSQLDatetime(ahora()), s.id, pi]);
+    pagoId = r.insertId;
+    await conn.execute("UPDATE stripe_sesiones SET estado = 'pagada' WHERE id = ?", [s.id]);
+    await conn.commit();
+  } catch (e) { await conn.rollback().catch(() => {}); throw e; } finally { conn.release(); }
+  correoPagoConfirmado(pagoId);
+  const cobrado = Number(s.amount_total) || 0;
+  anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Stripe', tipo: 'sistema', accion: 'Pago con tarjeta confirmado por Stripe', objeto_id: pagoId, cliente_id: p.cliente_id, detalle: { importe_centimos: cobrado, sesion: s.id } });
+  avisarCliente(p.cliente_id, '', 'pago con tarjeta recibido', 'Stripe ha confirmado el pago de ' + eurosCorreo(cobrado) + '. No hace falta hacer nada.', { prioridad: 3, etiqueta: 'euro' });
+  if (cobrado !== Number(p.importe_centimos)) avisarPagos('Revisa un pago con tarjeta', 'Stripe ha cobrado ' + eurosCorreo(cobrado) + ' y la propuesta es de ' + eurosCorreo(p.importe_centimos) + '. Mira la ficha del cliente.', { prioridad: 4 });
+  if (otros.length) avisarPagos('Puede que un cliente haya pagado dos veces', 'Ha pagado con tarjeta y ya tenía un pago ' + otros.map(x => (x.estado === 'confirmado' ? 'confirmado' : 'declarado') + ' (' + x.metodo + ')').join(', ') + '. Revisa la ficha y, si sobra uno, devuélvelo.', { prioridad: 4 });
+  return { estado: 'confirmado', pago_id: pagoId, nuevo: true };
+}
+
+// Devolución de un pago con tarjeta: la hace Stripe. Si Stripe la da por hecha en el momento, se avisa al cliente; si no, se marca sola al llegar el aviso
+async function devolverConStripe(devId, asesorId) {
+  await asegurarStripe();
+  const [[d]] = await pool.execute('SELECT d.id, d.importe_centimos, d.estado, d.stripe_refund, pg.stripe_pi FROM devoluciones d JOIN pagos pg ON pg.id = d.pago_id WHERE d.id = ?', [devId]);
+  if (!d || !d.stripe_pi) return null;
+  if (d.estado === 'hecha') return { estado: 'hecha', correo: 'ya_enviado' };
+  let rf;
+  if (d.stripe_refund && d.stripe_refund !== 'en_marcha') rf = await stripeLlamar('get', '/v1/refunds/' + encodeURIComponent(d.stripe_refund));
+  else {
+    const [bloq] = await pool.execute("UPDATE devoluciones SET stripe_refund = 'en_marcha' WHERE id = ? AND stripe_refund IS NULL", [d.id]);
+    if (!bloq.affectedRows) return { estado: 'en_curso' };   // otra petición la está haciendo
+    try { rf = await stripeLlamar('post', '/v1/refunds', { payment_intent: d.stripe_pi, amount: d.importe_centimos, reason: 'requested_by_customer', metadata: { devolucion_id: d.id } }, 'devolucion-' + d.id + '-' + Math.floor(Date.now() / 60000)); }
+    catch (e) { await pool.execute("UPDATE devoluciones SET stripe_refund = NULL WHERE id = ? AND stripe_refund = 'en_marcha'", [d.id]); throw e; }
+    await pool.execute('UPDATE devoluciones SET stripe_refund = ?, nota = NULL WHERE id = ?', [rf.id, d.id]);
+  }
+  return aplicarEstadoDevolucionStripe(d.id, rf, asesorId);
+}
+async function aplicarEstadoDevolucionStripe(devId, rf, asesorId) {
+  if (rf.status === 'succeeded') {
+    const [u] = await pool.execute("UPDATE devoluciones SET estado = 'hecha', hecha_en = NOW(), hecha_por = ?, nota = NULL WHERE id = ? AND estado = 'pendiente'", [asesorId || null, devId]);
+    return { estado: 'hecha', correo: u.affectedRows ? await correoDevolucion(devId) : 'ya_enviado' };
+  }
+  if (rf.status === 'failed' || rf.status === 'canceled') {
+    const motivo = { expired_or_canceled_card: 'la tarjeta está caducada o cancelada', lost_or_stolen_card: 'la tarjeta está perdida o robada', charge_for_pending_refund_disputed: 'el cliente ha abierto una disputa', insufficient_funds: 'no hay saldo en la cuenta de Stripe', declined: 'el banco la ha rechazado', merchant_request: 'se ha cancelado' }[rf.failure_reason];
+    const nota = 'Stripe no ha podido devolverla' + (motivo ? ': ' + motivo : '') + '. Devuélvela de otra forma y márcala a mano.';
+    const [u] = await pool.execute("UPDATE devoluciones SET stripe_refund = NULL, nota = ? WHERE id = ? AND estado = 'pendiente' AND (stripe_refund = ? OR stripe_refund IS NULL)", [nota, devId, rf.id]);
+    if (u.affectedRows) avisarPagos('Una devolución con tarjeta no se ha podido hacer', 'Mírala en «Cobros», en «Devoluciones pendientes».', { prioridad: 4 });
+    return { estado: 'fallida' };
+  }
+  return { estado: 'en_curso' };
+}
+// Aviso de Stripe sobre una devolución: la nuestra (por su id o por la devolución que lleva dentro) o una hecha en el panel de Stripe, que se apunta aquí
+async function devolucionDesdeStripe(rf) {
+  if (!rf || rf.object !== 'refund' || !rf.id) return;
+  await asegurarStripe();
+  const devId = Number((rf.metadata || {}).devolucion_id) || 0;
+  let [[d]] = await pool.execute('SELECT id FROM devoluciones WHERE stripe_refund = ? OR id = ? ORDER BY (stripe_refund = ?) DESC LIMIT 1', [rf.id, devId, rf.id]);
+  if (d && devId && d.id === devId) await pool.execute("UPDATE devoluciones SET stripe_refund = ? WHERE id = ? AND (stripe_refund IS NULL OR stripe_refund = 'en_marcha')", [rf.id, d.id]);
+  if (!d) {
+    if (rf.status === 'failed' || rf.status === 'canceled') return;
+    const pi = typeof rf.payment_intent === 'string' ? rf.payment_intent : (rf.payment_intent && rf.payment_intent.id) || null;
+    if (!pi) return;
+    const [[pg]] = await pool.execute("SELECT pg.id, pg.propuesta_id, p.cliente_id FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.stripe_pi = ? AND pg.estado IN ('confirmado', 'devuelto') ORDER BY pg.id DESC LIMIT 1", [pi]);
+    if (!pg) return;   // no es de un pago nuestro
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.execute('SELECT id FROM propuestas WHERE id = ? FOR UPDATE', [pg.propuesta_id]);
+      const [ya] = await conn.execute('SELECT id FROM devoluciones WHERE stripe_refund = ?', [rf.id]);
+      if (ya.length) { await conn.commit(); d = ya[0]; }
+      else {
+        const [r] = await conn.execute("INSERT INTO devoluciones (pago_id, propuesta_id, cliente_id, importe_centimos, motivo, origen, estado, stripe_refund) VALUES (?, ?, ?, ?, 'Hecha desde el panel de Stripe', 'asesor', 'pendiente', ?)",
+          [pg.id, pg.propuesta_id, pg.cliente_id, Number(rf.amount) || 0, rf.id]);
+        await cerrarSiDevueltoEntero(conn, pg.propuesta_id, null);
+        await conn.commit();
+        d = { id: r.insertId };
+        avisarPagos('Devolución hecha desde Stripe', 'Se ha devuelto ' + eurosCorreo(rf.amount) + ' desde el panel de Stripe. Queda apuntada en la ficha del cliente.', { prioridad: 3 });
+      }
+    } catch (e) { await conn.rollback().catch(() => {}); throw e; } finally { conn.release(); }
+  }
+  await aplicarEstadoDevolucionStripe(d.id, rf, null);
+}
+async function disputaDesdeStripe(dp) {
+  if (!dp || dp.object !== 'dispute') return;
+  await asegurarStripe();
+  const pi = typeof dp.payment_intent === 'string' ? dp.payment_intent : (dp.payment_intent && dp.payment_intent.id) || null;
+  const [[pg]] = pi ? await pool.execute('SELECT pg.id, p.cliente_id, c.nombre, c.apellidos, c.correo FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id JOIN clientes c ON c.id = p.cliente_id WHERE pg.stripe_pi = ? LIMIT 1', [pi]) : [[null]];
+  const quien = pg ? ([pg.nombre, pg.apellidos].filter(Boolean).join(' ') || pg.correo) : 'un cliente';
+  anotarRegistro({ actor_tipo: 'sistema', actor_nombre: 'Stripe', tipo: 'sistema', accion: 'Disputa abierta en un pago con tarjeta', objeto_id: pg ? pg.id : null, cliente_id: pg ? pg.cliente_id : null, detalle: { importe_centimos: dp.amount, motivo: dp.reason, disputa: dp.id } });
+  const motivo = { fraudulent: 'dice que no reconoce el cargo como suyo', unrecognized: 'no reconoce el cargo', duplicate: 'dice que se le cobró dos veces', product_not_received: 'dice que no recibió el servicio', product_unacceptable: 'no está conforme con el servicio', credit_not_processed: 'dice que no se le devolvió lo prometido', subscription_canceled: 'dice que lo había cancelado' }[dp.reason];
+  avisarPagos('Disputa abierta en un pago con tarjeta', 'El banco de ' + quien + ' ha reclamado ' + eurosCorreo(dp.amount) + (motivo ? ': el cliente ' + motivo : '') + '. Respóndela desde el panel de Stripe antes de que venza el plazo.', { prioridad: 5 });
+}
+
+// El cliente pulsa «Ir al pago seguro»: se abre (o se reutiliza) una sesión de Checkout por el importe de su propuesta
+app.post('/api/propuestas/:token/pago/tarjeta', async (req, res) => {
+  if (!stripeActivo()) return res.status(503).json({ error: 'El pago con tarjeta todavía no está disponible. Elige otra forma de pago.', codigo: 'tarjeta_no_disponible' });
+  await asegurarStripe();
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (p.estado !== 'aceptada') return res.status(409).json({ error: `No se puede pagar: la propuesta está "${p.estado}", no "aceptada"` });
+    if (p.importe_corregido_en && !p.importe_aceptado_en) return res.status(409).json({ error: 'Antes de pagar, acepta el importe corregido', codigo: 'importe_sin_aceptar' });
+    const [yaPg] = await conn.execute("SELECT estado FROM pagos WHERE propuesta_id = ? AND estado IN ('autodeclarado', 'confirmado', 'devuelto')", [p.id]);
+    if (yaPg.some(x => x.estado !== 'autodeclarado')) return res.status(409).json({ error: 'Este encargo ya está pagado.', codigo: 'ya_pagado' });
+    if (yaPg.length) return res.status(409).json({ error: 'Ya nos dijiste que habías pagado este encargo. Lo estamos confirmando.', codigo: 'pago_en_revision' });
+    const [abiertas] = await conn.execute("SELECT url FROM stripe_sesiones WHERE propuesta_id = ? AND estado = 'abierta' AND importe_centimos = ? AND expira_en > ? ORDER BY creado_en DESC LIMIT 1",
+      [p.id, p.importe_centimos, aSQLDatetime(new Date(Date.now() + 15 * 60e3))]);
+    if (abiertas.length) return res.json({ url: abiertas[0].url });
+    const vuelta = vueltaDeStripe(req, p.token);
+    if (!vuelta) return res.status(500).json({ error: 'Falta SITE_URL en el servidor' });
+    const [[cli]] = await conn.execute('SELECT correo, codigo FROM clientes WHERE id = ?', [p.cliente_id]);
+    const en = String((req.body || {}).idioma || '') === 'en';
+    const s = await stripeLlamar('post', '/v1/checkout/sessions', {
+      mode: 'payment', submit_type: 'pay', locale: en ? 'en' : 'es', payment_method_types: ['card'],
+      line_items: [{ quantity: 1, price_data: { currency: 'eur', unit_amount: p.importe_centimos, product_data: { name: en ? 'Acros engagement' : 'Encargo de Acros', description: cli && cli.codigo ? (en ? 'Client ' : 'Cliente ') + cli.codigo : undefined } } }],
+      customer_email: cli && correoValido(cli.correo || '') ? cli.correo : undefined,
+      client_reference_id: String(p.id), metadata: { propuesta_id: p.id, cliente_id: p.cliente_id },
+      payment_intent_data: { description: 'Acros, ' + (cli && cli.codigo ? 'cliente ' + cli.codigo : 'propuesta ' + p.id), metadata: { propuesta_id: p.id, cliente_id: p.cliente_id } },
+      success_url: vuelta + '&pago=ok&session_id={CHECKOUT_SESSION_ID}', cancel_url: vuelta + '&pago=cancelado',
+    }, 'sesion-' + p.id + '-' + p.importe_centimos + '-' + Math.floor(Date.now() / 60000));
+    await conn.execute('INSERT IGNORE INTO stripe_sesiones (id, propuesta_id, importe_centimos, url, expira_en) VALUES (?, ?, ?, ?, ?)',
+      [s.id, p.id, p.importe_centimos, s.url, aSQLDatetime(new Date((Number(s.expires_at) || (Date.now() / 1000 + 86400)) * 1000))]);
+    res.json({ url: s.url });
+  } catch (e) {
+    if (!e.stripe) throw e;
+    console.error('Stripe (sesión de pago):', e.message);
+    res.status(502).json({ error: 'No hemos podido abrir el pago con tarjeta. Inténtalo de nuevo en un momento o elige otra forma de pago.' });
+  } finally { conn.release(); }
+});
+// Al volver de Stripe: por si el aviso de Stripe aún no ha llegado, se pregunta directamente
+app.post('/api/propuestas/:token/pago/tarjeta/comprobar', async (req, res) => {
+  const sid = String((req.body || {}).session_id || '');
+  if (!stripeActivo() || !/^cs_[A-Za-z0-9_]{6,250}$/.test(sid)) return res.status(400).json({ error: 'Pago no válido' });
+  await asegurarStripe();
+  const [[x]] = await pool.execute('SELECT ss.id FROM stripe_sesiones ss JOIN propuestas p ON p.id = ss.propuesta_id WHERE ss.id = ? AND p.token = ?', [sid, req.params.token]);
+  if (!x) return res.status(404).json({ error: 'Pago no encontrado' });
+  try {
+    const s = await stripeLlamar('get', '/v1/checkout/sessions/' + encodeURIComponent(sid));
+    const r = await confirmarPagoStripe(s);
+    res.json({ estado: r.estado === 'confirmado' ? 'confirmado' : s.status === 'complete' ? 'en_curso' : 'sin_pagar' });
+  } catch (e) {
+    if (!e.stripe) throw e;
+    res.status(502).json({ error: 'No hemos podido comprobar el pago con Stripe. Si lo has completado, se confirmará solo en unos minutos.' });
+  }
+});
+// Avisos de Stripe (webhook). En el panel de Stripe: https://<backend>/api/stripe/webhook con estos eventos:
+// checkout.session.completed, checkout.session.async_payment_succeeded, checkout.session.async_payment_failed,
+// refund.created, refund.updated, refund.failed, charge.refund.updated, charge.dispute.created
+app.post('/api/stripe/webhook', async (req, res) => {
+  const secreto = process.env.STRIPE_WEBHOOK_SECRET || '';
+  if (!secreto) return res.status(503).json({ error: 'Webhook sin configurar' });
+  if (!firmaStripeValida(req.rawBody, req.get('stripe-signature'), secreto)) return res.status(400).json({ error: 'Firma no válida' });
+  const ev = req.body || {}, o = (ev.data && ev.data.object) || {};
+  if (!ev.id || !ev.type) return res.status(400).json({ error: 'Aviso no válido' });
+  await asegurarStripe();
+  const [visto] = await pool.execute('SELECT id FROM stripe_eventos WHERE id = ?', [String(ev.id)]);
+  if (visto.length) return res.json({ recibido: true });
+  try {
+    if (ev.type === 'checkout.session.completed' || ev.type === 'checkout.session.async_payment_succeeded') await confirmarPagoStripe(o);
+    else if (ev.type === 'checkout.session.async_payment_failed') avisarPagos('Un pago con tarjeta no se ha completado', 'El banco del cliente lo ha rechazado al final. El cliente puede volver a pagar desde su área.', { prioridad: 3 });
+    else if (/^(refund\.(created|updated|failed)|charge\.refund\.updated)$/.test(ev.type)) await devolucionDesdeStripe(o);
+    else if (ev.type === 'charge.dispute.created') await disputaDesdeStripe(o);
+    await pool.execute('INSERT IGNORE INTO stripe_eventos (id, tipo) VALUES (?, ?)', [String(ev.id).slice(0, 255), String(ev.type).slice(0, 80)]);
+    res.json({ recibido: true });
+  } catch (e) { console.error('Aviso de Stripe sin procesar (' + ev.type + '):', e.message); res.status(500).json({ error: 'No se pudo procesar; Stripe lo reintentará' }); }
+});
+
+// ---------------- 27/11 (Vikn): «Recuérdamelo». Lo que un asesor abre en el móvil y se hace en el ordenador, apuntado en su «Hoy»
+let tablaRecordatorios = null;
+const asegurarRecordatorios = () => tablaRecordatorios || (tablaRecordatorios = pool.query('CREATE TABLE IF NOT EXISTS recordatorios_asesor (id INT AUTO_INCREMENT PRIMARY KEY, asesor_id INT NOT NULL, texto VARCHAR(200) NOT NULL, enlace VARCHAR(500) NULL, creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, hecho_en DATETIME NULL, INDEX idx_rec_asesor (asesor_id, hecho_en))').catch(e => { tablaRecordatorios = null; throw e; }));
+app.get('/api/admin/recordatorios', requiereSesionAsesor, async (req, res) => {
+  await asegurarRecordatorios();
+  const [f] = await pool.execute('SELECT id, texto, enlace, creado_en FROM recordatorios_asesor WHERE asesor_id = ? AND hecho_en IS NULL ORDER BY id DESC LIMIT 50', [req.asesor.id]);
+  res.json({ recordatorios: f });
+});
+app.post('/api/admin/recordatorios', requiereSesionAsesor, async (req, res) => {
+  await asegurarRecordatorios();
+  const b = req.body || {}, texto = String(b.texto || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (!texto) return res.status(400).json({ error: 'Falta qué recordar' });
+  const enlace = /^\?[\w=&%.,-]{1,499}$/.test(String(b.enlace || '')) ? String(b.enlace) : null;   // solo una dirección del propio panel
+  const [ya] = await pool.execute('SELECT id FROM recordatorios_asesor WHERE asesor_id = ? AND hecho_en IS NULL AND texto = ? AND (enlace <=> ?)', [req.asesor.id, texto, enlace]);
+  if (ya.length) return res.json({ ok: true, id: ya[0].id, repetido: true });
+  const [r] = await pool.execute('INSERT INTO recordatorios_asesor (asesor_id, texto, enlace) VALUES (?, ?, ?)', [req.asesor.id, texto, enlace]);
+  res.status(201).json({ ok: true, id: r.insertId });
+});
+app.post('/api/admin/recordatorios/:id(\\d+)/hecho', requiereSesionAsesor, async (req, res) => {
+  await asegurarRecordatorios();
+  const [r] = await pool.execute('UPDATE recordatorios_asesor SET hecho_en = NOW() WHERE id = ? AND asesor_id = ? AND hecho_en IS NULL', [Number(req.params.id), req.asesor.id]);
+  res.json({ ok: !!r.affectedRows });
+});
+// ---------------- 27/11 (Vikn): la foto de un documento que el cliente da en mano, desde su ficha en el móvil.
+// Se cifra aquí, como los adjuntos de los correos, y queda en su documentación por revisar.
+app.post('/api/admin/propuestas/:id(\\d+)/documento-foto', requiereSesionAsesor, async (req, res) => {
+  const b = req.body || {}, nombre = String(b.nombre || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (nombre.length < 4) return res.status(400).json({ error: 'Escribe qué documento es (al menos 4 letras).' });
+  const tipo = String(b.tipo_mime || 'image/jpeg').toLowerCase();
+  if (!/^image\/(jpeg|png|webp|heic|heif)$/.test(tipo)) return res.status(400).json({ error: 'Eso no es una foto.' });
+  const datos = Buffer.from(String(b.imagen || ''), 'base64');
+  if (datos.length < 100) return res.status(400).json({ error: 'Falta la foto.' });
+  if (datos.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'La foto es demasiado grande.' });
+  const [ps] = await pool.execute("SELECT id, cliente_id FROM propuestas WHERE id = ? AND estado = 'aceptada'", [Number(req.params.id)]);
+  if (!ps.length) return res.status(404).json({ error: 'Ese encargo no está en curso.' });
+  const c = cifrarParaDocumentos(datos), clave = `docs/${ps[0].cliente_id}/${generarToken()}.enc`;
+  await subirAR2(clave, c.cifrado, 'application/octet-stream');
+  const ext = { 'image/png': 'png', 'image/webp': 'webp', 'image/heic': 'heic', 'image/heif': 'heif' }[tipo] || 'jpg';
+  const [r] = await pool.execute("INSERT INTO documentos_fiscales (cliente_id, propuesta_id, servicio, nombre, estado, documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, subido_en, nombre_original, huella_sha256, tamano_original) VALUES (?, ?, 'general', ?, 'enviado', ?, ?, ?, ?, ?, ?, ?, ?)",
+    [ps[0].cliente_id, ps[0].id, nombre, clave, c.iv, c.clave, tipo, aSQLDatetime(ahora()), ('Foto ' + hoyMadridISO() + '.' + ext), crypto.createHash('sha256').update(datos).digest('hex'), datos.length]);
+  res.status(201).json({ ok: true, id: r.insertId });
+});
+app.post('/api/admin/pagos/:id(\\d+)/rechazar', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
+  const motivo = String((req.body || {}).motivo || '').trim().slice(0, 300);
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT pg.*, p.cliente_id, p.token FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id WHERE pg.id = ?', [Number(req.params.id)]);
+    if (!f.length) return res.status(404).json({ error: 'Pago no encontrado' });
+    const pg = f[0];
+    if (pg.estado === 'confirmado') return res.status(409).json({ error: 'Ese pago ya está confirmado' });
+    if (pg.estado === 'rechazado') return res.status(409).json({ error: 'Ese pago ya estaba marcado como no llegado' });
+    await conn.execute("UPDATE pagos SET estado = 'rechazado', rechazado_en = NOW(), rechazado_por_asesor_id = ?, motivo_rechazo = ? WHERE id = ? AND estado = 'autodeclarado'", [req.asesor.id, motivo || null, pg.id]);
+    const [cl] = await conn.execute('SELECT correo, nombre, apellidos FROM clientes WHERE id = ?', [pg.cliente_id]);
+    req.body = Object.assign({}, req.body, { cliente: cl.length ? ([cl[0].nombre, cl[0].apellidos].filter(Boolean).join(' ') || cl[0].correo) : '', metodo: pg.metodo });   // registro de actividad
+    if (brevoActivo() && cl.length && cl[0].correo) {
+      const asesor = await personaDeCliente(pg.cliente_id).catch(() => null), quien = asesor ? ESC_HTML(asesor.nombre) + ', tu asesor de Acros,' : 'Tu asesor de Acros';
+      const METODO = { tarjeta: 'con tarjeta', bizum: 'por Bizum', transferencia: 'por transferencia', cripto: 'en cripto', otro: '' };
+      const fecha = new Date(pg.creado_en).toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Europe/Madrid' });
+      const enlace = enlaceArea('area', pg.token);
+      const correo = plantillaCorreo({
+        titulo: 'No nos ha llegado tu pago',
+        parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:', `${quien} no ha encontrado el pago ${METODO[pg.metodo] || ''} que nos indicaste el ${fecha}.`.replace(/\s+/g, ' '),
+          motivo ? '<em>' + ESC_HTML(motivo) + '</em>' : '', 'Si ya lo hiciste, escríbele desde tu área y lo miráis juntos. Si no, puedes pagar desde allí cuando quieras.'].filter(Boolean),
+        boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
+      });
+      enviarCorreo(cl[0].correo, 'No nos ha llegado tu pago', correo.html, correo.texto, { desde: 'asesor' }).catch(e => console.error('Correo de pago no llegado no enviado:', e.message));
+    }
+    res.json({ ok: true, estado: 'rechazado' });
+  } finally { conn.release(); }
+});
 app.post('/api/admin/pagos/:id/confirmar', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT * FROM pagos WHERE id = ?', [req.params.id]);
     if (!filas.length) return res.status(404).json({ error: 'Pago no encontrado' });
     if (filas[0].estado === 'confirmado') return res.status(409).json({ error: 'Ese pago ya estaba confirmado' });
+    if (filas[0].estado === 'rechazado') {   // 26/11 (G4): llegó al final
+      const [otro] = await conn.execute("SELECT id FROM pagos WHERE propuesta_id = ? AND id <> ? AND estado IN ('autodeclarado', 'confirmado') LIMIT 1", [filas[0].propuesta_id, filas[0].id]);
+      if (otro.length) return res.status(409).json({ error: 'El cliente ya ha declarado otro pago para ese encargo: confirma ese' });
+    }
     await conn.execute('UPDATE pagos SET estado = ?, confirmado_en = ?, confirmado_por_asesor_id = ? WHERE id = ?', ['confirmado', aSQLDatetime(ahora()), req.asesor.id, req.params.id]);
+    correoPagoConfirmado(filas[0].id);   // 26/11 (Vikn, M8): siempre
     // 15/10: para el registro de actividad (quién, cliente, método, importe) y el canal de pagos
     const [inf] = await conn.execute('SELECT c.nombre, c.apellidos, c.correo, p.importe_centimos FROM propuestas p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?', [filas[0].propuesta_id]);
     if (inf.length) {
@@ -3765,13 +4193,21 @@ async function verificarSOL(hash, direccionEsperada, moneda, importeEsperado) {
   return { ok: true, detalles: { importe_real: importeReal } };
 }
 
+// 26/11 (auditoría G8): importe esperado en cripto = importe del encargo / precio del catálogo (el mismo que ve el cliente al pagar).
+// Sin precio reciente, null: ese pago no se verifica solo y queda para revisarlo a mano.
+async function importeCriptoEsperado(conn, centimos, moneda) {
+  const [f] = await conn.execute('SELECT precio_eur, precio_en FROM activos_catalogo WHERE simbolo = ?', [String(moneda || '').toUpperCase()]);
+  const x = f[0];
+  if (!x || !(Number(x.precio_eur) > 0) || !x.precio_en || (Date.now() - new Date(x.precio_en).getTime()) > DIAS_PRECIO_VIEJO * 864e5 || !(Number(centimos) > 0)) return null;
+  return String(Number((Number(centimos) / 100 / Number(x.precio_eur)).toPrecision(10)));
+}
 const DIRECCIONES_ESPERADAS = {
   btc: process.env.CRIPTO_DIRECCION_BTC,
   eth: process.env.CRIPTO_DIRECCION_ETH,
   sol: process.env.CRIPTO_DIRECCION_SOL,
 };
 
-app.post('/api/admin/pagos/:id/verificar-cripto', requiereSesionAsesor, async (req, res) => {
+app.post('/api/admin/pagos/:id/verificar-cripto', requiereSesionAsesor, requiereRol('encargado'), async (req, res) => {   // 26/11 (auditoría G8): el mismo rol que la confirmación a mano
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT * FROM pagos WHERE id = ?', [req.params.id]);
@@ -3779,6 +4215,7 @@ app.post('/api/admin/pagos/:id/verificar-cripto', requiereSesionAsesor, async (r
     const pago = filas[0];
     if (pago.metodo !== 'cripto') return res.status(400).json({ error: 'Este pago no es en cripto' });
     if (pago.estado === 'confirmado') return res.status(409).json({ error: 'Ese pago ya estaba confirmado' });
+    if (pago.estado === 'rechazado') return res.status(409).json({ error: 'Ese pago está marcado como no llegado' });   // 26/11 (G4)
     if (!pago.hash_transaccion || !pago.red || !pago.moneda_cripto) {
       return res.status(400).json({ error: 'A este pago le falta la red, la moneda o el hash — no se puede verificar automáticamente' });
     }
@@ -3787,6 +4224,11 @@ app.post('/api/admin/pagos/:id/verificar-cripto', requiereSesionAsesor, async (r
       return res.status(500).json({ error: `Falta configurar CRIPTO_DIRECCION_${pago.red.toUpperCase()} en el servidor — sin eso no hay con qué comparar` });
     }
     const importeEsperado = pago.importe_cripto ? Number(pago.importe_cripto) : null;
+    // 26/11 (auditoría G8): sin importe de referencia no se confirma solo (antes, sin importe, cualquier envío valía)
+    if (!(importeEsperado > 0)) return res.json({ ok: true, verificado: false, motivo: 'Este pago no tiene importe de referencia (no había precio de esa moneda al declararlo): compruébalo en la cadena y confírmalo a mano' });
+    // y una misma transacción no paga dos encargos
+    const [usado] = await conn.execute('SELECT id FROM pagos WHERE id <> ? AND LOWER(TRIM(hash_transaccion)) = LOWER(TRIM(?)) LIMIT 1', [pago.id, pago.hash_transaccion]);
+    if (usado.length) return res.json({ ok: true, verificado: false, motivo: 'Esa transacción ya figura en otro pago (nº ' + usado[0].id + '): revísalo a mano' });
     let resultado;
     try {
       if (pago.red === 'btc') resultado = await verificarBTC(pago.hash_transaccion, direccionEsperada, importeEsperado);
@@ -3799,9 +4241,10 @@ app.post('/api/admin/pagos/:id/verificar-cripto', requiereSesionAsesor, async (r
     }
     if (!resultado.ok) return res.json({ ok: true, verificado: false, motivo: resultado.motivo });
     await conn.execute(
-      'UPDATE pagos SET estado = ?, confirmado_en = ?, verificado_auto = 1 WHERE id = ?',
-      ['confirmado', aSQLDatetime(ahora()), req.params.id]
+      'UPDATE pagos SET estado = ?, confirmado_en = ?, verificado_auto = 1, confirmado_por_asesor_id = ? WHERE id = ?',
+      ['confirmado', aSQLDatetime(ahora()), req.asesor.id, req.params.id]
     );
+    correoPagoConfirmado(pago.id);   // 26/11 (Vikn, M8)
     res.json({ ok: true, verificado: true, estado: 'confirmado', detalles: resultado.detalles });
   } finally {
     conn.release();
@@ -3980,6 +4423,36 @@ app.get('/api/admin/documentos/backup', requiereSesionAsesor, requiereAdminWeb, 
   }
 });
 
+// 26/11 (Vikn, M4): si cierra la pestaña a medias, el alta se retoma donde la dejó (en este dispositivo o en otro)
+let tablaBorradoresAlta = null;
+const asegurarBorradoresAlta = () => tablaBorradoresAlta || (tablaBorradoresAlta = pool.execute('CREATE TABLE IF NOT EXISTS diligencia_borradores (propuesta_id INT PRIMARY KEY, datos TEXT NOT NULL, actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)').catch(e => { tablaBorradoresAlta = null; throw e; }));
+app.get('/api/propuestas/:token/diligencia/borrador', async (req, res) => {
+  await asegurarBorradoresAlta();
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [ya] = await conn.execute('SELECT id FROM diligencias WHERE propuesta_id = ?', [p.id]);
+    if (ya.length) { await conn.execute('DELETE FROM diligencia_borradores WHERE propuesta_id = ?', [p.id]); return res.json({}); }   // enviada: el borrador sobra
+    const [b] = await conn.execute('SELECT datos, actualizado_en FROM diligencia_borradores WHERE propuesta_id = ?', [p.id]);
+    let datos = null; try { datos = b.length ? JSON.parse(b[0].datos) : null; } catch (e) {}
+    res.json(datos ? { datos, actualizado_en: b[0].actualizado_en } : {});
+  } finally { conn.release(); }
+});
+app.put('/api/propuestas/:token/diligencia/borrador', async (req, res) => {
+  const texto = JSON.stringify(req.body || {});
+  if (texto.length > 20000) return res.status(413).json({ error: 'Demasiado largo' });
+  await asegurarBorradoresAlta();
+  const conn = await pool.getConnection();
+  try {
+    const p = await propuestaVigente(conn, req.params.token);
+    if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    const [ya] = await conn.execute('SELECT id FROM diligencias WHERE propuesta_id = ?', [p.id]);
+    if (ya.length) return res.status(409).json({ error: 'El alta ya está enviada' });
+    await conn.execute('INSERT INTO diligencia_borradores (propuesta_id, datos) VALUES (?, ?) ON DUPLICATE KEY UPDATE datos = VALUES(datos)', [p.id, texto]);
+    res.json({ ok: true });
+  } finally { conn.release(); }
+});
 app.post('/api/propuestas/:token/diligencia', async (req, res) => {
   if (req.body && req.body.documento_anterior === true) await rellenarDocumentoAnterior(req);   // 21/10: renovación con el mismo documento
   const errores = validarDiligencia(req.body);
@@ -3988,8 +4461,7 @@ app.post('/api/propuestas/:token/diligencia', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [pagos] = await conn.execute('SELECT * FROM pagos WHERE propuesta_id = ?', [p.id]);
-    if (!pagos.length && p.cobro !== 'despues') return res.status(409).json({ error: 'No hay ningún pago registrado para esta propuesta todavía' });   // 29/10: con «pagar después», el alta va antes del pago
+    if (p.estado !== 'aceptada') return res.status(409).json({ error: 'Antes del alta, acepta la propuesta', codigo: 'propuesta_sin_aceptar' });   // 26/11 (auditoría G6): el alta, también antes de pagar
 
     const [existentes] = await conn.execute('SELECT id FROM diligencias WHERE propuesta_id = ?', [p.id]);
     if (existentes.length) return res.status(409).json({ error: 'Ya se envió un cuestionario de diligencia para esta propuesta' });
@@ -4079,6 +4551,27 @@ app.post('/api/admin/diligencias/:id/resolver', requiereSesionAsesor, async (req
     );
     if (accion === 'rechazar') {
       await conn.execute('UPDATE clientes SET estado = ? WHERE id = ?', ['inerte', d.cliente_id]);
+      // 26/11 (Vikn, M7): si el alta no se aprueba, se le avisa por correo (sin motivos: lo explica su asesor). Si se aprueba, nada.
+      try {
+        const [[cl]] = await conn.execute('SELECT correo, nombre FROM clientes WHERE id = ?', [d.cliente_id]);
+        const as = await personaDeCliente(d.cliente_id, conn).catch(() => null);
+        // 26/11 (Vikn): si había pagado, se le devuelve (la devolución la hace a mano quien lleva los cobros)
+        const [[pp]] = await conn.execute("SELECT p.token, (SELECT COUNT(*) FROM pagos g WHERE g.propuesta_id = p.id AND g.estado IN ('confirmado', 'devuelto')) AS pagado FROM propuestas p WHERE p.id = ?", [d.propuesta_id]);
+        if (pp && pp.pagado) {   // 26/11 (Vikn): se le devuelve; queda pendiente en «Cobros» hasta que se haga
+          const [[pg]] = await conn.execute("SELECT g.id, p.importe_centimos, p.cliente_id FROM pagos g JOIN propuestas p ON p.id = g.propuesta_id WHERE g.propuesta_id = ? AND g.estado = 'confirmado' ORDER BY g.id DESC LIMIT 1", [d.propuesta_id]);
+          const queda = Number(pg.importe_centimos) - await devueltoDe(conn, d.propuesta_id);
+          if (queda > 0) await conn.execute("INSERT INTO devoluciones (pago_id, propuesta_id, cliente_id, importe_centimos, motivo, origen, estado, creado_por) VALUES (?, ?, ?, ?, 'Alta no aprobada', 'alta_no_aprobada', 'pendiente', ?)", [pg.id, d.propuesta_id, pg.cliente_id, queda, req.asesor.id]);
+          await cerrarSiDevueltoEntero(conn, d.propuesta_id, req.asesor.id);
+        }
+        if (cl && cl.correo && brevoActivo()) {
+          const enl = pp ? enlaceArea('area', pp.token) : null;
+          const c = plantillaCorreo({ titulo: 'Sobre tu encargo',
+            parrafos: [cl.nombre ? `Hola, ${ESC_HTML(cl.nombre)}:` : 'Hola:', 'Hemos revisado tu alta y ahora mismo no cumples los requisitos para trabajar con nosotros.' + (pp && pp.pagado ? ' Te devolvemos lo que pagaste.' : ''),
+              'Si crees que se trata de un error o quieres arreglarlo, ' + (as ? 'llama o escribe a ' + ESC_HTML(as.nombre) : 'llámanos o escríbenos') + '. Lo tienes todo en tu área.'],
+            boton: enl ? { texto: 'Ir a mi área', url: enl } : null });
+          await enviarCorreo(cl.correo, 'Sobre tu encargo con Acros', c.html, c.texto, { desde: 'asesor' });
+        }
+      } catch (err) { console.error('Correo de alta no aprobada:', err.message); }
     }
     if (estadoResultante === 'aprobado') await heredarAltasDeCliente(conn, d.cliente_id).catch(err => console.error('Altas heredadas:', err.message));   // 21/10
     res.json({ ok: true, estado: estadoResultante });
@@ -4115,7 +4608,7 @@ app.get('/api/admin/clientes', requiereSesionAsesor, async (req, res) => {
               c.id AS cliente_id, c.nombre, c.apellidos, c.correo, c.telefono, c.codigo,
               (SELECT q.nombre FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_nombre,
               (SELECT q.asesor_id FROM personas q WHERE q.id = c.asesor_persona_id) AS asesor_cuenta_id,
-              (SELECT pg.estado FROM pagos pg WHERE pg.propuesta_id = p.id ORDER BY pg.id DESC LIMIT 1) AS estado_pago,
+              (SELECT pg.estado FROM pagos pg WHERE pg.propuesta_id = p.id AND pg.estado <> 'rechazado' ORDER BY (pg.estado = 'confirmado') DESC, pg.id DESC LIMIT 1) AS estado_pago,
               (SELECT d.estado FROM diligencias d WHERE d.propuesta_id = p.id ORDER BY d.id DESC LIMIT 1) AS estado_diligencia,
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id) AS docs_total,
               (SELECT COUNT(*) FROM documentos_fiscales df WHERE df.propuesta_id = p.id AND df.estado IN ('pendiente','rechazado')) AS docs_pendientes, -- rechazado = hay que volver a subirlo
@@ -4185,7 +4678,7 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
     const ids = propuestas.map(p => p.id);
     let pagos = [], diligencias = [], documentos = [], entregasF = [];
     if (ids.length) {
-      [pagos] = await conn.query('SELECT id, propuesta_id, metodo, estado, creado_en FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+      [pagos] = await conn.query('SELECT id, propuesta_id, metodo, estado, creado_en, (stripe_pi IS NOT NULL) AS stripe FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [diligencias] = await conn.query('SELECT id, propuesta_id, estado, coherencia, nota_asesor, resuelto_en, creado_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
       [documentos] = await conn.query(
         `SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en, nombre_original, nombre_anterior, renombrado_en, (documento_ref IS NOT NULL) AS tiene_archivo,
@@ -4193,6 +4686,8 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
          FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en`, [req.asesor.id, ids]);
       [entregasF] = await conn.query('SELECT `id`, `propuesta_id`, `servicio`, `version`, `nombre_archivo`, `bytes`, `subido_en`, `estado`, `comentario`, `respondido_en` FROM entregas WHERE `propuesta_id` IN (?) ORDER BY `servicio`, `version` DESC', [ids]);
     }
+    let docVers = []; if (ids.length) [docVers] = await conn.query("SELECT v.id, v.documento_id, v.nombre_original, v.subido_en, v.estado_previo, v.razon_rechazo, v.reemplazado_en, (SELECT COUNT(*) FROM llaves_documento l WHERE l.tipo = 'fiscal_v' AND l.objeto_id = v.id AND l.asesor_id = ?) AS mi_llave FROM documentos_versiones v JOIN documentos_fiscales d ON d.id = v.documento_id WHERE d.propuesta_id IN (?) ORDER BY v.id", [req.asesor.id, ids]);
+    let devols = []; if (ids.length) { await asegurarStripe(); [devols] = await conn.query('SELECT id, pago_id, propuesta_id, importe_centimos, motivo, origen, estado, creado_en, hecha_en, stripe_refund, nota FROM devoluciones WHERE propuesta_id IN (?) ORDER BY id', [ids]); }
     const telefonoLimpio = String(cliente.telefono || '').replace(/\D/g, '').slice(-9);
     const [solicitudes] = await conn.query(
       `SELECT id, servicios, detalle, cuestionario, telefono, correo, atendida, creado_en
@@ -4205,8 +4700,9 @@ app.get('/api/admin/clientes/:id', requiereSesionAsesor, async (req, res) => {
       encargos: propuestas.map(p => ({
         ...p,
         pagos: pagos.filter(x => x.propuesta_id === p.id),
+        devoluciones: devols.filter(x => x.propuesta_id === p.id),   // 26/11: devoluciones
         diligencia: diligencias.filter(x => x.propuesta_id === p.id).pop() || null,
-        documentos: documentos.filter(x => x.propuesta_id === p.id),
+        documentos: documentos.filter(x => x.propuesta_id === p.id).map(x => Object.assign(x, { versiones: docVers.filter(v => v.documento_id === x.id) })),   // 26/11: archivos anteriores
         entregas: entregasF.filter(x => x.propuesta_id === p.id),
       })),
       solicitudes,
@@ -4228,7 +4724,7 @@ app.get('/api/admin/clientes-activos', requiereSesionAsesor, async (req, res) =>
     const [filas] = await conn.execute(
       `SELECT c.id AS cliente_id, c.correo, c.nombre, c.apellidos, d.propuesta_id, (SELECT pr.servicios FROM propuestas pr WHERE pr.id = d.propuesta_id) AS servicios, (SELECT pr.creado_en FROM propuestas pr WHERE pr.id = d.propuesta_id) AS propuesta_creado_en
        FROM diligencias d JOIN clientes c ON c.id = d.cliente_id
-       WHERE d.estado = 'aprobado' ORDER BY d.resuelto_en DESC`
+       WHERE d.estado IN ('revision', 'examen', 'aprobado') ORDER BY d.resuelto_en DESC`
     );
     res.json(filas);
   } finally {
@@ -4329,6 +4825,12 @@ async function subidasDeHoy(conn, clienteId) {
 const MSG_LIMITE_SUBIDAS = 'Has llegado al límite de hoy (' + LIMITE_SUBIDAS_DIA + ' documentos). Mañana podrás subir más; si te corre prisa, escribe a tu asesor.';
 // 15/10: el cliente sube un documento que no se le ha pedido (botón «Subir
 // documento» → «Otro documento»). Se guarda igual que los pedidos.
+// 26/11 (menor): los documentos se suben con el alta ya enviada (como los ve el cliente desde M7), y uno validado no se reemplaza
+async function altaEnviadaDe(conn, propuestaId) {
+  const [r] = await conn.execute("SELECT 1 FROM diligencias WHERE propuesta_id = ? AND estado IN ('revision','examen','aprobado') LIMIT 1", [propuestaId]);
+  return r.length > 0;
+}
+const MSG_SIN_ALTA_DOCS = 'Completa tu alta antes de subir documentos: lo tienes en «Tareas pendientes».';
 app.post('/api/propuestas/:token/documentos-nuevo', async (req, res) => {
   const b = req.body || {};
   const nombre = String(b.nombre || '').trim().slice(0, 200);
@@ -4339,6 +4841,7 @@ app.post('/api/propuestas/:token/documentos-nuevo', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    if (!(await altaEnviadaDe(conn, p.id))) return res.status(409).json({ error: MSG_SIN_ALTA_DOCS });   // 26/11 (menor)
     const servicios = serviciosDePropuesta(p);
     const servicio = servicios.includes(b.servicio) ? b.servicio : 'general';
     if (!b.archivo_ref && await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
@@ -4368,6 +4871,7 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [filas] = await conn.execute('SELECT * FROM documentos_fiscales WHERE id = ? AND propuesta_id = ?', [req.params.id, p.id]);
     if (!filas.length) return res.status(404).json({ error: 'Documento no encontrado' });
+    if (!(await altaEnviadaDe(conn, p.id))) return res.status(409).json({ error: MSG_SIN_ALTA_DOCS });
     if (!req.body.archivo_ref && await subidasDeHoy(conn, p.cliente_id) >= LIMITE_SUBIDAS_DIA) return res.status(429).json({ error: MSG_LIMITE_SUBIDAS });
     if (req.body.nombre_original) await conn.execute('UPDATE documentos_fiscales SET nombre_original = ? WHERE id = ?', [String(req.body.nombre_original).slice(0, 255), req.params.id]);
     let clave;
@@ -4375,6 +4879,13 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
     else { clave = `docs/${p.cliente_id}/${generarToken()}.enc`; await subirAR2(clave, Buffer.from(archivo_cifrado, 'base64'), 'application/octet-stream'); }
     const huella = huellaValida(req.body.huella_sha256);
     await conn.execute('UPDATE documentos_fiscales SET huella_sha256 = ?, tamano_original = ? WHERE id = ?', [huella, huella ? (Number(req.body.tamano_original) || null) : null, req.params.id]);
+    // 26/11 (Vikn): el archivo anterior se guarda (solo para el equipo) y las llaves de los asesores pasan con él
+    if (filas[0].documento_ref) {
+      const v = filas[0];
+      const [gv] = await conn.execute('INSERT INTO documentos_versiones (documento_id, cliente_id, documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, nombre_original, huella_sha256, tamano_original, subido_en, estado_previo, razon_rechazo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [v.id, v.cliente_id, v.documento_ref, v.documento_iv || null, v.documento_clave_cifrada || null, v.documento_tipo_mime || null, v.nombre_original || null, v.huella_sha256 || null, v.tamano_original || null, v.subido_en || null, v.estado, v.razon_rechazo || null]);
+      await conn.execute("UPDATE llaves_documento SET tipo = 'fiscal_v', objeto_id = ? WHERE tipo = 'fiscal' AND objeto_id = ?", [gv.insertId, v.id]);
+    }
     // Re-subir tras un rechazo también vale — vuelve a "enviado" y borra
     // la razón anterior, para que el asesor lo revise de nuevo desde cero.
     await conn.execute(
@@ -4393,6 +4904,16 @@ app.post('/api/propuestas/:token/documentos/:id/subir', async (req, res) => {
   }
 });
 
+// 26/11 (Vikn): un archivo anterior de un documento (sigue cifrado; se descifra en el navegador del asesor)
+app.get('/api/admin/documentos/versiones/:vid(\\d+)/descargar', requiereSesionAsesor, async (req, res) => {
+  try {
+    const [f] = await pool.execute('SELECT documento_ref, documento_iv, documento_clave_cifrada, documento_tipo_mime, huella_sha256, subido_en FROM documentos_versiones WHERE id = ?', [Number(req.params.vid)]);
+    if (!f.length) return res.status(404).json({ error: 'Versión no encontrada' });
+    const d = f[0], { buffer } = await bajarDeR2(d.documento_ref);
+    res.json({ archivo_cifrado: buffer.toString('base64'), huella_sha256: d.huella_sha256 || null, subido_en: d.subido_en, iv: d.documento_iv, clave_cifrada: d.documento_clave_cifrada, tipo_mime: d.documento_tipo_mime,
+      clave_asesor: await claveDeAsesor('fiscal_v', Number(req.params.vid), req.asesor.id) });
+  } catch (err) { console.error('Versión de un documento:', err.message); res.status(500).json({ error: 'No se pudo recuperar esa versión' }); }
+});
 // El asesor recupera el archivo (sigue cifrado) para descifrarlo en su
 // propio navegador con su clave privada — igual que con el DNI.
 app.get('/api/admin/documentos/:id/descargar', requiereSesionAsesor, async (req, res) => {
@@ -4480,6 +5001,8 @@ async function sesionClienteTrasEntrar(conn, cliente, tokenDispositivo) {
   return { sesion: await crearSesionCliente(conn, cliente.id, 0), requiere_2fa: true };
 }
 
+// 26/11 (Vikn, M4): «inerte» por alta no aprobada (o reembolsado) puede entrar a su área; las fichas fusionadas, no
+const clienteConAcceso = c => !!c && (c.estado === 'activo' || (c.estado === 'inerte' && !String(c.correo || '').startsWith('fusionado-')));
 async function requiereSesionCliente(req, res, next) {
   const token = (req.get('x-sesion-cliente') || '').trim();
   if (!token) return res.status(401).json({ error: 'Falta iniciar sesión' });
@@ -4492,7 +5015,7 @@ async function requiereSesionCliente(req, res, next) {
     if (!filas.length) return res.status(401).json({ error: 'Sesión no válida. Vuelve a entrar.' });
     const s = filas[0];
     if (new Date(s.expira_en) < ahora()) return res.status(401).json({ error: 'Tu sesión ha caducado. Vuelve a entrar.' });
-    if (s.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
+    if (!clienteConAcceso(s)) return res.status(403).json({ error: 'Esta cuenta ya no está activa.' });
     if (s.totp_activo && !s.dos_pasos && !req.permitirSinDosPasos) return res.status(401).json({ error: 'Falta la verificación en dos pasos', requiere_2fa: true });
     req.cliente = { id: s.id, correo: s.correo, nombre: s.nombre, apellidos: s.apellidos, tieneContrasena: !!s.tiene_contrasena, sesionToken: token };
     next();
@@ -4508,7 +5031,7 @@ app.post('/api/acceso/solicitar', async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const [filas] = await conn.execute('SELECT * FROM clientes WHERE correo = ?', [correo]);
-    if (filas.length && filas[0].estado === 'activo') {
+    if (filas.length && clienteConAcceso(filas[0])) {
       const cliente = filas[0];
       const token = generarToken();
       const expira = sumarMinutos(ahora(), MINUTOS_VIGENCIA_ACCESO);
@@ -4613,7 +5136,7 @@ app.post('/api/clientes/login', async (req, res) => {
     const error = () => { apuntarFalloLogin(claveC); return res.status(401).json({ error: 'Correo o contraseña incorrectos' }); };
     if (!filas.length || !filas[0].contrasena_hash) return error();
     const cliente = filas[0];
-    if (cliente.estado !== 'activo') return res.status(403).json({ error: 'Esta cuenta ya no está activa' });
+    if (!clienteConAcceso(cliente)) return res.status(403).json({ error: 'Esta cuenta ya no está activa' });
     const ok = await bcrypt.compare(contrasena, cliente.contrasena_hash);
     if (!ok) return error();
     const r = await sesionClienteTrasEntrar(conn, cliente, req.get('x-dispositivo-2fa'));
@@ -5354,7 +5877,7 @@ async function ajustesFacturacion() {
 app.get('/api/admin/facturacion', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
   try {
     const d = await ajustesFacturacion(), clave = process.env.STRIPE_SECRET_KEY || '';
-    res.json(Object.assign(d, { quipu: { conectado: !!(process.env.QUIPU_APP_ID && process.env.QUIPU_APP_SECRET) }, stripe: { conectado: !!clave, modo: clave.startsWith('sk_live') ? 'real' : 'pruebas' }, facturas: [] }));
+    res.json(Object.assign(d, { quipu: { conectado: !!(process.env.QUIPU_APP_ID && process.env.QUIPU_APP_SECRET) }, stripe: { conectado: !!clave, modo: /^(sk|rk)_live_/.test(clave) ? 'real' : 'pruebas', webhook: !!process.env.STRIPE_WEBHOOK_SECRET }, facturas: [] }));
   } catch (e) { console.error('Facturación:', e.message); res.status(500).json({ error: 'No se pudieron leer los ajustes de facturación' }); }
 });
 app.put('/api/admin/facturacion', requiereSesionAsesor, requiereRol('admin'), async (req, res) => {
@@ -5862,7 +6385,7 @@ app.get('/api/admin/cambios-asesor', requiereSesionAsesor, async (req, res) => {
 async function asignarAsesor(conn, clienteId, persona, motivoTexto) {
   await conn.execute('UPDATE clientes SET `asesor_persona_id` = ? WHERE id = ?', [persona ? persona.id : null, clienteId]);
   if (persona) {
-    const t = '🤝 Tienes un cliente nuevo', tGen = '🤝 ' + quienIni(await inicialesDePersona(persona.id)) + ' · Tiene un cliente nuevo';
+    const t = '🤝 Tienes un cliente nuevo', tGen = '🤝 ' + quienIni(await inicialesDePersona(persona.id)) + ': tiene un cliente nuevo';
     const m = (motivoTexto || 'Te lo han asignado') + '. Lo tienes en «Clientes y encargos».';
     avisar(tGen, m, { etiqueta: 'handshake' });
     if (persona.ntfy_topic && persona.ntfy_topic !== NTFY_TOPIC) avisarEn(persona.ntfy_topic, t, m, { etiqueta: 'handshake' });
@@ -5950,7 +6473,7 @@ app.post('/api/admin/propuestas/:id/colaboraciones', requiereSesionAsesor, async
     if (!confirmada && titular) {
       const [t] = await conn.execute('SELECT * FROM personas WHERE id = ?', [titular]);
       if (t.length) {
-        const titulo = '🤝 Confirma una colaboración', tituloGen = '🤝 ' + quienIni(await inicialesDePersona(t[0].id)) + ' · Confirma una colaboración';
+        const titulo = '🤝 Confirma una colaboración', tituloGen = '🤝 ' + quienIni(await inicialesDePersona(t[0].id)) + ': confirma una colaboración';
         const msg = quienIni(await inicialesDeAsesor(req.asesor.id)) + ' dice que ha colaborado en un encargo tuyo. Confírmalo en la ficha del cliente.';
         avisar(tituloGen, msg, { etiqueta: 'handshake' });
         if (t[0].ntfy_topic && t[0].ntfy_topic !== NTFY_TOPIC) avisarEn(t[0].ntfy_topic, titulo, msg, { etiqueta: 'handshake' });
@@ -6019,7 +6542,7 @@ app.get('/api/admin/rendimiento', requiereSesionAsesor, requiereRol('encargado')
       informes: 0, terminados: 0, valoraciones: 0, atencion: null, calidad: null, rapidez: null, calidad_ponderada: null,
       colab_hechas: 0, colab_recibidas: 0, respuesta_horas: null, dias_entrega: null, cambios: 0, piden_cambio: 0, _resp: [], _dias: [], _cal: [] }; });
     // Informes entregados (v1) y días pago → entrega
-    const [ents] = await conn.execute('SELECT e.subido_por, e.version, e.subido_en, (SELECT COALESCE(MIN(pg.confirmado_en), MIN(pg.creado_en)) FROM pagos pg WHERE pg.propuesta_id = e.propuesta_id) AS pagado_en FROM entregas e WHERE e.subido_en >= ? AND e.subido_en < ?', rango);
+    const [ents] = await conn.execute('SELECT e.subido_por, e.version, e.subido_en, (SELECT COALESCE(MIN(pg.confirmado_en), MIN(pg.creado_en)) FROM pagos pg WHERE pg.propuesta_id = e.propuesta_id AND pg.estado <> \'rechazado\') AS pagado_en FROM entregas e WHERE e.subido_en >= ? AND e.subido_en < ?', rango);
     ents.forEach(e => { const f = filas[porAsesor[e.subido_por]]; if (!f || e.version !== 1) return; f.informes++; if (e.pagado_en) f._dias.push((new Date(e.subido_en) - new Date(e.pagado_en)) / 86400000); });
     // Cambios pedidos en informes suyos
     const [cams] = await conn.execute("SELECT subido_por FROM entregas WHERE comentario IS NOT NULL AND respondido_en >= ? AND respondido_en < ?", rango);
@@ -6100,8 +6623,9 @@ app.post('/api/propuestas/:token/valoracion', exigirPagoConfirmado, async (req, 
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     if (!(await encargoTerminado(conn, p))) return res.status(409).json({ error: 'Podrás valorar cuando hayas dado tu conformidad a todos tus informes' });
-    const [ya] = await conn.execute('SELECT `estado` FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
-    if (ya.length && ya[0].estado !== 'omitida') return res.status(409).json({ error: 'Ya valoraste este encargo. ¡Gracias!' });
+    const [ya] = await conn.execute('SELECT `estado`, `comentario`, (`creado_en` >= NOW() - INTERVAL 7 DAY) AS cambiable FROM valoraciones WHERE `propuesta_id` = ?', [p.id]);
+    const cambio = !!(ya.length && ya[0].estado !== 'omitida');   // 27/11 (Vikn): enviada, se puede cambiar durante 7 días
+    if (cambio && (b.omitir || !ya[0].cambiable)) return res.status(409).json({ error: 'Ya valoraste este encargo. ¡Gracias!' });
     const asesor = await personaDeCliente(p.cliente_id, conn);
     if (b.omitir) {
       if (!ya.length) await conn.execute("INSERT INTO valoraciones (`propuesta_id`, `cliente_id`, `persona_id`, `estado`) VALUES (?, ?, ?, 'omitida')", [p.id, p.cliente_id, asesor ? asesor.id : null]);
@@ -6114,10 +6638,13 @@ app.post('/api/propuestas/:token/valoracion', exigirPagoConfirmado, async (req, 
     const [cl] = await conn.execute('SELECT nombre, apellidos FROM clientes WHERE id = ?', [p.cliente_id]);
     const comentario = textoMensaje(b.comentario || '').slice(0, 2000) || null;
     const valores = [asesor ? asesor.id : null, at, ca, ra, comentario, forma, nombreParaMostrar(cl[0] || {}, forma), comentario ? 'por_revisar' : 'revisada'];
-    if (ya.length) await conn.execute('UPDATE valoraciones SET `persona_id`=?, `atencion`=?, `calidad`=?, `rapidez`=?, `comentario`=?, `nombre_publico`=?, `nombre_mostrado`=?, `estado`=?, `creado_en`=NOW() WHERE `propuesta_id`=?', [...valores, p.id]);
+    if (cambio) {   // 27/11: se cambia sin mover su fecha (las métricas cuentan desde la primera); el comentario igual no se vuelve a revisar
+      const mismo = (ya[0].comentario || null) === comentario && ya[0].estado === 'revisada';
+      await conn.execute('UPDATE valoraciones SET `persona_id`=?, `atencion`=?, `calidad`=?, `rapidez`=?, `comentario`=?, `nombre_publico`=?, `nombre_mostrado`=?, `estado`=?, `editada_en`=NOW()' + (mismo ? '' : ', `comentario_revisado`=NULL, `revisado_en`=NULL') + ' WHERE `propuesta_id`=?', [...valores.slice(0, 7), mismo ? 'revisada' : valores[7], p.id]);
+    } else if (ya.length) await conn.execute('UPDATE valoraciones SET `persona_id`=?, `atencion`=?, `calidad`=?, `rapidez`=?, `comentario`=?, `nombre_publico`=?, `nombre_mostrado`=?, `estado`=?, `creado_en`=NOW() WHERE `propuesta_id`=?', [...valores, p.id]);
     else await conn.execute('INSERT INTO valoraciones (`persona_id`, `atencion`, `calidad`, `rapidez`, `comentario`, `nombre_publico`, `nombre_mostrado`, `estado`, `propuesta_id`, `cliente_id`) VALUES (?,?,?,?,?,?,?,?,?,?)', [...valores, p.id, p.cliente_id]);
     const media = ((at + ca + ra) / 3).toFixed(1).replace('.', ',');
-    (async () => { const q = await personaDeCliente(p.cliente_id).catch(() => null); avisarAdminClientes('⭐ Nueva valoración' + (q ? ' para ' + quienIni(await inicialesDePersona(q.id)) : ''), 'Media ' + media + '/5' + (comentario ? ' · con comentario por revisar' : '') + '.', { etiqueta: 'star' }); })();   // 15/10: las valoraciones solo a los admins
+    (async () => { const q = await personaDeCliente(p.cliente_id).catch(() => null); avisarAdminClientes((cambio ? 'Valoración cambiada' : '⭐ Nueva valoración') + (q ? ' para ' + quienIni(await inicialesDePersona(q.id)) : ''), 'Media ' + media + '/5' + (comentario ? ', con comentario por revisar' : '') + '.', { etiqueta: 'star' }); })();   // 15/10: las valoraciones solo a los admins
     res.status(201).json({ ok: true });
   } finally { conn.release(); }
 });
@@ -6160,7 +6687,7 @@ async function enviarRecordatoriosValoracion() {
         boton: enlace ? { texto: 'Valorar en un minuto', url: enlace } : null,
         nota: 'Es el único recordatorio que te enviaremos.',
       });
-      notificarCliente(conn, f.cliente_id, 'recordatorios', () => enviarCorreo(f.correo, `¿Qué tal con ${quien}? · Acros`, c.html, c.texto, { desde: 'asesor' }),
+      notificarCliente(conn, f.cliente_id, 'recordatorios', () => enviarCorreo(f.correo, `¿Qué tal con ${quien}?`, c.html, c.texto, { desde: 'asesor' }),
         `Acros: hace unos días terminamos tu encargo. ¿Nos cuentas qué tal te ha atendido ${quien}? Son tres preguntas.` + (enlace ? ' ' + enlace : ''))
         .catch(err => console.error('Recordatorio de valoración no enviado:', err.message));
     }
@@ -6192,28 +6719,41 @@ const MAX_BYTES_ENTREGA = 10 * 1024 * 1024; // en base64 ocupa ~13,4 MB: cabe en
 const nombreSeguro = n => String(n || 'informe').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 180);
 
 app.post('/api/admin/propuestas/:id/entregas', requiereSesionAsesor, async (req, res) => {
-  const { servicio, nombre, tipo, datos_base64 } = req.body || {};
+  const { servicio, nombre, tipo, datos_base64, anadir } = req.body || {};   // 26/11: «anadir»: otro archivo para la misma versión (p. ej. un PDF por año)
   if (!TIPOS_ENTREGA[tipo]) return res.status(400).json({ error: 'Formato no admitido (PDF, Excel, Word, CSV o ZIP)' });
   const buffer = Buffer.from(String(datos_base64 || ''), 'base64');
   if (!buffer.length) return res.status(400).json({ error: 'El archivo está vacío' });
   if (buffer.length > MAX_BYTES_ENTREGA) return res.status(413).json({ error: 'El archivo supera los 10 MB' });
-  if (!R2_BUCKET) return res.status(500).json({ error: 'El almacenamiento (R2) no está configurado' });
+  if (!R2_BUCKET && process.env.ACROS_PRUEBAS !== '1') return res.status(500).json({ error: 'El almacenamiento (R2) no está configurado' });
   const conn = await pool.getConnection();
   try {
     const [ps] = await conn.execute('SELECT p.*, c.`correo`, c.`nombre` AS cliente_nombre FROM propuestas p JOIN clientes c ON c.`id` = p.`cliente_id` WHERE p.`id` = ?', [Number(req.params.id)]);
     if (!ps.length) return res.status(404).json({ error: 'Encargo no encontrado' });
     const p = ps[0];
     const serv = servicioDeHilo(p, servicio);
-    const [v] = await conn.execute('SELECT COALESCE(MAX(`version`), 0) + 1 AS v FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ?', [p.id, serv]);
-    const version = v[0].v;
+    let version;
+    if (anadir) {   // 26/11: se suma a la última versión, si el cliente aún no ha respondido
+      const [u] = await conn.execute('SELECT `version`, `estado` FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ? ORDER BY `version` DESC, `id` DESC LIMIT 1', [p.id, serv]);
+      if (!u.length) return res.status(409).json({ error: 'Aún no hay informe al que añadir archivos: súbelo primero' });
+      if (u[0].estado !== 'entregado') return res.status(409).json({ error: 'El cliente ya respondió a esa versión: sube una versión nueva' });
+      version = u[0].version;
+    } else {
+      const [v] = await conn.execute('SELECT COALESCE(MAX(`version`), 0) + 1 AS v FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ?', [p.id, serv]);
+      version = v[0].v;
+    }
     const nombreArch = nombreSeguro(nombre);
     const clave = `entregas/${p.id}/${serv}/v${version}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${TIPOS_ENTREGA[tipo]}`;
     await subirAR2(clave, buffer, tipo);
     const [r] = await conn.execute(
-      'INSERT INTO entregas (`propuesta_id`, `cliente_id`, `servicio`, `version`, `nombre_archivo`, `tipo`, `bytes`, `clave_r2`, `subido_por`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [p.id, p.cliente_id, serv, version, nombreArch, tipo, buffer.length, clave, req.asesor.id]);
-    let correo = 'sin_correo';
-    if (p.correo && brevoActivo()) {
+      'INSERT INTO entregas (`propuesta_id`, `cliente_id`, `servicio`, `version`, `nombre_archivo`, `tipo`, `bytes`, `clave_r2`, `subido_por`, `conformidad_pedida_en`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())',
+      [p.id, p.cliente_id, serv, version, nombreArch, tipo, buffer.length, clave, req.asesor.id]);   // 26/11 (M1): el visto bueno se puede dar desde ya
+    if (!anadir && version > 1) {   // 26/11 (menor): una versión nueva de un informe ya aprobado reabre el servicio hasta su nuevo visto bueno
+      const [sv] = await conn.execute("SELECT id FROM servicios_cliente WHERE propuesta_id = ? AND servicio = ? AND estado = 'terminado'", [p.id, serv]);
+      if (sv.length) { await conn.execute("UPDATE servicios_cliente SET estado = 'abierto', propuesto_en = NULL, propuesto_por = NULL, cerrado_en = NULL, cerrado_por = NULL, cierre_via = NULL WHERE id = ?", [sv[0].id]); await apuntarServicio(conn, sv[0].id, 'reabierto', 'asesor', req.asesor.id, 'sube una versión nueva del informe').catch(() => {}); }
+    }
+    let correo = anadir ? 'no_hace_falta' : 'sin_correo';   // 26/11: el correo sale con el primer archivo de la versión
+    const pagadoE = await pagoConfirmadoDe(conn, p.id);
+    if (!anadir && p.correo && brevoActivo()) {
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
       const asesorE = await personaDeCliente(p.cliente_id, conn).catch(() => null);
       const quienE = asesorE ? ESC_HTML(asesorE.nombre) : 'Tu asesor';
@@ -6221,7 +6761,8 @@ app.post('/api/admin/propuestas/:id/entregas', requiereSesionAsesor, async (req,
         titulo: version > 1 ? 'Tu informe corregido está listo' : 'Tu informe está listo',
         parrafos: [p.cliente_nombre ? `Hola, ${ESC_HTML(p.cliente_nombre)}:` : 'Hola:',
           (version > 1 ? `${quienE} ha subido la versión corregida de tu informe.` : `${quienE} ha terminado tu informe y ya lo tienes en tu área de cliente.`) +
-          ' Descárgalo, revísalo y, si todo está bien, danos tu conformidad con un clic. Si tienes cualquier duda, pídenos el cambio desde ahí mismo.'],
+          (pagadoE ? ' Descárgalo, revísalo y, si todo está bien, dale el visto bueno con un clic. Si algo no te cuadra, cuéntaselo desde ahí mismo.'
+            : ' Podrás abrirlo en cuanto confirmemos tu pago; lo tienes en «Tareas pendientes», dentro de tu área.')],   // 26/11 (M1): sin pago no lo ve
         boton: enlace ? { texto: 'Ver mi informe', url: enlace } : null,
         nota: 'Por tu privacidad, el informe no viaja por correo: está guardado en tu área y podrás descargarlo siempre que lo necesites.',
       });
@@ -6250,13 +6791,14 @@ app.get('/api/admin/entregas/:id/descargar', requiereSesionAsesor, async (req, r
   } finally { conn.release(); }
 });
 // Cliente: descargar cualquiera de SUS informes (de este encargo o de anteriores)
-app.get('/api/propuestas/:token/entregas/:id/descargar', exigirPagoConfirmado, async (req, res) => {
+app.get('/api/propuestas/:token/entregas/:id/descargar', async (req, res) => {   // 26/11 (auditoría G7): el pago se mira en el encargo del informe
   const conn = await pool.getConnection();
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
     const [f] = await conn.execute('SELECT * FROM entregas WHERE `id` = ? AND `cliente_id` = ?', [Number(req.params.id), p.cliente_id]);
     if (!f.length) return res.status(404).json({ error: 'No encontrado' });
+    if (!(await pagoConfirmadoDe(conn, f[0].propuesta_id))) return res.status(402).json(SIN_PAGO);
     await enviarArchivoEntrega(res, f[0]);
   } finally { conn.release(); }
 });
@@ -6265,8 +6807,8 @@ async function entregaDelCliente(conn, token, id) {
   if (!p) return { error: [404, 'Propuesta no encontrada'] };
   const [f] = await conn.execute('SELECT * FROM entregas WHERE `id` = ? AND `propuesta_id` = ?', [Number(id), p.id]);
   if (!f.length) return { error: [404, 'Informe no encontrado'] };
-  const [ult] = await conn.execute('SELECT MAX(`id`) AS m FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ?', [p.id, f[0].servicio]);
-  if (ult[0].m !== f[0].id) return { error: [409, 'Hay una versión más reciente de este informe'] };
+  const [ult] = await conn.execute('SELECT MAX(`version`) AS v FROM entregas WHERE `propuesta_id` = ? AND `servicio` = ?', [p.id, f[0].servicio]);   // 26/11: varios archivos por versión
+  if (ult[0].v !== f[0].version) return { error: [409, 'Hay una versión más reciente de este informe'] };
   if (f[0].estado !== 'entregado') return { error: [409, 'Ya respondiste a este informe'] };
   return { p, e: f[0] };
 }
@@ -6275,8 +6817,7 @@ app.post('/api/propuestas/:token/entregas/:id/conformidad', exigirPagoConfirmado
   try {
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
-    if (!r.e.conformidad_pedida_en) return res.status(409).json({ error: 'Tu asesor aún no te ha pedido el visto bueno de este informe' });   // 26/10
-    await conn.execute("UPDATE entregas SET `estado` = 'conforme', `respondido_en` = NOW() WHERE `id` = ?", [r.e.id]);
+    await conn.execute("UPDATE entregas SET `estado` = 'conforme', `respondido_en` = NOW() WHERE `propuesta_id` = ? AND `servicio` = ? AND `version` = ?", [r.e.propuesta_id, r.e.servicio, r.e.version]);   // 26/11: todos los archivos de esa versión
     await cerrarServicioPorInforme(conn, r.p, r.e.servicio).catch(err => console.error('Cierre del servicio por informe:', err.message));
     avisarCliente(r.e.cliente_id, '✅', 'un cliente ha dado su conformidad a su informe', 'Ese servicio queda terminado.', { etiqueta: 'white_check_mark' });
     res.json({ ok: true, estado: 'conforme' });
@@ -6289,7 +6830,7 @@ app.post('/api/propuestas/:token/entregas/:id/cambios', exigirPagoConfirmado, as
   try {
     const r = await entregaDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
-    await conn.execute("UPDATE entregas SET `estado` = 'cambios', `comentario` = ?, `respondido_en` = NOW() WHERE `id` = ?", [comentario, r.e.id]);
+    await conn.execute("UPDATE entregas SET `estado` = 'cambios', `comentario` = ?, `respondido_en` = NOW() WHERE `propuesta_id` = ? AND `servicio` = ? AND `version` = ?", [comentario, r.e.propuesta_id, r.e.servicio, r.e.version]);
     await reabrirServicioPorCambios(conn, r.p, r.e.servicio).catch(err => console.error('Reapertura del servicio por cambios:', err.message));
     // El comentario va también al chat de ese servicio, para hablarlo ahí
     await conn.execute("INSERT INTO mensajes (propuesta_id, cliente_id, servicio, autor, texto) VALUES (?, ?, ?, 'cliente', ?)",
@@ -6362,39 +6903,100 @@ async function enviarAvisosDocumentosPendientes() {
   tareaDocsEnMarcha = true;
   const conn = await pool.getConnection();
   try {
+    // 26/11 (Vikn, M8): también los rechazados (cuentan desde que se rechazaron), en el mismo correo agrupado
     const [props] = await conn.query(
-      `SELECT d.propuesta_id, c.id AS cliente_id, c.correo, c.nombre AS cliente_nombre, MAX(d.creado_en) AS ultimo, a.ultimo_aviso_en
+      `SELECT d.propuesta_id, c.id AS cliente_id, c.correo, c.nombre AS cliente_nombre,
+              MAX(CASE WHEN d.estado = 'rechazado' THEN COALESCE(d.revisado_en, d.creado_en) ELSE d.creado_en END) AS ultimo, a.ultimo_aviso_en
        FROM documentos_fiscales d JOIN clientes c ON c.id = d.cliente_id
        LEFT JOIN avisos_documentos a ON a.propuesta_id = d.propuesta_id
-       WHERE d.estado = 'pendiente'
+       WHERE (d.estado = 'pendiente' OR (d.estado = 'rechazado' AND COALESCE(d.revisado_en, d.creado_en) >= '2026-11-26')) AND c.estado = 'activo'   -- los rechazos de antes de esto no se avisan de golpe
        GROUP BY d.propuesta_id, c.id, c.correo, c.nombre, a.ultimo_aviso_en
-       HAVING MAX(d.creado_en) <= NOW() - INTERVAL ? SECOND
-          AND (a.ultimo_aviso_en IS NULL OR MAX(d.creado_en) > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
+       HAVING ultimo <= NOW() - INTERVAL ? SECOND
+          AND (a.ultimo_aviso_en IS NULL OR ultimo > a.ultimo_aviso_en)`, [SEGUNDOS_AVISO_CHAT]);
     for (const f of props) {
       await conn.execute('INSERT INTO avisos_documentos (propuesta_id, ultimo_aviso_en) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE ultimo_aviso_en = NOW()', [f.propuesta_id]);
       if (!f.correo || !brevoActivo()) continue;
-      const [docs] = await conn.execute("SELECT nombre, urgente FROM documentos_fiscales WHERE propuesta_id = ? AND estado = 'pendiente' ORDER BY creado_en", [f.propuesta_id]);
-      if (!docs.length) continue;
+      const [todos] = await conn.execute("SELECT nombre, urgente, estado, razon_rechazo FROM documentos_fiscales WHERE propuesta_id = ? AND estado IN ('pendiente', 'rechazado') ORDER BY creado_en", [f.propuesta_id]);
+      const docs = todos.filter(d => d.estado === 'pendiente'), rech = todos.filter(d => d.estado === 'rechazado');
+      if (!docs.length && !rech.length) continue;
       const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
       const asesorD = await personaDeCliente(f.cliente_id, conn).catch(() => null);
       const quienD = asesorD ? ESC_HTML(asesorD.nombre) : 'tu asesor';
+      const parrafos = [f.cliente_nombre ? `Hola, ${ESC_HTML(f.cliente_nombre)}:` : 'Hola:'];
+      if (rech.length) parrafos.push(rech.length === 1 ? `${quienD.replace(/^t/, 'T')} ha revisado un documento que subiste y necesita que lo vuelvas a subir:` : `${quienD.replace(/^t/, 'T')} ha revisado unos documentos que subiste y necesita que los vuelvas a subir:`,
+        rech.map(d => '<strong>' + ESC_HTML(d.nombre) + '</strong>' + (d.razon_rechazo ? '<br><em>' + ESC_HTML(d.razon_rechazo) + '</em>' : '')).join('<br><br>'));
+      if (docs.length) parrafos.push(rech.length ? (docs.length === 1 ? 'Y también necesita este:' : 'Y también necesita estos:') : (docs.length === 1 ? `Para seguir con tu encargo, ${quienD} necesita este documento:` : `Para seguir con tu encargo, ${quienD} necesita estos documentos:`),
+        '<strong>' + docs.map(d => ESC_HTML(d.nombre) + (d.urgente ? ' (urgente)' : '')).join('<br>') + '</strong>');
+      parrafos.push('Súbelos desde tu área de cliente; viajan y se guardan cifrados.');
+      const soloRech = !docs.length, n = docs.length + rech.length;
       const c = plantillaCorreo({
-        titulo: asesorD ? `${asesorD.nombre} necesita documentación` : 'Tu asesor necesita documentación',
-        parrafos: [f.cliente_nombre ? `Hola, ${ESC_HTML(f.cliente_nombre)}:` : 'Hola:',
-          docs.length === 1 ? `Para seguir con tu encargo, ${quienD} necesita este documento:` : `Para seguir con tu encargo, ${quienD} necesita estos documentos:`,
-          '<strong>' + docs.map(d => ESC_HTML(d.nombre) + (d.urgente ? ' (urgente)' : '')).join('<br>') + '</strong>',
-          'Súbelos desde tu área de cliente; viajan y se guardan cifrados.'],
+        titulo: soloRech ? (rech.length === 1 ? 'Vuelve a subir un documento' : 'Vuelve a subir unos documentos') : (asesorD ? `${asesorD.nombre} necesita documentación` : 'Tu asesor necesita documentación'),
+        parrafos,
         boton: enlace ? { texto: 'Subir documentación', url: enlace } : null,
         nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
       });
-      try { await notificarCliente(conn, f.cliente_id, 'documentos', () => enviarCorreo(f.correo, asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación', c.html, c.texto, { desde: 'asesor' }),
-        'Acros: ' + (asesorD ? asesorD.nombre : 'tu asesor') + ' necesita ' + (docs.length === 1 ? 'un documento' : docs.length + ' documentos') + ' para seguir con tu encargo. Súbelos desde tu área.' + (enlace ? ' ' + enlace : '')); }
+      const asunto = soloRech ? (asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita que vuelvas a subir ` : 'Tu asesor de Acros necesita que vuelvas a subir ') + (rech.length === 1 ? 'un documento' : 'unos documentos')
+        : (asesorD ? `${asesorD.nombre}, tu asesor de Acros, necesita documentación` : 'Tu asesor de Acros necesita documentación');
+      try { await notificarCliente(conn, f.cliente_id, 'documentos', () => enviarCorreo(f.correo, asunto, c.html, c.texto, { desde: 'asesor' }),
+        'Acros: ' + (asesorD ? asesorD.nombre : 'tu asesor') + (soloRech ? ' necesita que vuelvas a subir ' + (rech.length === 1 ? 'un documento' : rech.length + ' documentos') : ' necesita ' + (n === 1 ? 'un documento' : n + ' documentos')) + ' para seguir con tu encargo. Súbelos desde tu área.' + (enlace ? ' ' + enlace : '')); }
       catch (err) { console.error('Correo de documentación pedida no enviado:', err.message); }
     }
   } catch (err) {
     console.error('Tarea de avisos de documentación:', err.message);
   } finally { conn.release(); tareaDocsEnMarcha = false; }
 }
+// 26/11 (Vikn, M8): al confirmar un pago, SIEMPRE un correo al cliente («para que esté tranquilo»), con lo que le toca después
+const eurosCorreo = c => { const n = Math.round(Number(c) || 0), e = Math.floor(n / 100), r = n % 100; return String(e).replace(/\B(?=(\d{3})+(?!\d))/g, '.') + (r ? ',' + String(r).padStart(2, '0') : '') + ' €'; };
+async function correoPagoConfirmado(pagoId) {
+  if (!brevoActivo()) return;
+  const conn = await pool.getConnection();
+  try {
+    const [f] = await conn.execute('SELECT p.id AS propuesta_id, p.token, p.importe_centimos, c.id AS cliente_id, c.correo, c.nombre, c.estado FROM pagos pg JOIN propuestas p ON p.id = pg.propuesta_id JOIN clientes c ON c.id = p.cliente_id WHERE pg.id = ?', [pagoId]);
+    if (!f.length || !f[0].correo) return;
+    const x = f[0];
+    const [[e]] = await conn.execute('SELECT (SELECT estado FROM diligencias WHERE propuesta_id = ? ORDER BY id DESC LIMIT 1) AS alta, (SELECT COUNT(*) FROM entregas WHERE propuesta_id = ?) AS informes', [x.propuesta_id, x.propuesta_id]);
+    const asesor = await personaDeCliente(x.cliente_id, conn).catch(() => null), quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
+    const sig = x.estado !== 'activo' ? null : [e.informes > 0 ? 'Ya puedes ver tu informe en tu área.' : '',
+      !e.alta ? (e.informes > 0 ? 'Te queda completar tu alta: son unos minutos y lo tienes en «Tareas pendientes».' : 'Lo siguiente es completar tu alta: son unos minutos y lo tienes en «Tareas pendientes», dentro de tu área.') : '',
+      e.alta && !(e.informes > 0) ? quien + ' ya está con tu encargo. Te avisaremos en cuanto haya novedades.' : ''].filter(Boolean).join(' ') || null;
+    const enlace = enlaceArea('area', x.token);
+    const c = plantillaCorreo({
+      titulo: 'Hemos recibido tu pago',
+      parrafos: [x.nombre ? `Hola, ${ESC_HTML(x.nombre)}:` : 'Hola:', `Hemos recibido tu pago de <strong>${eurosCorreo(x.importe_centimos)}</strong>. Todo en orden.`, sig].filter(Boolean),
+      boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
+    });
+    await enviarCorreo(x.correo, 'Hemos recibido tu pago', c.html, c.texto, { desde: 'asesor' });
+  } catch (err) { console.error('Correo de pago confirmado no enviado:', err.message); } finally { conn.release(); }
+}
+// 26/11 (Vikn, M8): propuesta sin responder que caduca en 3 días o menos: un aviso, una sola vez
+let columnaAvisoCaduca = null, tareaCaducaEnMarcha = false;
+async function avisarPropuestasPorCaducar() {
+  if (tareaCaducaEnMarcha) return;
+  tareaCaducaEnMarcha = true;
+  const conn = await pool.getConnection();
+  try {
+    await (columnaAvisoCaduca || (columnaAvisoCaduca = agregaColumnaSiFalta('propuestas', 'aviso_caduca_en', 'DATETIME NULL')));
+    const [ps] = await conn.query(`SELECT p.id, p.token, p.token_expira_en, c.id AS cliente_id, c.correo, c.nombre FROM propuestas p JOIN clientes c ON c.id = p.cliente_id
+      WHERE p.estado = 'enviada' AND p.aviso_caduca_en IS NULL AND c.estado = 'activo'
+        AND p.token_expira_en > NOW() AND p.token_expira_en <= NOW() + INTERVAL 3 DAY AND p.creado_en <= NOW() - INTERVAL 2 DAY`);
+    for (const x of ps) {
+      await conn.execute('UPDATE propuestas SET aviso_caduca_en = NOW() WHERE id = ?', [x.id]);
+      if (!x.correo || !brevoActivo()) continue;
+      const asesor = await personaDeCliente(x.cliente_id, conn).catch(() => null), quien = asesor ? ESC_HTML(asesor.nombre) : 'tu asesor';
+      const enlace = enlaceArea('area', x.token), fecha = fechaLargaES(x.token_expira_en);
+      const c = plantillaCorreo({
+        titulo: 'Tu propuesta caduca pronto',
+        parrafos: [x.nombre ? `Hola, ${ESC_HTML(x.nombre)}:` : 'Hola:', `La propuesta que te preparó ${quien} sigue esperando tu respuesta. Es válida hasta el ${fecha}, incluido.`,
+          'Si te encaja, acéptala desde tu área. Si no, dinos por qué y te preparará otra que sí.'],
+        boton: enlace ? { texto: 'Ir a mi área', url: enlace } : null,
+      });
+      try { await notificarCliente(conn, x.cliente_id, 'recordatorios', () => enviarCorreo(x.correo, 'Tu propuesta de Acros caduca pronto', c.html, c.texto, { desde: 'asesor' }),
+        'Acros: tu propuesta caduca el ' + fecha + '. Puedes aceptarla o decirnos por qué no te encaja desde tu área.' + (enlace ? ' ' + enlace : '')); }
+      catch (err) { console.error('Aviso de propuesta por caducar no enviado:', err.message); }
+    }
+  } catch (err) { console.error('Tarea de propuestas por caducar:', err.message); } finally { conn.release(); tareaCaducaEnMarcha = false; }
+}
+setInterval(avisarPropuestasPorCaducar, MS_TAREA_AVISOS);
 setInterval(enviarAvisosDocumentosPendientes, MS_TAREA_AVISOS);
 
 // --- Resumen diario para los administradores (10/10) ---
@@ -6442,23 +7044,23 @@ async function enviarResumenDiario({ forzarFecha } = {}) {
     const servs = x => { try { const l = JSON.parse(x); return Array.isArray(l) ? l.join(', ') : String(x); } catch (e) { return String(x || ''); } };
     const bloque = (titulo, filas) => filas.length ? `<p style="margin:18px 0 6px;"><strong>${titulo} (${filas.length})</strong></p><ul style="margin:0; padding-left:20px;">${filas.map(f => '<li style="margin:3px 0;">' + f + '</li>').join('')}</ul>` : '';
     const fechaBonita = new Date(ayer + 'T12:00:00Z').toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'Europe/Madrid' });
-    const html = bloque('Solicitudes de presupuesto', sols.map(x => ESC_HTML(servs(x.servicios)) + ' · ' + ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : '') + (x.con_cuest ? ' · con cuestionario' : ' · <em>sin cuestionario</em>'))) +
-      bloque('Peticiones de llamada', llams.map(x => ESC_HTML(x.nombre || '') + ' · ' + ESC_HTML(x.telefono || ''))) +
-      bloque('Empresas registradas', emps.map(x => ESC_HTML(x.razon_social || '') + (x.contacto ? ' · ' + ESC_HTML(x.contacto) : ''))) +
-      bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ' · ' + ESC_HTML(x.correo) : ''))) +
-      bloque('Sugerencias', sugs.map(x => '<em>' + ({ idea: 'Idea', fallo: 'Algo no funciona', otro: 'Otro' })[x.tipo] + (x.origen === 'area' ? ' · desde el área' : ' · desde la web') + ':</em> ' + ESC_HTML(String(x.texto).slice(0, 220)) + (String(x.texto).length > 220 ? '…' : ''))) +
-      bloque('Cambios de asesor pedidos', cambs.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · de ' + ESC_HTML(x.desde_nombre || 'sin asesor') + ' a ' + ESC_HTML(x.a_nombre || '?') + (x.estado === 'pendiente' ? ' · <em>pendiente</em>' : ' · ' + x.estado))) +
+    const html = bloque('Solicitudes de presupuesto', sols.map(x => ESC_HTML(servs(x.servicios)) + ', ' + ESC_HTML(x.telefono || '') + (x.correo ? ', ' + ESC_HTML(x.correo) : '') + (x.con_cuest ? ', con cuestionario' : ', <em>sin cuestionario</em>'))) +
+      bloque('Peticiones de llamada', llams.map(x => ESC_HTML(x.nombre || '') + ', ' + ESC_HTML(x.telefono || ''))) +
+      bloque('Empresas registradas', emps.map(x => ESC_HTML(x.razon_social || '') + (x.contacto ? ', ' + ESC_HTML(x.contacto) : ''))) +
+      bloque('Cuestionarios completados después', cuests.map(x => ESC_HTML(x.telefono || '') + (x.correo ? ', ' + ESC_HTML(x.correo) : ''))) +
+      bloque('Sugerencias', sugs.map(x => '<em>' + ({ idea: 'Idea', fallo: 'Algo no funciona', otro: 'Otro' })[x.tipo] + (x.origen === 'area' ? ', desde el área' : ', desde la web') + ':</em> ' + ESC_HTML(String(x.texto).slice(0, 220)) + (String(x.texto).length > 220 ? '…' : ''))) +
+      bloque('Cambios de asesor pedidos', cambs.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ', de ' + ESC_HTML(x.desde_nombre || 'sin asesor') + ' a ' + ESC_HTML(x.a_nombre || '?') + (x.estado === 'pendiente' ? ', <em>pendiente</em>' : ', ' + x.estado))) +
       (pendientes ? '<p style="margin:22px 0 0;"><strong>Pendiente ahora mismo</strong></p>' : '') +
-      bloque('💬 Chats de clientes sin contestar', chats.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · ' + x.n + ' mensaje' + (x.n == 1 ? '' : 's'))) +
-      bloque('📄 Documentos por revisar', docsP.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ' · ' + ESC_HTML(x.doc || ''))) +
-      bloque('💶 Pagos por confirmar', pagosP.map(x => ESC_HTML(x.correo) + ' · ' + ESC_HTML(x.metodo || ''))) +
+      bloque('💬 Chats de clientes sin contestar', chats.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ', ' + x.n + ' mensaje' + (x.n == 1 ? '' : 's'))) +
+      bloque('📄 Documentos por revisar', docsP.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo) + ', ' + ESC_HTML(x.doc || ''))) +
+      bloque('💶 Pagos por confirmar', pagosP.map(x => ESC_HTML(x.correo) + ', ' + ESC_HTML(x.metodo || ''))) +
       bloque('🪪 Altas por revisar', altasP.map(x => ESC_HTML([x.nombre, x.apellidos].filter(Boolean).join(' ') || x.correo))) +
       bloque('⏰ Plazos que vencen', plazosP);
     const nuevos = total - pendientes;
     const c = plantillaCorreo({ titulo: 'Resumen de Acros', parrafos: [nuevos ? 'Esto es lo que entró el ' + fechaBonita + ':' : 'Ayer (' + fechaBonita + ') no entró nada nuevo.', html, 'Lo tenéis todo en el panel: panel.acrosfi.es'] });
     const [admins] = await conn.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
     for (const a of admins) {
-      try { await enviarCorreo(a.correo, 'Resumen de Acros · ' + fechaBonita + ' (' + total + ')', c.html, c.texto); }
+      try { await enviarCorreo(a.correo, 'Resumen de Acros del ' + fechaBonita + ' (' + total + ')', c.html, c.texto); }
       catch (err) { console.error('Resumen diario no enviado a ' + a.correo + ':', err.message); }
     }
     return { total, enviado: true };
@@ -6634,12 +7236,12 @@ app.get('/api/admin/copias-bd/:id/descargar', requiereSesionAsesor, requiereRol(
 
 app.post('/api/admin/avisos/prueba', requiereSesionAsesor, async (req, res) => {
   if (!NTFY_TOPIC) return res.status(400).json({ error: 'Falta la variable NTFY_TOPIC en Railway: sin ella no se envía ningún aviso.' });
-  const ok = await avisar('🔔 Aviso de prueba · canal de clientes', 'Si ves esto, los avisos de clientes funcionan.', { etiqueta: 'tada' });
+  const ok = await avisar('🔔 Aviso de prueba del canal de clientes', 'Si ves esto, los avisos de clientes funcionan.', { etiqueta: 'tada' });
   if (!ok) return res.status(502).json({ error: 'ntfy no ha aceptado el aviso. Revisa el nombre del canal en NTFY_TOPIC.' });
   // 15/10: también al canal de administración y al propio del asesor, si los hay
-  if (NTFY_TOPIC_ADMIN) await avisarEn(NTFY_TOPIC_ADMIN, '🔔 Aviso de prueba · canal de administración', 'Si ves esto, los avisos de administración funcionan.', { etiqueta: 'tada' });
+  if (NTFY_TOPIC_ADMIN) await avisarEn(NTFY_TOPIC_ADMIN, '🔔 Aviso de prueba del canal de administración', 'Si ves esto, los avisos de administración funcionan.', { etiqueta: 'tada' });
   const [q] = await pool.execute('SELECT ntfy_topic FROM personas WHERE asesor_id = ? AND ntfy_topic IS NOT NULL LIMIT 1', [req.asesor.id]);
-  if (q.length && q[0].ntfy_topic !== NTFY_TOPIC) await avisarEn(q[0].ntfy_topic, '🔔 Aviso de prueba · tu canal', 'Si ves esto, te llegan los avisos de tus clientes.', { etiqueta: 'tada' });
+  if (q.length && q[0].ntfy_topic !== NTFY_TOPIC) await avisarEn(q[0].ntfy_topic, '🔔 Aviso de prueba en tu canal', 'Si ves esto, te llegan los avisos de tus clientes.', { etiqueta: 'tada' });
   res.json({ ok: true, canal_admin: !!NTFY_TOPIC_ADMIN, canal_propio: !!q.length });
 });
 
@@ -6891,7 +7493,7 @@ function vistaServicio(f, cfg, hoyISO, duplicado) {
     es_rango: f.ejercicio_desde !== f.ejercicio_hasta,
     admite_rango: !!(def && def.rango),
     nombre_es: nombreServicio(f, 'es', duplicado), nombre_en: nombreServicio(f, 'en', duplicado),
-    estado: f.estado, en_curso: enCurso,
+    estado: f.estado, en_curso: enCurso, chat_abierto: enCurso || (f.estado === 'terminado' && !!f.cerrado_en && Date.now() - new Date(f.cerrado_en).getTime() < HORAS_CHAT_TRAS_CIERRE * 3600e3),   // 26/11 (Vikn)
     plazo, plazo_origen: plazoOrigen, ventana_dias: ventana, plazo_estado: plazoEstado, dias_restantes: dias,
     presentado_en: f.presentado_en,
     propuesto_en: f.propuesto_en, propuesto_por_nombre: f.propuesto_por_nombre || null,
@@ -6938,7 +7540,7 @@ function progresoServicio(v, e, validos) {
 async function estadoEncargos(conn, ids) {
   const enc = {}; if (!ids.length) return enc;
   const [ps] = await conn.query('SELECT id, estado, cobro FROM propuestas WHERE id IN (?)', [ids]);
-  const [pg] = await conn.query('SELECT propuesta_id, estado FROM pagos WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+  const [pg] = await conn.query("SELECT propuesta_id, estado FROM pagos WHERE propuesta_id IN (?) AND estado <> 'rechazado' ORDER BY id", [ids]);
   const [dl] = await conn.query('SELECT propuesta_id, estado FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
   ps.forEach(p => { enc[p.id] = { estado: p.estado, cobro: p.cobro || 'antes', pago: null, alta: null }; });
   pg.forEach(g => { const e = enc[g.propuesta_id]; if (e && e.pago !== 'confirmado') e.pago = g.estado; });
@@ -7220,7 +7822,7 @@ app.get('/api/propuestas/:token/servicios', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const lista = (await listarServiciosCliente(conn, p.cliente_id)).map(v => {
+    const lista = (await listarServiciosCliente(conn, p.cliente_id)).filter(v => v.estado !== 'cancelado').map(v => {   // 26/11: los cancelados (devolución total), fuera
       if (v.confirmado) return v;
       // 21/10: aún sin confirmar su año: el cliente lo ve (cada servicio por separado), pero sin año deducido ni plazo
       const g = (TIPOS_SERVICIO[v.tipo] && TIPOS_SERVICIO[v.tipo].generico) || { es: v.nombre_es, en: v.nombre_en };
@@ -7242,6 +7844,8 @@ app.get('/api/propuestas/:token/servicios', async (req, res) => {
     });
   } finally { conn.release(); }
 });
+// 26/11 (Vikn): el chat de un servicio terminado sigue abierto unas horas, por si el cliente quiere decir algo a su asesor
+const HORAS_CHAT_TRAS_CIERRE = Math.max(0, Number(process.env.HORAS_CHAT_TRAS_CIERRE) || 48);
 async function servicioDelCliente(conn, token, id) {
   const p = await propuestaVigente(conn, token);
   if (!p) return { error: [404, 'Propuesta no encontrada'] };
@@ -7249,11 +7853,12 @@ async function servicioDelCliente(conn, token, id) {
   if (!f || f.cliente_id !== p.cliente_id || (f.confirmado !== 0 && f.confirmado !== 1)) return { error: [404, 'Servicio no encontrado'] };   // 21/10: también los de año sin confirmar (no los fusionados)
   return { p, f };
 }
-app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', exigirPagoConfirmado, async (req, res) => {
+app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', async (req, res) => {   // 26/11 (auditoría G7): el pago se mira en el encargo del servicio
   const conn = await pool.getConnection();
   try {
     const r = await servicioDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    if (!(await pagoDelServicio(conn, r.f))) return res.status(402).json(SIN_PAGO);
     const [u] = await conn.execute("UPDATE servicios_cliente SET estado = 'terminado', cierre_via = 'cliente', cerrado_en = NOW() WHERE id = ? AND estado = 'por_confirmar'", [r.f.id]);
     if (!u.affectedRows) return res.status(409).json({ error: r.f.estado === 'abierto' ? 'Tu asesor aún no ha dado este servicio por terminado' : 'Este servicio ya no espera tu confirmación' });
     await apuntarServicio(conn, r.f.id, 'terminado_cliente', 'cliente', null, null);
@@ -7261,11 +7866,12 @@ app.post('/api/propuestas/:token/servicios/:id(\\d+)/terminado', exigirPagoConfi
     res.json({ ok: true, estado: 'terminado' });
   } finally { conn.release(); }
 });
-app.post('/api/propuestas/:token/servicios/:id(\\d+)/pendiente', exigirPagoConfirmado, async (req, res) => {
+app.post('/api/propuestas/:token/servicios/:id(\\d+)/pendiente', async (req, res) => {   // 26/11 (auditoría G7)
   const conn = await pool.getConnection();
   try {
     const r = await servicioDelCliente(conn, req.params.token, req.params.id);
     if (r.error) return res.status(r.error[0]).json({ error: r.error[1] });
+    if (!(await pagoDelServicio(conn, r.f))) return res.status(402).json(SIN_PAGO);
     const [u] = await conn.execute("UPDATE servicios_cliente SET estado = 'abierto', propuesto_en = NULL, propuesto_por = NULL WHERE id = ? AND estado = 'por_confirmar'", [r.f.id]);
     if (!u.affectedRows) return res.status(409).json({ error: 'Este servicio ya no espera tu confirmación' });
     const detalle = textoMensaje(req.body && req.body.texto);
@@ -7381,7 +7987,7 @@ app.post('/api/admin/propuestas/:id(\\d+)/corregir-importe', requiereSesionAseso
     if (!f.length) { await conn.rollback(); return res.status(404).json({ error: 'Encargo no encontrado' }); }
     const p = f[0];
     if (p.estado !== 'aceptada') { await conn.rollback(); return res.status(409).json({ error: p.estado === 'enviada' ? 'La propuesta aún no está aceptada: envía una nueva y retira esta' : 'Solo se corrige el importe de un encargo aceptado' }); }
-    const [pg] = await conn.execute('SELECT estado FROM pagos WHERE propuesta_id = ?', [p.id]);
+    const [pg] = await conn.execute("SELECT estado FROM pagos WHERE propuesta_id = ? AND estado <> 'rechazado'", [p.id]);
     if (pg.some(x => x.estado === 'confirmado')) { await conn.rollback(); return res.status(409).json({ error: 'Ese encargo ya está pagado: para cobrar más, amplía el encargo' }); }
     if (pg.length) { await conn.rollback(); return res.status(409).json({ error: 'El cliente dice que ya ha pagado: confirma o rechaza ese pago antes de corregir el importe' }); }
     // nuevo importe: con desglose, precio por servicio (los mismos servicios); sin desglose, el total
@@ -7434,11 +8040,11 @@ app.post('/api/propuestas/:token/aceptar-importe', async (req, res) => {
 app.post('/api/admin/propuestas/:id(\\d+)/recordar-pago', requiereSesionAsesor, async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const [f] = await conn.execute('SELECT id, cliente_id, estado, servicios, creado_en FROM propuestas WHERE id = ?', [Number(req.params.id)]);
+    const [f] = await conn.execute('SELECT id, cliente_id, estado, servicios, creado_en, cobro, inicio_inmediato_en FROM propuestas WHERE id = ?', [Number(req.params.id)]);
     if (!f.length) return res.status(404).json({ error: 'Encargo no encontrado' });
     const p = f[0];
     if (p.estado !== 'aceptada') return res.status(409).json({ error: 'Ese encargo no está aceptado' });
-    const [pg] = await conn.execute('SELECT COUNT(*) AS n FROM pagos WHERE propuesta_id = ?', [p.id]);
+    const [pg] = await conn.execute("SELECT COUNT(*) AS n FROM pagos WHERE propuesta_id = ? AND estado <> 'rechazado'", [p.id]);
     if (pg[0].n) return res.status(409).json({ error: 'El cliente ya ha hecho el pago de ese encargo' });
     const asesor = await personaDeCliente(p.cliente_id, conn).catch(() => null);
     const quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
@@ -7447,7 +8053,7 @@ app.post('/api/admin/propuestas/:id(\\d+)/recordar-pago', requiereSesionAsesor, 
       clienteId: p.cliente_id, tipo: 'pago', objetoId: p.id,
       asunto: (asesor ? asesor.nombre + ', tu asesor de Acros' : 'Tu asesor de Acros') + ', te recuerda el pago de tu encargo',
       titulo: 'Falta el pago de tu encargo',
-      parrafos: [`${quien} te recuerda que, para empezar a trabajar en tu encargo, falta el pago:`, nombres.length ? '<strong>' + nombres.map(ESC_HTML).join(', ') + '</strong>' : '', 'Puedes hacerlo desde tu área de cliente, con el método que prefieras.'].filter(Boolean),
+      parrafos: [p.cobro === 'despues' ? `${quien} te recuerda que tienes pendiente el pago de tu encargo` + (plazoPagoDe(p) ? `, con plazo hasta el ${fechaLargaES(plazoPagoDe(p))}` : '') + ':' : `${quien} te recuerda que, para empezar a trabajar en tu encargo, falta el pago:` /* 26/11 (menor): con cobro «después» ya se está trabajando */, nombres.length ? '<strong>' + nombres.map(ESC_HTML).join(', ') + '</strong>' : '', 'Puedes hacerlo desde tu área de cliente, con el método que prefieras.'].filter(Boolean),
       textoWA: 'Acros: ' + (asesor ? asesor.nombre : 'tu asesor') + ' te recuerda el pago de tu encargo. Puedes hacerlo desde tu área.',
     });
     respuestaRecordatorio(res, r);
@@ -7469,32 +8075,25 @@ app.get('/api/propuestas/:token/area', async (req, res) => {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    const [props] = await conn.execute("SELECT id, token, estado, servicios, creado_en, inicio_inmediato_en, token_expira_en, cobro, amplia_a FROM propuestas WHERE cliente_id = ? AND (estado = 'aceptada' OR (estado = 'enviada' AND token_expira_en > NOW())) ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
+    const [props] = await conn.execute("SELECT id, token, estado, servicios, creado_en, inicio_inmediato_en, token_expira_en, cobro, amplia_a FROM propuestas WHERE cliente_id = ? AND (estado = 'aceptada' OR (estado = 'enviada' AND token_expira_en > NOW())) AND NOT EXISTS (SELECT 1 FROM pagos dv WHERE dv.propuesta_id = propuestas.id AND dv.estado = 'devuelto') ORDER BY creado_en DESC, id DESC", [p.cliente_id]);
     const ids = props.map(x => x.id);
     const vacio = { encargos: [], documentos: [], entregas: [], mensajes: [], historial: [], subidas_hoy: 0, limite_subidas: LIMITE_SUBIDAS_DIA };
-    if (!ids.length) return res.json(vacio);
+    if (!ids.length) return res.json(Object.assign(vacio, { historial: await eventosDeCliente(conn, p.cliente_id) }));   // 26/11: sin encargos (p. ej., devuelto entero), su historial sí
     const [dils] = await conn.query('SELECT propuesta_id, estado, creado_en, resuelto_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
-    const aprobadas = new Set(dils.filter(d => d.estado === 'aprobado').map(d => d.propuesta_id));
+    const aprobadas = new Set(dils.filter(d => ['revision', 'examen', 'aprobado'].includes(d.estado)).map(d => d.propuesta_id));   // 26/11 (Vikn, M7): con el alta enviada, la documentación ya va
     const [svs] = await conn.execute('SELECT id, propuesta_id, servicio FROM servicios_cliente WHERE cliente_id = ? AND confirmado IN (0, 1)', [p.cliente_id]);   // 21/10: también los de año sin confirmar
     const sidDe = (pid, serv) => { const s = svs.find(x => x.propuesta_id === pid && x.servicio === serv); return s ? s.id : null; };
     // La documentación solo se ve cuando el alta de ESE encargo está aprobada (como siempre)
     const [docs] = aprobadas.size ? await conn.query('SELECT id, propuesta_id, servicio, nombre, urgente, estado, razon_rechazo, subido_en, creado_en, revisado_en FROM documentos_fiscales WHERE propuesta_id IN (?) ORDER BY creado_en, id', [[...aprobadas]]) : [[]];
-    const [ents] = await conn.execute('SELECT id, propuesta_id, servicio, version, nombre_archivo, bytes, subido_en, estado, comentario, respondido_en, conformidad_pedida_en FROM entregas WHERE cliente_id = ? ORDER BY id', [p.cliente_id]);
+    const [ents] = await conn.execute('SELECT id, propuesta_id, servicio, version, nombre_archivo, bytes, subido_en, estado, comentario, respondido_en, conformidad_pedida_en, resumen FROM entregas WHERE cliente_id = ? ORDER BY id', [p.cliente_id]);   // 26/11: con el resumen
     const [msgs] = await conn.query(
       `SELECT m.id, m.propuesta_id, m.servicio, m.autor, m.texto, m.creado_en, m.leido_en, a.nombre AS asesor, m.archivo_nombre, m.archivo_tipo, m.archivo_bytes
        FROM mensajes m LEFT JOIN asesores a ON a.id = m.asesor_id
        WHERE m.propuesta_id IN (?) AND m.oculto_cliente_en IS NULL AND m.retirado_en IS NULL ORDER BY m.creado_en, m.id`, [ids]);
-    const [pagos] = await conn.query('SELECT propuesta_id, metodo, estado, creado_en, confirmado_en FROM pagos WHERE propuesta_id IN (?)', [ids]);
+    const [pagosTodos] = await conn.query('SELECT propuesta_id, metodo, estado, creado_en, confirmado_en, rechazado_en FROM pagos WHERE propuesta_id IN (?)', [ids]);
+    const pagos = pagosTodos.filter(g => g.estado !== 'rechazado');   // 26/11 (G4): el que no llegó no cuenta
     const [evS] = await conn.query("SELECT h.servicio_id, h.evento, h.creado_en FROM servicios_historial h JOIN servicios_cliente s ON s.id = h.servicio_id WHERE s.cliente_id = ? AND s.confirmado IN (0, 1) AND h.evento IN (?)", [p.cliente_id, EVENTOS_SERVICIO_CLIENTE]);
-    // Historial, ya apto para enseñárselo al cliente: nada interno del equipo
-    const h = [], add = (cuando, tipo, datos) => { if (cuando) h.push(Object.assign({ cuando, tipo }, datos || {})); };
-    props.forEach(e => { add(e.creado_en, 'propuesta'); if (e.inicio_inmediato_en) add(e.inicio_inmediato_en, 'aceptada'); });
-    pagos.forEach(x => { add(x.creado_en, 'pago_declarado', { propuesta_id: x.propuesta_id }); if (x.estado === 'confirmado') add(x.confirmado_en, 'pago_confirmado', { propuesta_id: x.propuesta_id }); });
-    dils.forEach(x => { add(x.creado_en, 'alta_enviada'); if (x.resuelto_en) add(x.resuelto_en, x.estado === 'aprobado' ? 'alta_aprobada' : 'alta_rechazada'); });
-    docs.forEach(x => { const sid = sidDe(x.propuesta_id, x.servicio); add(x.creado_en, 'doc_pedido', { servicio_id: sid, nombre: x.nombre }); if (x.subido_en) add(x.subido_en, 'doc_subido', { servicio_id: sid, nombre: x.nombre }); if (x.revisado_en) add(x.revisado_en, x.estado === 'rechazado' ? 'doc_rechazado' : 'doc_validado', { servicio_id: sid, nombre: x.nombre, motivo: x.estado === 'rechazado' ? x.razon_rechazo : undefined }); });
-    ents.forEach(x => { const sid = sidDe(x.propuesta_id, x.servicio); add(x.subido_en, 'informe', { servicio_id: sid, nombre: x.nombre_archivo, version: x.version }); if (x.respondido_en) add(x.respondido_en, x.estado === 'conforme' ? 'conforme' : 'cambios', { servicio_id: sid, motivo: x.estado === 'cambios' ? x.comentario : undefined }); });
-    evS.forEach(x => add(x.creado_en, 'servicio', { servicio_id: x.servicio_id, evento: x.evento }));
-    h.sort((a, b) => new Date(b.cuando) - new Date(a.cuando));
+    const h = await eventosDeCliente(conn, p.cliente_id);   // 26/11 (Vikn, M6): el mismo historial que antes del alta
     const [recPago] = await conn.execute("SELECT objeto_id, MAX(creado_en) AS ultimo FROM recordatorios_cliente WHERE tipo = 'pago' AND cliente_id = ? GROUP BY objeto_id", [p.cliente_id]);   // 26/10
     res.json({
       encargos: props.map(x => ({ id: x.id, token: x.token, estado: x.estado, creado_en: x.creado_en, amplia_a: x.amplia_a || null, alta_aprobada: aprobadas.has(x.id),
@@ -7603,12 +8202,12 @@ async function correoUrgenciaCliente(conn, v) {
     titulo: 'Se acerca un plazo',
     parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:',
       `El plazo de <strong>${ESC_HTML(v.nombre_es)}</strong> vence el ${fechaISOaES(v.plazo)}${v.dias_restantes === 0 ? ' (hoy)' : v.dias_restantes === 1 ? ' (mañana)' : ' (en ' + v.dias_restantes + ' días)'}.`,
-      queFalta, 'Lo tienes todo en «Te toca a ti», en tu área.'],
+      queFalta, v.docs_pendientes > 0 ? 'Lo tienes todo en «Tareas pendientes», en tu área.' : 'Lo tienes en «Tus informes», en tu área.'],   // 26/11 (M2): el visto bueno se da en «Tus informes»
     boton: enlace ? { texto: 'Entrar en mi área', url: enlace } : null,
     nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
   });
   try {
-    const salio = await notificarCliente(conn, v.cliente_id, 'recordatorios', () => enviarCorreo(cl[0].correo, 'Se acerca un plazo · Acros', c.html, c.texto, { desde: 'asesor' }),
+    const salio = await notificarCliente(conn, v.cliente_id, 'recordatorios', () => enviarCorreo(cl[0].correo, 'Se acerca un plazo', c.html, c.texto, { desde: 'asesor' }),
       `Acros: el plazo de ${v.nombre_es} vence el ${fechaISOaES(v.plazo)}. ${queFalta}` + (enlace ? ' ' + enlace : ''));
     if (salio) await conn.execute('INSERT INTO recordatorios_cliente (tipo, objeto_id, cliente_id, asesor_id) VALUES (?, ?, ?, NULL)', ['urgencia', v.id, v.cliente_id]).catch(() => {});
     return salio;
@@ -7622,7 +8221,7 @@ async function plazosParaResumen(conn) {
   const cli = new Map(cs.map(c => [c.id, c]));
   return lista.sort((a, b) => a.dias_restantes - b.dias_restantes).map(v => {
     const c = cli.get(v.cliente_id) || {};
-    return ESC_HTML([c.nombre, c.apellidos].filter(Boolean).join(' ') || c.correo || '') + ' · ' + ESC_HTML(v.nombre_es) + ' · ' + ESC_HTML(c.asesor || 'sin asesor') + ' · ' +
+    return ESC_HTML([c.nombre, c.apellidos].filter(Boolean).join(' ') || c.correo || '') + ', ' + ESC_HTML(v.nombre_es) + ', ' + ESC_HTML(c.asesor || 'sin asesor') + ', ' +
       (v.plazo_estado === 'vencido' ? '<strong>venció el ' + fechaISOaES(v.plazo) + '</strong>' : 'vence el ' + fechaISOaES(v.plazo) + (v.dias_restantes === 0 ? ' (hoy)' : ' (en ' + v.dias_restantes + (v.dias_restantes === 1 ? ' día)' : ' días)')));
   });
 }
@@ -7799,7 +8398,7 @@ async function candidatosDuplicado(conn, clienteIds) {
 //   servicios y años en curso, o en otra propuesta pendiente (que el asesor
 //   puede retirar en el mismo paso).
 // ================================================================
-const VERSION_ACROS = '2026-11-21.4';
+const VERSION_ACROS = '2026-11-27.1';
 app.get('/api/version', (req, res) => res.json({ servidor: VERSION_ACROS }));
 
 // --- Alta heredada ---
@@ -8055,17 +8654,17 @@ async function recordablesDeCliente(conn, clienteId) {
   const it = [];
   const [docs] = await conn.execute("SELECT id, nombre, servicio, estado, creado_en, revisado_en FROM documentos_fiscales WHERE cliente_id = ? AND estado IN ('pendiente','rechazado') ORDER BY id", [clienteId]);
   docs.forEach(d => it.push({ tipo: 'documento', id: d.id, titulo: (d.estado === 'rechazado' ? 'Volver a subir «' : 'Subir «') + d.nombre + '»', sub: nombreGenerico(d.servicio) || 'Documento' }));
-  const [props] = await conn.execute("SELECT p.id, p.servicios, p.creado_en, (SELECT COUNT(*) FROM pagos g WHERE g.propuesta_id = p.id) AS n_pagos, (SELECT COUNT(*) FROM diligencias d WHERE d.propuesta_id = p.id) AS n_altas FROM propuestas p WHERE p.cliente_id = ? AND p.estado = 'aceptada' ORDER BY p.id", [clienteId]);
+  const [props] = await conn.execute("SELECT p.id, p.servicios, p.creado_en, (SELECT COUNT(*) FROM pagos g WHERE g.propuesta_id = p.id AND g.estado <> 'rechazado') AS n_pagos, (SELECT COUNT(*) FROM diligencias d WHERE d.propuesta_id = p.id) AS n_altas FROM propuestas p WHERE p.cliente_id = ? AND p.estado = 'aceptada' ORDER BY p.id", [clienteId]);
   const dma = f => { const d = new Date(f); return String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear(); };
   props.forEach(p => {
     const sv = serviciosDePropuesta(p).map(nombreGenerico).join(', ');
     if (!p.n_pagos) it.push({ tipo: 'pago', id: p.id, titulo: 'Pagar el encargo del ' + dma(p.creado_en), sub: sv });
-    else if (!p.n_altas) it.push({ tipo: 'alta', id: p.id, titulo: 'Completar el alta (cuestionario y documento de identidad)', sub: 'Encargo del ' + dma(p.creado_en) });
+    if (!p.n_altas) it.push({ tipo: 'alta', id: p.id, titulo: 'Completar el alta (cuestionario y documento de identidad)', sub: 'Encargo del ' + dma(p.creado_en) });
   });
   const sv = await listarServiciosCliente(conn, clienteId);
   sv.filter(s => s.estado === 'por_confirmar').forEach(s => it.push({ tipo: 'servicio', id: s.id, titulo: 'Confirmar que está terminado', sub: s.nombre_es }));
-  const [ents] = await conn.execute("SELECT e.id, e.nombre_archivo, e.servicio, e.conformidad_pedida_en FROM entregas e WHERE e.cliente_id = ? AND e.estado = 'entregado' AND e.id = (SELECT MAX(e2.id) FROM entregas e2 WHERE e2.propuesta_id = e.propuesta_id AND e2.servicio = e.servicio) ORDER BY e.id", [clienteId]);
-  ents.forEach(e => it.push({ tipo: 'informe', id: e.id, titulo: e.conformidad_pedida_en ? 'Dar el visto bueno al informe «' + e.nombre_archivo + '»' : 'Pedirle el visto bueno del informe «' + e.nombre_archivo + '»', sub: nombreGenerico(e.servicio), pedida: e.conformidad_pedida_en }));
+  const [ents] = await conn.execute("SELECT e.id, e.propuesta_id, e.nombre_archivo, e.servicio, e.subido_en, e.conformidad_pedida_en, (SELECT COUNT(*) FROM entregas e3 WHERE e3.propuesta_id = e.propuesta_id AND e3.servicio = e.servicio AND e3.version = e.version) AS n_arch FROM entregas e WHERE e.cliente_id = ? AND e.estado = 'entregado' AND e.id = (SELECT MAX(e2.id) FROM entregas e2 WHERE e2.propuesta_id = e.propuesta_id AND e2.servicio = e.servicio) ORDER BY e.id", [clienteId]);
+  for (const e of ents) if (await pagoConfirmadoDe(conn, e.propuesta_id)) it.push({ tipo: 'informe', id: e.id, titulo: e.n_arch > 1 ? 'Dar el visto bueno al informe «' + nombreGenerico(e.servicio) + '» (' + e.n_arch + ' archivos)' : 'Dar el visto bueno al informe «' + e.nombre_archivo + '»', archivos: Number(e.n_arch), sub: nombreGenerico(e.servicio), subido: e.subido_en, pedida: e.conformidad_pedida_en || e.subido_en });   // 26/11 (M1, M2)
   return it.map(x => { const u = ult(x.tipo, x.id); return Object.assign(x, { ultimo: u, recordado_hoy: hoy(u) }); });
 }
 app.get('/api/admin/clientes/:id(\\d+)/recordables', requiereSesionAsesor, async (req, res) => {
@@ -8095,14 +8694,15 @@ app.post('/api/admin/clientes/:id(\\d+)/recordar', requiereSesionAsesor, async (
     const asesor = await personaDeCliente(clienteId, conn).catch(() => null);
     const quien = asesor ? ESC_HTML(asesor.nombre) : 'Tu asesor';
     const enlace = SITE_URL ? `${SITE_URL}/area?login=1` : null;
-    const linea = x => x.tipo === 'informe' ? 'Dar el visto bueno a tu informe «' + ESC_HTML(x.titulo.replace(/^.*«|»$/g, '')) + '» (' + ESC_HTML(x.sub) + ')' : ESC_HTML(x.titulo) + (x.sub ? ' (' + ESC_HTML(x.sub) + ')' : '');
+    const linea = x => x.tipo === 'informe' && x.archivos > 1 ? 'Dar el visto bueno a tu informe de ' + ESC_HTML(x.sub) + ' (' + x.archivos + ' archivos)' : x.tipo === 'informe' ? 'Dar el visto bueno a tu informe «' + ESC_HTML(x.titulo.replace(/^.*«|»$/g, '')) + '» (' + ESC_HTML(x.sub) + ')' : ESC_HTML(x.titulo) + (x.sub ? ' (' + ESC_HTML(x.sub) + ')' : '');
     let correo = 'sin_correo';
     if (cl.length && cl[0].correo) {
       if (!brevoActivo()) correo = 'sin_servicio';
       else {
         const c = plantillaCorreo({
           titulo: elegidos.length === 1 ? 'Tienes algo pendiente en tu área' : 'Tienes ' + elegidos.length + ' cosas pendientes en tu área',
-          parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:', `${quien} te recuerda lo que tienes pendiente para avanzar con tu encargo:`, '<ul>' + elegidos.map(x => '<li>' + linea(x) + '</li>').join('') + '</ul>', 'Lo tienes todo en «Te toca a ti», dentro de tu área.'],
+          parrafos: [cl[0].nombre ? `Hola, ${ESC_HTML(cl[0].nombre)}:` : 'Hola:', `${quien} te recuerda lo que tienes pendiente para avanzar con tu encargo:`, '<ul>' + elegidos.map(x => '<li>' + linea(x) + '</li>').join('') + '</ul>',
+            elegidos.every(x => x.tipo === 'informe') ? 'Lo tienes en «Tus informes», dentro de tu área.' : elegidos.some(x => x.tipo === 'informe') ? 'Lo tienes en tu área: el visto bueno, en «Tus informes»; lo demás, en «Tareas pendientes».' : 'Lo tienes todo en «Tareas pendientes», dentro de tu área.'],   // 26/11 (M2)
           boton: enlace ? { texto: 'Entrar en mi área', url: enlace } : null,
           nota: 'Por tu privacidad, no envíes documentos por correo: súbelos siempre desde tu área.',
         });
@@ -8148,7 +8748,7 @@ app.post('/api/admin/clientes/:id(\\d+)/notas', requiereSesionAsesor, async (req
   try {
     const [c] = await conn.execute('SELECT id FROM clientes WHERE id = ?', [Number(req.params.id)]);
     if (!c.length) return res.status(404).json({ error: 'Cliente no encontrado' });
-    await conn.execute("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, 'ficha', ?)", [Number(req.params.id), req.asesor.id, texto]);
+    await conn.execute("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, ?, ?)", [Number(req.params.id), req.asesor.id, (req.body || {}).origen === 'llamada' ? 'llamada' : 'ficha', texto]);   // 27/11: el apunte tras una llamada
     res.status(201).json({ notas: await notasDeCliente(conn, Number(req.params.id)) });
   } finally { conn.release(); }
 });
@@ -8221,6 +8821,8 @@ async function pagoConfirmadoDe(conn, propuestaId) {
   const [r] = await conn.execute("SELECT 1 FROM pagos WHERE propuesta_id = ? AND estado = 'confirmado' LIMIT 1", [propuestaId]);
   return r.length > 0;
 }
+// 26/11 (auditoría G7): un servicio de un encargo mira el pago de ese encargo; uno sin encargo (de año), que el cliente tenga alguno pagado
+async function pagoDelServicio(conn, f) { return f.propuesta_id ? pagoConfirmadoDe(conn, f.propuesta_id) : clienteConPagoConfirmado(conn, f.cliente_id); }
 async function clienteConPagoConfirmado(conn, clienteId) {
   const [r] = await conn.execute("SELECT 1 FROM pagos g JOIN propuestas p ON p.id = g.propuesta_id WHERE p.cliente_id = ? AND g.estado = 'confirmado' LIMIT 1", [clienteId]);
   return r.length > 0;
@@ -8247,7 +8849,7 @@ async function exigirAlgunPagoConfirmado(req, res, next) {
   try {
     const p = await propuestaVigente(conn, req.params.token);
     if (!p) return res.status(404).json({ error: 'Propuesta no encontrada' });
-    if (!(await clienteConPagoConfirmado(conn, p.cliente_id))) return res.status(402).json(SIN_PAGO);
+    if (!(await clienteConPagoConfirmado(conn, p.cliente_id))) return res.json({ disponible: false });   // 26/11 (menor): antes, un 402 en la consola en cada visita
     next();
   } finally { conn.release(); }
 }
@@ -8273,7 +8875,7 @@ async function correoCambioAsesor(_conn, clienteId, actual, destino, motivo, aza
     'Confírmalo en «Cambios de asesor pendientes»: panel.acrosfi.es' ] });
   const [admins] = await pool.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1');
   for (const a of admins) {
-    try { await enviarCorreo(a.correo, 'Cambio de asesor pedido · ' + nombre, c.html, c.texto); }
+    try { await enviarCorreo(a.correo, 'Cambio de asesor pedido: ' + nombre, c.html, c.texto); }
     catch (err) { console.error('Aviso de cambio de asesor no enviado a ' + a.correo + ':', err.message); }
   }
 }
@@ -8343,7 +8945,7 @@ app.get('/api/admin/cliente-por-codigo/:codigo', requiereSesionAsesor, async (re
 // PANTALLAS DE ERROR BONITAS (29/10, Vikn) — generado por generar_errores.py
 // A quien llega con un navegador a una dirección que no existe o que falla se le enseña una página de Acros; a los programas, el JSON de siempre.
 // ================================================================
-const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong · Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>"}};
+const PAGINAS_ERROR = {"es": {"404": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>No encontramos esa página | Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>No encontramos esa página</h1><p>Puede que la dirección esté mal escrita o que la página ya no exista. Desde aquí puedes volver al inicio o entrar en tu área.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Ir al inicio</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Entrar en mi área</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>", "500": "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Algo no ha ido bien | Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Algo no ha ido bien</h1><p>Hemos tenido un problema de nuestro lado. No se ha perdido nada: inténtalo de nuevo en un momento. Si sigue pasando, escríbenos o llámanos.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Reintentar</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Ir al inicio</a></div>\n<div class=\"pie\">Acros, tu asesoría fiscal de criptoactivos.<br>Contacta en: <a href=\"https://acrosfi.es\">acrosfi.es</a> / 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>"}, "en": {"404": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>We can't find that page | Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">404</div><h1>We can't find that page</h1><p>The address may be misspelled or the page may no longer exist. From here you can go back home or enter your area.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"https://acrosfi.es\">Go to the homepage</a><a class=\"boton sec\" href=\"https://acrosfi.es/area\">Enter my area</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>", "500": "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>Something went wrong | Acros</title>\n<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\"><style>\n:root { --fondo:#FBF8F2; --panel:#FFFFFF; --linea:#E6DCCD; --tinta:#335C47; --titular:#23402F; --suave:#6B655C; --acento:#A84C18; --boton:#B9541B; --boton-t:#FFFFFF; --sombra:0 10px 30px rgba(66,52,36,.10); }\n@media (prefers-color-scheme: dark) { :root { --fondo:#1A1D1B; --panel:#262B28; --linea:#3A403C; --tinta:#E8E1D4; --titular:#F2ECE1; --suave:#C9C2B6; --acento:#D9A066; --boton:#D9A066; --boton-t:#1C2A22; --sombra:none; } }\n* { box-sizing:border-box; } html,body { height:100%; margin:0; }\nbody { background:var(--fondo); color:var(--tinta); font-family:'IBM Plex Sans', Helvetica, Arial, sans-serif; line-height:1.55; display:flex; align-items:center; justify-content:center; padding:24px; }\n.caja { width:100%; max-width:560px; background:var(--panel); border:1px solid var(--linea); border-top:4px solid #D2601F; border-radius:18px; box-shadow:var(--sombra); padding:36px 34px 28px; text-align:center; }\n.logo { width:58px; height:58px; display:block; margin:0 auto 6px; }\n.marca { font-family:'IBM Plex Serif', Georgia, serif; letter-spacing:.3em; font-size:18px; color:var(--titular); margin:0 0 18px; }\n.codigo { font-family:'IBM Plex Serif', Georgia, serif; font-size:72px; line-height:1; color:var(--acento); margin:6px 0 4px; font-weight:600; }\nh1 { font-family:'IBM Plex Serif', Georgia, serif; font-size:26px; line-height:1.25; color:var(--titular); margin:6px 0 10px; font-weight:600; }\np { margin:0 auto 22px; max-width:440px; color:var(--suave); font-size:15.5px; }\n.botones { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-bottom:6px; }\n.boton { display:inline-block; padding:13px 24px; border-radius:11px; font:inherit; font-weight:600; font-size:15.5px; text-decoration:none; cursor:pointer; border:1px solid transparent; }\n.boton.prim { background:var(--boton); color:var(--boton-t); } .boton.sec { background:transparent; color:var(--tinta); border-color:var(--linea); }\n.pie { border-top:1px solid var(--linea); margin-top:24px; padding-top:14px; font-size:12.5px; color:var(--suave); }\n.pie a { color:var(--suave); }\n@media (max-width:480px) { .caja { padding:28px 20px 22px; } .codigo { font-size:58px; } h1 { font-size:22px; } .boton { width:100%; text-align:center; } }\n</style></head>\n<body><main class=\"caja\"><img class=\"logo\" src=\"data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2212 -80 996 996%22%3E%3Cg transform=%22translate%280 827%29 scale%28.1 -.1%29%22 fill=%22%23D2601F%22%3E%3Cpath d=%22M4945 8083 c-136 -13 -249 -51 -358 -122 -136 -89 -225 -199 -414 -506 -44 -71 -135 -218 -202 -325 -132 -209 -165 -262 -346 -555 -202 -325 -235 -378 -505 -815 -145 -234 -302 -488 -350 -565 -48 -77 -124 -201 -170 -275 -46 -74 -111 -180 -145 -235 -118 -191 -380 -612 -605 -970 -124 -198 -285 -454 -357 -570 -188 -302 -299 -482 -369 -593 -58 -94 -180 -289 -309 -497 -583 -940 -595 -961 -620 -1068 -21 -87 -20 -362 0 -442 52 -197 205 -328 413 -356 51 -6 1605 -9 4552 -7 l4475 3 65 23 c134 48 217 123 279 252 l36 75 4 183 c4 199 -5 270 -44 358 -20 46 -119 211 -395 664 -42 69 -135 222 -207 340 -72 118 -166 272 -209 342 -44 70 -116 187 -160 260 -170 278 -543 883 -804 1303 -48 77 -154 248 -235 380 -179 290 -420 677 -620 995 -129 205 -447 719 -525 850 -15 25 -62 101 -105 170 -43 69 -175 285 -293 480 -118 195 -277 456 -352 580 -199 329 -205 337 -299 430 -129 128 -267 192 -450 210 -92 9 -293 11 -376 3z m227 -629 c115 -58 118 -62 570 -804 69 -113 161 -261 203 -330 140 -226 230 -372 383 -620 l151 -245 -147 -5 c-114 -4 -154 -9 -179 -22 -19 -11 -69 -70 -125 -145 -157 -215 -193 -262 -200 -263 -4 0 -37 39 -75 87 -292 371 -270 355 -498 351 -191 -4 -187 -2 -299 -141 -41 -51 -123 -154 -184 -229 l-110 -138 -78 103 c-43 56 -118 155 -166 219 -92 122 -130 157 -187 177 -44 14 -303 14 -356 0 -44 -12 -122 -87 -245 -233 -37 -45 -86 -101 -109 -126 l-42 -45 49 80 c27 44 71 116 97 160 27 44 60 98 75 120 15 22 65 103 112 180 47 77 133 217 193 310 59 94 186 296 283 450 96 154 185 296 197 315 12 19 54 85 92 145 348 552 371 583 483 644 30 17 56 31 58 31 1 0 26 -12 54 -26z m-972 -3012 c196 -249 243 -299 289 -312 20 -5 96 -10 170 -10 115 0 141 3 177 21 32 15 90 75 239 249 l197 230 168 -204 c202 -244 190 -236 383 -236 72 0 149 5 169 10 43 12 84 57 266 286 l119 152 34 -43 c80 -101 230 -274 259 -299 31 -26 32 -26 202 -26 188 0 213 7 259 71 11 16 24 29 28 29 3 0 15 -15 26 -32 10 -18 124 -204 254 -413 129 -209 269 -436 311 -505 43 -69 195 -316 340 -550 144 -234 287 -465 318 -515 180 -296 549 -902 840 -1383 83 -138 102 -176 91 -183 -20 -12 -8460 -12 -8479 1 -13 8 -12 15 9 52 44 79 476 784 706 1153 34 55 137 219 227 365 234 376 395 633 729 1165 80 127 234 373 344 549 189 304 199 317 214 298 83 -104 147 -172 170 -182 19 -7 87 -10 206 -8 l177 3 46 50 c25 28 112 132 195 233 83 100 153 182 156 181 3 0 76 -89 161 -197z%22/%3E%3C/g%3E%3C/svg%3E\" alt=\"\"><p class=\"marca\" style=\"max-width:none\">ACROS</p>\n<div class=\"codigo\">500</div><h1>Something went wrong</h1><p>We had a problem on our side. Nothing has been lost: please try again in a moment. If it keeps happening, write or call us.</p>\n<div class=\"botones\"><a class=\"boton prim\" href=\"javascript:location.reload()\">Try again</a><a class=\"boton sec\" href=\"https://acrosfi.es\">Go to the homepage</a></div>\n<div class=\"pie\">Acros, your crypto-asset tax advisory.<br>Contact: <a href=\"https://acrosfi.es\">acrosfi.es</a> / +34 668 17 00 20</div></main><script>(function(){try{var b=(window.ACROS_BACKEND||localStorage.getItem('acros_backend_url')||location.origin).replace(/\\/+$/,'');fetch(b+'/api/web/contenido').then(function(r){return r.ok?r.json():null}).then(function(d){if(!d||!d.marca||!d.marca.logo)return;var s=b+'/api/web/imagen/'+d.marca.logo,p=new Image();p.onload=function(){var l=document.querySelectorAll('img.logo');for(var k=0;k<l.length;k++)l[k].src=s;};p.src=s;}).catch(function(){})}catch(e){}})();</script></body></html>"}};
 function pideHTML(req) { const a = String(req.headers.accept || ''); return a.includes('text/html') && !a.includes('application/json'); }
 function paginaError(req, codigo) { const i = /^en\b/i.test(String(req.headers['accept-language'] || '')) ? 'en' : 'es'; return PAGINAS_ERROR[i][codigo]; }
 
@@ -8420,7 +9022,7 @@ async function avisarCambioPin(asesorId, tipo, actor) {
       try { await enviarCorreo(quien.correo, 'Tu PIN del panel de Acros ha cambiado', c.html, c.texto); } catch (e) { console.error('Aviso de PIN no enviado:', e.message); }
       const [admins] = await pool.execute('SELECT correo FROM asesores WHERE es_admin = 1 AND activo = 1 AND id <> ? AND id <> ?', [asesorId, actor ? actor.id : 0]);
       const ca = plantillaCorreo({ titulo: 'Cambio de PIN en el panel', parrafos: [ESC_HTML(quien.nombre) + ' ' + ESC_HTML(QUE[tipo]) + ' (' + ESC_HTML(cuando) + ').', 'Queda en el registro de actividad. Si no te cuadra, revísalo en Equipo.'] });
-      for (const a of admins) { try { await enviarCorreo(a.correo, 'Cambio de PIN en el panel · ' + quien.nombre, ca.html, ca.texto); } catch (e) { console.error('Aviso de PIN a administrador no enviado:', e.message); } }
+      for (const a of admins) { try { await enviarCorreo(a.correo, 'Cambio de PIN en el panel: ' + quien.nombre, ca.html, ca.texto); } catch (e) { console.error('Aviso de PIN a administrador no enviado:', e.message); } }
     }
     const ini = quien.persona_id ? quienIni(await inicialesDePersona(quien.persona_id)) : '';
     avisarEn(canalDe('equipo'), 'PIN del panel cambiado' + (ini ? ': ' + ini : ''), 'Detalle en el correo de los administradores y en el registro de actividad.');
@@ -8879,7 +9481,7 @@ app.post('/api/propuestas/:token/mis-datos', async (req, res) => {
     try {
       const [as] = await pool.execute('SELECT ac.correo FROM clientes c JOIN personas q ON q.id = c.asesor_persona_id JOIN asesores ac ON ac.id = q.asesor_id WHERE c.id = ?', [a.id]);
       if (as.length && brevoActivo()) {
-        const c = plantillaCorreo({ titulo: 'Un cliente ha cambiado sus datos', parrafos: ['El cliente ' + ESC_HTML(a.codigo || ('#' + a.id)) + ' ha cambiado sus datos desde su área:', lineas.map(l => '· ' + ESC_HTML(l)).join('<br>'), 'Lo tienes también como nota en su ficha. Si algo no cuadra (por ejemplo, el documento del alta), habla con él.'], boton: { texto: 'Abrir su ficha', url: PANEL_URL + '/?cliente=' + encodeURIComponent(a.codigo || a.id) } });
+        const c = plantillaCorreo({ titulo: 'Un cliente ha cambiado sus datos', parrafos: ['El cliente ' + ESC_HTML(a.codigo || ('#' + a.id)) + ' ha cambiado sus datos desde su área:', lineas.map(l => '- ' + ESC_HTML(l)).join('<br>'), 'Lo tienes también como nota en su ficha. Si algo no cuadra (por ejemplo, el documento del alta), habla con él.'], boton: { texto: 'Abrir su ficha', url: PANEL_URL + '/?cliente=' + encodeURIComponent(a.codigo || a.id) } });
         enviarCorreo(as[0].correo, 'Un cliente ha cambiado sus datos', c.html, c.texto).catch(e => console.error('Aviso de datos cambiados:', e.message));
       }
     } catch (e) { console.error('Aviso de datos cambiados:', e.message); }
@@ -10909,7 +11511,21 @@ app.delete('/api/admin/preguntas/:id(\\d+)', requiereSesionAsesor, async (req, r
 // · Lista para quien la necesite (Área, panel, web): /logos/plataformas.json.
 // · El logo se guarda en la base de datos (como las fotos del equipo). Se cambia en un sitio y cambia en todos.
 // ================================================================
-const PLAT_TIPOS = ['exchange', 'monedero', 'blockchain', 'otro'];
+const PLAT_TIPOS = ['exchange', 'monedero', 'blockchain', 'empresa', 'herramienta', 'otro'];
+// 23/11 (nota de Acros 8): empresas de trazabilidad y plataformas de cálculo. Están en el catálogo para sus logos (por
+// ejemplo, en las respuestas de las baterías), pero no son sitios donde el cliente tenga criptos: no se reconocen como
+// plataforma de un cliente (mapas de burbujas, guías por exchange, reconocer archivos).
+const PLAT_SIN_CRIPTOS = ['empresa', 'herramienta'];
+const PLAT_SEMILLA_2 = [
+  ['taxdown', 'TaxDown', 'empresa', [], 'https://taxdown.es'],
+  ['clcripto', 'CLCripto', 'empresa', ['CL Cripto'], 'https://www.clcripto.com'],
+  ['abast', 'Abast', 'empresa', ['Abast Legal'], 'https://abastlegal.com'],
+  ['cointracking', 'CoinTracking', 'herramienta', ['Coin Tracking'], 'https://cointracking.info'],
+  ['waltio', 'Waltio', 'herramienta', [], 'https://waltio.com'],
+  ['koinly', 'Koinly', 'herramienta', [], 'https://koinly.io'],
+  ['blockpit', 'Blockpit', 'herramienta', [], 'https://www.blockpit.io'],
+  ['crypto-tax-calculator', 'Crypto Tax Calculator', 'herramienta', ['CTC', 'CryptoTaxCalculator'], 'https://cryptotaxcalculator.io'],
+];
 const PLAT_MAX_LOGO = 300 * 1024;
 const PLAT_SEMILLA = [
   // exchanges y brókers (los de las guías y los conversores de DFPro)
@@ -10983,21 +11599,37 @@ async function prepararPlataformas() {
     for (const [clave, nombre, tipo, alias, web] of PLAT_SEMILLA)
       await pool.execute('INSERT IGNORE INTO plataformas (clave, nombre, tipo, alias, web) VALUES (?, ?, ?, ?, ?)', [clave, nombre, tipo, JSON.stringify(alias), web]);
   }
+  // Segunda siembra (23/11), una sola vez: si el equipo ya había dado de alta alguna como «Otro», solo se le pone el tipo
+  try {
+    await pool.query('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');
+    const [[s2]] = await pool.query("SELECT COUNT(*) n FROM ajustes WHERE clave = 'plataformas_semilla_2'");
+    if (!s2.n) {
+      for (const [clave, nombre, tipo, alias, web] of PLAT_SEMILLA_2) {
+        await pool.execute('INSERT IGNORE INTO plataformas (clave, nombre, tipo, alias, web) VALUES (?, ?, ?, ?, ?)', [clave, nombre, tipo, JSON.stringify(alias), web]);
+        await pool.execute("UPDATE plataformas SET tipo = ? WHERE clave = ? AND tipo = 'otro'", [tipo, clave]);
+        if (web) await pool.execute("UPDATE plataformas SET web = ? WHERE clave = ? AND (web IS NULL OR web = '')", [web, clave]);
+      }
+      await pool.query("INSERT INTO ajustes (clave, valor) VALUES ('plataformas_semilla_2', '1') ON DUPLICATE KEY UPDATE valor = valor");
+    }
+    // 23/11: la web de Abast es abastlegal.com (no abast.es); se corrige por si ya se había sembrado con la otra
+    await pool.query("UPDATE plataformas SET web = 'https://abastlegal.com' WHERE clave = 'abast' AND web = 'https://www.abast.es'");
+  } catch (e) { console.error('Plataformas (segunda siembra):', e.message); }
 }
 
 // Lista en memoria (se refresca al cambiar algo) para reconocer nombres sin consultar la base cada vez
 let PLAT_CACHE = null;
 async function plataformasActivas() {
   if (PLAT_CACHE) return PLAT_CACHE;
-  const [f] = await pool.query("SELECT id, clave, nombre, tipo, alias, web, logo_tipo, logo_fuente, logo_actualizado_en, (logo_datos IS NOT NULL) AS tiene_logo FROM plataformas WHERE activa = 1 ORDER BY FIELD(tipo, 'exchange', 'monedero', 'blockchain', 'otro'), nombre");
+  const [f] = await pool.query("SELECT id, clave, nombre, tipo, alias, web, logo_tipo, logo_fuente, logo_actualizado_en, (logo_datos IS NOT NULL) AS tiene_logo FROM plataformas WHERE activa = 1 ORDER BY FIELD(tipo, 'exchange', 'monedero', 'blockchain', 'empresa', 'herramienta', 'otro'), nombre");
   PLAT_CACHE = f.map(x => { let a = []; try { a = JSON.parse(x.alias || '[]'); } catch (e) {} return { ...x, alias: a, tiene_logo: !!x.tiene_logo }; });
   return PLAT_CACHE;
 }
 const platOlvidar = () => { PLAT_CACHE = null; };
 // «Binance Spain», «BSC», «kraken»… → su plataforma (o null)
-async function plataformaDeNombre(nombre) {
+// Empresas y plataformas de cálculo no cuentan como plataforma de un cliente, salvo que se pida con { todas: true }
+async function plataformaDeNombre(nombre, op = {}) {
   const n = platNorm(nombre); if (!n) return null;
-  const lista = await plataformasActivas();
+  const lista = (await plataformasActivas()).filter(p => op.todas || !PLAT_SIN_CRIPTOS.includes(p.tipo));
   return lista.find(p => platNorm(p.clave) === n || platNorm(p.nombre) === n || p.alias.some(a => platNorm(a) === n)) || null;
 }
 const urlLogo = p => '/logos/' + p.clave + (p.logo_actualizado_en ? '?v=' + new Date(p.logo_actualizado_en).getTime().toString(36) : '');
@@ -11018,9 +11650,10 @@ function svgSeguro(texto) {
 }
 
 // ---------------- Público
+// ?criptos=1: solo donde el cliente puede tener criptos (para mapas de burbujas y guías). Cada una lleva con_criptos.
 app.get('/logos/plataformas.json', async (req, res) => {
-  const lista = await plataformasActivas();
-  res.set('Cache-Control', 'public, max-age=300').json(lista.map(p => ({ clave: p.clave, nombre: p.nombre, tipo: p.tipo, alias: p.alias, web: p.web, logo: urlLogo(p), tiene_logo: p.tiene_logo })));
+  const lista = (await plataformasActivas()).filter(p => req.query.criptos !== '1' || !PLAT_SIN_CRIPTOS.includes(p.tipo));
+  res.set('Cache-Control', 'public, max-age=300').json(lista.map(p => ({ clave: p.clave, nombre: p.nombre, tipo: p.tipo, con_criptos: !PLAT_SIN_CRIPTOS.includes(p.tipo), alias: p.alias, web: p.web, logo: urlLogo(p), tiene_logo: p.tiene_logo })));
 });
 app.get('/logos/:clave([a-z0-9-]{1,60})(.svg|.png|.webp|.jpg)?', async (req, res) => {
   const [f] = await pool.execute('SELECT nombre, logo_tipo, logo_datos FROM plataformas WHERE clave = ? AND activa = 1', [req.params.clave]);
@@ -11105,6 +11738,411 @@ app.get('/api/admin/plataformas/reconocer', requiereSesionAsesor, async (req, re
   const p = await plataformaDeNombre(req.query.nombre);
   res.json(p ? { clave: p.clave, nombre: p.nombre, tipo: p.tipo, logo: urlLogo(p) } : null);
 });
+
+// ================================================================
+// FLUJO DEL CLIENTE (24/11, Vikn firma la muestra «Flujo del cliente en Acros»)
+// Lo que el Área necesita para enseñar todo el camino en una sola pantalla:
+//  · en qué punto está (preguntas, espera, propuesta, rechazada, caducada, aceptada),
+//  · a quién llamar (el asesor de cada cliente, con su teléfono, WhatsApp y correo),
+//  · los hitos por celebrar («¡Te ha llegado tu propuesta!», «¡Pago recibido!»…) y qué partes del recorrido ha visto,
+//  · su historial, con lo nuevo marcado hasta que lo mira,
+//  · el rechazo con motivo y «Pedir otra propuesta».
+// Decisiones de Vikn (24/11): el alta va al aceptar la propuesta; con «cobrar después», el informe se celebra pero no se
+// abre hasta pagar; con el pago declarado, «En revisión desde…», chat abierto y contacto del asesor; la valoración va
+// aparte, debajo de «Te toca a ti».
+// ================================================================
+const FLUJO_GENERAL = { nombre: 'Acros', telefono: '668 17 00 20', whatsapp: '34668170020', correo: 'hola@acrosfi.es' };
+const MOTIVOS_RECHAZO = { caro: 'Me parece caro', menos: 'Necesito menos servicios', otra: 'Lo voy a hacer con otra empresa', luego: 'Lo dejo para más adelante', otro: 'Otro motivo' };
+const HITO_RE = /^(prop|acep|pago|docs|inf|fin):\d{1,10}$|^rec:[123]$|^hist$/;
+let FLUJO_DESDE = null;   // a partir de cuándo se celebra: lo de antes se da por visto (no se le celebra a nadie lo de hace meses)
+
+async function prepararFlujo() {
+  try {
+    await agregaColumnaSiFalta('personas', 'telefono_clientes', 'VARCHAR(30) NULL');
+    await agregaColumnaSiFalta('personas', 'whatsapp_clientes', 'VARCHAR(30) NULL');
+    await agregaColumnaSiFalta('personas', 'correo_clientes', 'VARCHAR(160) NULL');
+    await agregaColumnaSiFalta('propuestas', 'nota', 'TEXT NULL');
+    await agregaColumnaSiFalta('propuestas', 'nota_plantilla', 'VARCHAR(40) NULL');
+    await agregaColumnaSiFalta('propuestas', 'motivo_tipo', 'VARCHAR(20) NULL');
+    await agregaColumnaSiFalta('propuestas', 'rechazada_en', 'DATETIME NULL');
+    await agregaColumnaSiFalta('propuestas', 'aceptada_en', 'DATETIME NULL');
+    await agregaColumnaSiFalta('solicitudes_presupuesto', 'cliente_id', 'INT NULL');
+    await agregaColumnaSiFalta('pagos', 'aviso_revision_en', 'DATETIME NULL');
+    { const [[col]] = await pool.query("SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'pagos' AND COLUMN_NAME = 'estado'");   // 26/11 (G4)
+      if (col && !/rechazado/.test(col.t)) await pool.query("ALTER TABLE pagos MODIFY estado ENUM('autodeclarado','confirmado','rechazado') NOT NULL DEFAULT 'autodeclarado'"); }
+    await agregaColumnaSiFalta('pagos', 'rechazado_en', 'DATETIME NULL');
+    await agregaColumnaSiFalta('pagos', 'rechazado_por_asesor_id', 'INT NULL');
+    await agregaColumnaSiFalta('pagos', 'motivo_rechazo', 'VARCHAR(300) NULL');
+    await asegurarStripe();   // 26/11: Stripe
+    await agregaColumnaSiFalta('valoraciones', 'editada_en', 'DATETIME NULL');   // 27/11: valoración cambiada
+    await agregaColumnaSiFalta('entregas', 'resumen', 'JSON NULL');   // 25/11: el resumen del informe (lo rellenará la herramienta que lee el PDF)
+    await pool.query('CREATE TABLE IF NOT EXISTS cliente_hitos (`cliente_id` INT NOT NULL, `clave` VARCHAR(40) NOT NULL, `visto_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`cliente_id`, `clave`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    await pool.query('CREATE TABLE IF NOT EXISTS ajustes (`clave` VARCHAR(60) PRIMARY KEY, `valor` TEXT NULL, `actualizado_en` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');
+    await pool.query("INSERT IGNORE INTO ajustes (clave, valor) VALUES ('flujo_desde', DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s'))");
+    const [[d]] = await pool.query("SELECT valor FROM ajustes WHERE clave = 'flujo_desde'");
+    FLUJO_DESDE = new Date(String(d.valor).replace(' ', 'T'));
+  } catch (e) { console.error('Flujo del cliente (tablas):', e.message); }
+}
+
+const flujoFecha = v => { if (!v) return null; const d = v instanceof Date ? v : new Date(String(v).replace(' ', 'T')); return isNaN(d) ? null : d; };
+const flujoISO = v => { const d = flujoFecha(v); return d ? d.toISOString() : null; };
+
+// Contacto que ve el cliente: el de su asesor; lo que el asesor no tenga, el general de Acros
+async function contactoDeCliente(clienteId, conn) {
+  const q = await personaDeCliente(clienteId, conn).catch(() => null);
+  if (!q) return Object.assign({ general: true, foto: null, puesto: '' }, FLUJO_GENERAL);
+  const wa = String(q.whatsapp_clientes || '').replace(/\D/g, '');
+  return {
+    general: false, nombre: q.nombre, puesto: String(q.puesto_es || '').replace(/\s*·\s*/g, ' y '), foto: q.foto || null,
+    telefono: q.telefono_clientes || FLUJO_GENERAL.telefono,
+    whatsapp: wa ? (wa.length === 9 ? '34' + wa : wa) : (q.telefono_clientes ? (() => { const t = String(q.telefono_clientes).replace(/\D/g, ''); return t.length === 9 ? '34' + t : t; })() : FLUJO_GENERAL.whatsapp),
+    correo: q.correo_clientes || FLUJO_GENERAL.correo,
+    genero: q.genero || generoPorNombre(q.nombre),   // 27/11
+  };
+}
+
+// Hitos que tiene ahora (con la fecha en que ocurrieron)
+async function hitosAhora(clienteId, conn) {
+  const h = [];
+  const [ps] = await conn.execute('SELECT id, estado, creado_en, aceptada_en, inicio_inmediato_en, actualizado_en FROM propuestas WHERE cliente_id = ?', [clienteId]);
+  for (const p of ps) {
+    if (p.estado === 'enviada' || p.estado === 'aceptada') h.push({ clave: 'prop:' + p.id, tipo: 'propuesta', en: p.creado_en, propuesta_id: p.id });
+    if (p.estado === 'aceptada') h.push({ clave: 'acep:' + p.id, tipo: 'aceptada', en: p.aceptada_en || p.inicio_inmediato_en || p.actualizado_en, propuesta_id: p.id });
+  }
+  const [pg] = await conn.execute("SELECT g.propuesta_id, MAX(g.confirmado_en) en FROM pagos g JOIN propuestas p ON p.id = g.propuesta_id WHERE p.cliente_id = ? AND g.estado = 'confirmado' GROUP BY g.propuesta_id", [clienteId]);
+  pg.forEach(x => h.push({ clave: 'pago:' + x.propuesta_id, tipo: 'pago', en: x.en, propuesta_id: x.propuesta_id }));
+  // Documentación completa: todo lo pedido está validado (y se pidió algo)
+  const [dc] = await conn.execute("SELECT d.propuesta_id, COUNT(*) n, SUM(d.estado = 'valido') v, MAX(d.subido_en) en FROM documentos_fiscales d JOIN propuestas p ON p.id = d.propuesta_id WHERE p.cliente_id = ? GROUP BY d.propuesta_id", [clienteId]);
+  dc.filter(x => Number(x.n) > 0 && Number(x.v) === Number(x.n)).forEach(x => h.push({ clave: 'docs:' + x.propuesta_id, tipo: 'docs', en: x.en, propuesta_id: x.propuesta_id }));
+  // Informe para revisar: la última versión de cada informe, aún sin respuesta del cliente
+  const [en] = await conn.execute("SELECT e.id, e.propuesta_id, e.servicio, e.subido_en FROM entregas e WHERE e.cliente_id = ? AND e.estado = 'entregado' AND e.id = (SELECT MAX(e2.id) FROM entregas e2 WHERE e2.propuesta_id = e.propuesta_id AND e2.servicio = e.servicio)", [clienteId]);
+  en.forEach(x => h.push({ clave: 'inf:' + x.id, tipo: 'informe', en: x.subido_en, propuesta_id: x.propuesta_id, servicio: x.servicio }));
+  const [fin] = await conn.execute("SELECT id, propuesta_id, servicio, cerrado_en FROM servicios_cliente WHERE cliente_id = ? AND estado = 'terminado' AND cerrado_en IS NOT NULL", [clienteId]);
+  fin.forEach(x => h.push({ clave: 'fin:' + x.id, tipo: 'terminado', en: x.cerrado_en, propuesta_id: x.propuesta_id, servicio: x.servicio }));
+  return h;
+}
+async function vistosDe(clienteId, conn) {
+  const [f] = await conn.execute('SELECT clave, visto_en FROM cliente_hitos WHERE cliente_id = ?', [clienteId]);
+  return new Map(f.map(x => [x.clave, x.visto_en]));
+}
+async function marcarVisto(clienteId, claves, conn) {
+  for (const c of claves) if (HITO_RE.test(c)) await (conn || pool).execute('INSERT INTO cliente_hitos (cliente_id, clave, visto_en) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE visto_en = IF(clave = \'hist\', NOW(), visto_en)', [clienteId, c]);
+}
+
+// 26/11 (Vikn, M6): un solo historial del cliente. Lo usan el Área antes del alta (/flujo) y después (/area):
+// los mismos momentos y los mismos textos (t, t_en). Los informes, solo con el pago de su encargo confirmado.
+const TXT_EVENTO = {
+  solicitud: ['Enviaste tu solicitud', 'You sent your request'], otra: ['Pediste otra propuesta', 'You asked for another proposal'],
+  preguntas: ['Respondiste tus preguntas', 'You answered your questions'], propuesta: ['Te llegó tu propuesta', 'Your proposal arrived'],
+  aceptada: ['Aceptaste la propuesta', 'You accepted the proposal'], rechazada: ['Rechazaste la propuesta', 'You declined the proposal'],
+  caducada: ['La propuesta caducó sin respuesta', 'The proposal expired without an answer'],
+  pago_declarado: ['Nos dijiste que habías pagado', 'You told us you had paid'], pago_confirmado: ['Confirmamos tu pago', 'We confirmed your payment'],
+  pago_rechazado: ['No nos llegó tu pago', 'Your payment did not reach us'], devolucion: ['Te devolvimos', 'We refunded'], alta_enviada: ['Enviaste tu alta', 'You sent your sign-up'],
+  alta_aprobada: ['Tu alta está aprobada', 'Your sign-up is approved'], alta_rechazada: ['Tu alta no se pudo aprobar', 'Your sign-up could not be approved'],
+  conforme: ['Diste el visto bueno al informe', 'You approved the report'], terminado_cliente: ['Confirmaste que está terminado', 'You confirmed it is finished'],
+  terminado_informe: ['Diste el visto bueno al informe y el servicio quedó terminado', 'You approved the report and the service was finished'],
+  cerrado_sin_respuesta: ['Se cerró sin tu respuesta', 'It was closed without your reply'], reabierto: ['Se reabrió el servicio', 'The service was reopened'],
+  pendiente_cliente: ['Dijiste que tenías algo pendiente', 'You said you had something pending'],
+};
+function textoEvento(x, a, aEn) {
+  const n = x.nombre || '', m = x.motivo ? ': ' + x.motivo : '';
+  switch (x.tipo) {
+    case 'doc_pedido': return [a + ' te pidió «' + n + '»', aEn + ' asked for «' + n + '»'];
+    case 'doc_subido': return ['Subiste «' + n + '»', 'You uploaded «' + n + '»'];
+    case 'doc_validado': return [a + ' dio por válido «' + n + '»', aEn + ' accepted «' + n + '»'];
+    case 'doc_rechazado': return [a + ' rechazó «' + n + '»' + m, aEn + ' rejected «' + n + '»' + m];
+    case 'informe': return x.archivos > 1 ? [a + ' te entregó tu informe en ' + x.archivos + ' archivos' + (x.version > 1 ? ' (versión ' + x.version + ')' : ''), aEn + ' delivered your report in ' + x.archivos + ' files' + (x.version > 1 ? ' (version ' + x.version + ')' : '')]
+      : [a + ' te entregó «' + n + '»' + (x.version > 1 ? ' (versión ' + x.version + ')' : ''), aEn + ' delivered «' + n + '»' + (x.version > 1 ? ' (version ' + x.version + ')' : '')];
+    case 'cambios': return ['Le comentaste algo del informe' + m, 'You commented on the report' + m];
+    case 'devolucion': return ['Te devolvimos ' + eurosCorreo(x.importe), 'We refunded ' + eurosCorreo(x.importe).replace(',', '.')];
+    case 'servicio': return x.evento === 'propuesto_cierre' ? [a + ' dio por terminado el servicio y falta tu confirmación', aEn + ' marked the service as finished and your confirmation is missing'] : (TXT_EVENTO[x.evento] || [x.evento, x.evento]);
+    default: return TXT_EVENTO[x.tipo] || [x.tipo, x.tipo];
+  }
+}
+async function eventosDeCliente(conn, clienteId) {
+  const h = [], add = (cuando, tipo, datos) => { if (cuando) h.push(Object.assign({ cuando, tipo }, datos || {})); };
+  const [[cl]] = await conn.execute('SELECT correo FROM clientes WHERE id = ?', [clienteId]);
+  const [ss] = await conn.execute('SELECT origen, creado_en FROM solicitudes_presupuesto WHERE cliente_id = ? OR (correo = ? AND ? <> \'\') ORDER BY id', [clienteId, (cl && cl.correo) || '', (cl && cl.correo) || '']);
+  ss.forEach(x => add(x.creado_en, x.origen === 'otra_propuesta' ? 'otra' : 'solicitud'));
+  try { const [fs] = await conn.execute("SELECT respondida_en FROM formularios_cliente WHERE cliente_id = ? AND estado = 'respondida' AND respondida_en IS NOT NULL", [clienteId]); fs.forEach(f => add(f.respondida_en, 'preguntas')); } catch (e) {}
+  const [ps] = await conn.execute('SELECT id, estado, creado_en, aceptada_en, inicio_inmediato_en, rechazada_en, actualizado_en, token_expira_en FROM propuestas WHERE cliente_id = ?', [clienteId]);
+  ps.forEach(x => { add(x.creado_en, 'propuesta', { propuesta_id: x.id });
+    if (x.estado === 'aceptada') add(x.aceptada_en || x.inicio_inmediato_en || x.actualizado_en, 'aceptada', { propuesta_id: x.id });
+    if (x.estado === 'rechazada') add(x.rechazada_en || x.actualizado_en, 'rechazada', { propuesta_id: x.id });
+    if (x.estado === 'caducada') add(x.token_expira_en, 'caducada', { propuesta_id: x.id }); });
+  const ids = ps.map(x => x.id);
+  if (ids.length) {
+    const [pg] = await conn.query('SELECT propuesta_id, estado, creado_en, confirmado_en, rechazado_en FROM pagos WHERE propuesta_id IN (?)', [ids]);
+    pg.forEach(x => { add(x.creado_en, 'pago_declarado', { propuesta_id: x.propuesta_id }); if (x.estado === 'confirmado' || x.estado === 'devuelto') add(x.confirmado_en, 'pago_confirmado', { propuesta_id: x.propuesta_id }); if (x.estado === 'rechazado') add(x.rechazado_en, 'pago_rechazado', { propuesta_id: x.propuesta_id }); });
+    const pagadas = new Set(pg.filter(x => x.estado === 'confirmado').map(x => x.propuesta_id));
+    try { await asegurarDevoluciones(); const [dv] = await conn.query("SELECT propuesta_id, importe_centimos, hecha_en FROM devoluciones WHERE propuesta_id IN (?) AND estado = 'hecha'", [ids]); dv.forEach(x => add(x.hecha_en, 'devolucion', { propuesta_id: x.propuesta_id, importe: x.importe_centimos })); } catch (e) {}   // 26/11: devoluciones
+    const [dl] = await conn.query('SELECT propuesta_id, estado, creado_en, resuelto_en FROM diligencias WHERE propuesta_id IN (?) ORDER BY id', [ids]);
+    dl.forEach(x => { add(x.creado_en, 'alta_enviada'); if (x.resuelto_en && x.estado === 'aprobado') add(x.resuelto_en, 'alta_aprobada'); if (x.resuelto_en && x.estado === 'rechazado') add(x.resuelto_en, 'alta_rechazada'); });
+    const aprobadas = [...new Set(dl.filter(x => ['revision', 'examen', 'aprobado'].includes(x.estado)).map(x => x.propuesta_id))];
+    const [svs] = await conn.execute('SELECT id, propuesta_id, servicio FROM servicios_cliente WHERE cliente_id = ? AND confirmado IN (0, 1)', [clienteId]);
+    const sidDe = (pid, serv) => { const x = svs.find(y => y.propuesta_id === pid && y.servicio === serv); return x ? x.id : null; };
+    if (aprobadas.length) {
+      const [docs] = await conn.query('SELECT propuesta_id, servicio, nombre, estado, razon_rechazo, subido_en, creado_en, revisado_en FROM documentos_fiscales WHERE propuesta_id IN (?)', [aprobadas]);
+      docs.forEach(x => { const sid = sidDe(x.propuesta_id, x.servicio); add(x.creado_en, 'doc_pedido', { servicio_id: sid, nombre: x.nombre }); if (x.subido_en) add(x.subido_en, 'doc_subido', { servicio_id: sid, nombre: x.nombre });
+        if (x.revisado_en && (x.estado === 'rechazado' || x.estado === 'valido')) add(x.revisado_en, x.estado === 'rechazado' ? 'doc_rechazado' : 'doc_validado', { servicio_id: sid, nombre: x.nombre, motivo: x.estado === 'rechazado' ? x.razon_rechazo : undefined }); });
+    }
+    if (pagadas.size) {   // los informes, solo si el cliente puede verlos
+      const [ents] = await conn.query('SELECT propuesta_id, servicio, version, nombre_archivo, subido_en, estado, comentario, respondido_en FROM entregas WHERE propuesta_id IN (?) ORDER BY id', [[...pagadas]]);
+      const porVersion = new Map(); ents.forEach(x => { const k = x.propuesta_id + '|' + x.servicio + '|' + x.version; if (!porVersion.has(k)) porVersion.set(k, []); porVersion.get(k).push(x); });
+      porVersion.forEach(l => { const x = l[0], sid = sidDe(x.propuesta_id, x.servicio);
+        add(x.subido_en, 'informe', { servicio_id: sid, nombre: x.nombre_archivo, version: x.version, archivos: l.length });
+        if (x.respondido_en && (x.estado === 'conforme' || x.estado === 'cambios')) add(x.respondido_en, x.estado, { servicio_id: sid, motivo: x.estado === 'cambios' ? x.comentario : undefined }); });
+    }
+    const [evS] = await conn.query("SELECT h.servicio_id, h.evento, h.creado_en FROM servicios_historial h JOIN servicios_cliente s ON s.id = h.servicio_id WHERE s.cliente_id = ? AND s.confirmado IN (0, 1) AND h.evento IN (?)", [clienteId, EVENTOS_SERVICIO_CLIENTE]);
+    evS.forEach(x => add(x.creado_en, 'servicio', { servicio_id: x.servicio_id, evento: x.evento }));
+  }
+  const as = await personaDeCliente(clienteId, conn).catch(() => null), a = as ? as.nombre : 'Tu asesor', aEn = as ? as.nombre : 'Your advisor';
+  h.forEach(x => { const [t, tEn] = textoEvento(x, a, aEn); x.t = t; x.t_en = tEn; });
+  return h.sort((x, y) => new Date(y.cuando) - new Date(x.cuando));
+}
+async function historialDe(cliente, conn) {
+  return (await eventosDeCliente(conn, cliente.id)).slice(0, 80).map(x => { const d = flujoFecha(x.cuando); return d ? { t: x.t, t_en: x.t_en, en: d.toISOString(), clave: x.tipo } : null; }).filter(Boolean);
+}
+
+// Todo lo que necesita el Área de un cliente
+async function flujoDeCliente(clienteId, token) {
+  const conn = await pool.getConnection();
+  try {
+    await caducarPropuestas(clienteId);
+    const [[cli]] = await conn.execute('SELECT id, correo, nombre, creado_en, estado FROM clientes WHERE id = ?', [clienteId]);
+    if (!cli) return null;
+    const [ps] = await conn.execute(SQL_PROPUESTA_DE_ENTRADA.replace('SELECT token, estado', 'SELECT id, token, estado, servicios, importe_centimos, nota, motivo_tipo, motivo_rechazo, rechazada_en, token_expira_en, creado_en, cobro, creado_por_asesor_id'), [clienteId]);
+    let p = ps[0] || null;
+    if (token) { const [pt] = await conn.execute('SELECT id, token, estado, servicios, importe_centimos, nota, motivo_tipo, motivo_rechazo, rechazada_en, token_expira_en, creado_en, cobro, creado_por_asesor_id FROM propuestas WHERE token = ? AND cliente_id = ?', [token, clienteId]); if (pt[0]) p = pt[0]; }   // por su enlace: esa propuesta
+    // ¿Ya tiene su área de servicios por otro encargo? Entonces esto se ve allí, no aquí
+    const [est] = await conn.execute("SELECT COUNT(*) n FROM propuestas p2 JOIN diligencias d ON d.propuesta_id = p2.id WHERE p2.cliente_id = ? AND p2.estado = 'aceptada' AND d.estado IN ('revision', 'examen', 'aprobado') AND p2.id <> ?", [clienteId, p ? p.id : 0]);
+    const establecido = Number(est[0].n) > 0;
+    let pendientes = 0; try { const [[n]] = await conn.execute("SELECT COUNT(*) n FROM formularios_cliente WHERE cliente_id = ? AND estado = 'enviada'", [clienteId]); pendientes = Number(n.n); } catch (e) {}
+    const [otras] = await conn.execute("SELECT creado_en FROM solicitudes_presupuesto WHERE cliente_id = ? AND origen = 'otra_propuesta' AND atendida = 0 ORDER BY id DESC LIMIT 1", [clienteId]);
+    const otra = otras[0] && p && ['rechazada', 'caducada'].includes(p.estado) && flujoFecha(otras[0].creado_en) >= (flujoFecha(p.rechazada_en) || flujoFecha(p.token_expira_en) || new Date(0)) ? otras[0] : null;
+    let fase;
+    if (!p) fase = pendientes ? 'preguntas' : 'espera';
+    else if (p.estado === 'enviada') fase = 'propuesta';
+    else if (p.estado === 'aceptada') fase = 'aceptada';
+    else fase = otra ? 'espera' : p.estado;   // rechazada o caducada
+    let pago = null;
+    if (p) { const [g] = await conn.execute("SELECT metodo, estado, creado_en, confirmado_en FROM pagos WHERE propuesta_id = ? AND estado <> 'rechazado' ORDER BY (estado = 'confirmado') DESC, id DESC LIMIT 1", [p.id]); if (g[0]) pago = { metodo: g[0].metodo, estado: g[0].estado, desde: flujoISO(g[0].creado_en), confirmado_en: flujoISO(g[0].confirmado_en) }; }
+    const [sol] = await conn.execute('SELECT servicios, creado_en FROM solicitudes_presupuesto WHERE correo = ? OR cliente_id = ? ORDER BY id DESC LIMIT 1', [cli.correo, clienteId]);
+    let pedidos = []; if (sol[0]) { try { const x = JSON.parse(sol[0].servicios); pedidos = Array.isArray(x) ? x.map(String) : String(sol[0].servicios).split(','); } catch (e) { pedidos = String(sol[0].servicios || '').split(',').map(s => s.trim()).filter(Boolean); } }
+    // Hitos: lo anterior a la puesta en marcha (o a la creación del cliente, si es anterior) se da por visto sin celebrarlo
+    const vistos = await vistosDe(clienteId, conn), ahoraH = await hitosAhora(clienteId, conn);
+    const desde = FLUJO_DESDE || new Date(0);
+    let antiguo = flujoFecha(cli.creado_en) < desde;   // cliente de antes de la puesta en marcha (o con encargos de antes): ya conoce su área
+    if (!antiguo) { const [[x]] = await conn.execute('SELECT MIN(creado_en) m FROM propuestas WHERE cliente_id = ?', [clienteId]); antiguo = !!(x.m && flujoFecha(x.m) < desde); }
+    const silenciar = ahoraH.filter(x => !vistos.has(x.clave) && (flujoFecha(x.en) || new Date(0)) < desde).map(x => x.clave);
+    if (antiguo) ['rec:1', 'rec:2', 'rec:3'].forEach(c => { if (!vistos.has(c)) silenciar.push(c); });
+    if (silenciar.length) { await marcarVisto(clienteId, silenciar, conn); silenciar.forEach(c => vistos.set(c, new Date())); }
+    const hitos = ahoraH.filter(x => !vistos.has(x.clave)).sort((a, b) => (flujoFecha(a.en) || 0) - (flujoFecha(b.en) || 0)).map(x => Object.assign({}, x, { en: flujoISO(x.en) }));
+    if (!vistos.has('hist')) { await marcarVisto(clienteId, ['hist'], conn); vistos.set('hist', new Date()); }   // lo nuevo cuenta desde su primera visita
+    const historial = await historialDe(cli, conn), visto = flujoFecha(vistos.get('hist'));
+    historial.forEach(x => { x.nuevo = !!visto && new Date(x.en) > visto; });
+    let servicios = [];
+    if (p) { try { servicios = JSON.parse(p.servicios); } catch (e) { servicios = []; } }
+    return {
+      fase, establecido, pendientes: cli.estado === 'inerte' ? [] : pendientes, otra_pedida_en: otra ? flujoISO(otra.creado_en) : null, no_apto: cli.estado === 'inerte', devuelto: p ? (await asegurarDevoluciones().then(() => conn.execute("SELECT 1 FROM devoluciones WHERE propuesta_id = ? AND estado = 'hecha' LIMIT 1", [p.id])).then(([r]) => r.length > 0).catch(() => false)) : false,   // 26/11 (M4): sin tareas
+      nombre: cli.nombre || '', antiguo,
+      propuesta: p ? { id: p.id, token: p.token, estado: p.estado, servicios, importe_centimos: p.importe_centimos, nota: p.nota || '', cobro: p.cobro || 'antes', dias_pago: DIAS_PLAZO_PAGO, expira_en: flujoISO(p.token_expira_en), creado_en: flujoISO(p.creado_en), motivo_tipo: p.motivo_tipo || null, motivo: p.motivo_rechazo || '' } : null,
+      pago, pedidos, solicitud_en: sol[0] ? flujoISO(sol[0].creado_en) : null,
+      contacto: await contactoDeCliente(clienteId, conn),
+      hitos, recorrido: [1, 2, 3].filter(n => vistos.has('rec:' + n)),
+      historial, historial_visto: !!visto,
+      incluye: await flujoIncluye(),
+      animaciones: await animacionesArea(),
+    };
+  } finally { conn.release(); }
+}
+// 24/11 (Vikn): animaciones del Área, cada una se enciende o apaga desde el panel (Automatizaciones, «Flujo del cliente»)
+const ANIM_DEFECTO = { latido_entrada: true, onda_entrada: true, onda_documentos: true, onda_informes: true, campana_historial: true, recorrido: true,
+  cel_propuesta: true, cel_aceptada: true, cel_pago: true, cel_docs: true, cel_informe: true, cel_terminado: true };
+async function animacionesArea() {
+  try { const [[f]] = await pool.query("SELECT valor FROM ajustes WHERE clave = 'area_animaciones'"); const o = JSON.parse((f && f.valor) || '{}'); const r = {}; for (const k of Object.keys(ANIM_DEFECTO)) r[k] = typeof o[k] === 'boolean' ? o[k] : ANIM_DEFECTO[k]; return r; }
+  catch (e) { return Object.assign({}, ANIM_DEFECTO); }
+}
+// «Qué incluye» cada servicio de la carta: lo escribe el equipo en el panel (sin textos inventados por defecto)
+async function flujoIncluye() {
+  try { const [[f]] = await pool.query("SELECT valor FROM ajustes WHERE clave = 'carta_incluye'"); const o = JSON.parse((f && f.valor) || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e) { return {}; }
+}
+
+app.get('/api/clientes/flujo', requiereSesionCliente, async (req, res) => {
+  try { res.json(await flujoDeCliente(req.cliente.id)); } catch (e) { console.error('Flujo del cliente:', e.message); res.status(500).json({ error: 'No se ha podido cargar tu área' }); }
+});
+app.get('/api/propuestas/:token/flujo', async (req, res) => {
+  try {
+    const [f] = await pool.execute('SELECT cliente_id FROM propuestas WHERE token = ?', [req.params.token]);
+    if (!f.length) return res.status(404).json({ error: 'Propuesta no encontrada' });
+    res.json(await flujoDeCliente(f[0].cliente_id, req.params.token));
+  } catch (e) { console.error('Flujo del cliente:', e.message); res.status(500).json({ error: 'No se ha podido cargar tu área' }); }
+});
+async function clienteDeFlujo(req) {
+  if (req.params.token) { const [f] = await pool.execute('SELECT cliente_id FROM propuestas WHERE token = ?', [req.params.token]); return f[0] ? f[0].cliente_id : null; }
+  return req.cliente ? req.cliente.id : null;
+}
+const flujoVisto = async (req, res) => {
+  const id = await clienteDeFlujo(req); if (!id) return res.status(404).json({ error: 'No encontrado' });
+  const claves = (Array.isArray((req.body || {}).claves) ? req.body.claves : [(req.body || {}).clave]).map(String).filter(c => HITO_RE.test(c)).slice(0, 20);
+  if (!claves.length) return res.status(400).json({ error: 'Nada que marcar' });
+  await marcarVisto(id, claves); res.json({ ok: true });
+};
+app.post('/api/clientes/flujo/visto', requiereSesionCliente, flujoVisto);
+app.post('/api/propuestas/:token/flujo/visto', flujoVisto);
+// Repetir el recorrido desde Ajustes: se olvidan las partes vistas
+const flujoRepetir = async (req, res) => {
+  const id = await clienteDeFlujo(req); if (!id) return res.status(404).json({ error: 'No encontrado' });
+  await pool.execute("DELETE FROM cliente_hitos WHERE cliente_id = ? AND clave LIKE 'rec:%'", [id]); res.json({ ok: true });
+};
+app.post('/api/clientes/flujo/repetir-recorrido', requiereSesionCliente, flujoRepetir);
+app.post('/api/propuestas/:token/flujo/repetir-recorrido', flujoRepetir);
+
+// Pedir otra propuesta (tras rechazarla o dejarla caducar): vuelve a «Solicitudes nuevas» del panel, unida a su ficha
+const flujoOtra = async (req, res) => {
+  const id = await clienteDeFlujo(req); if (!id) return res.status(404).json({ error: 'No encontrado' });
+  const conn = await pool.getConnection();
+  try {
+    const [[c]] = await conn.execute('SELECT id, correo, telefono FROM clientes WHERE id = ?', [id]);
+    const [ps] = await conn.execute("SELECT id, estado, servicios, motivo_tipo, motivo_rechazo FROM propuestas WHERE cliente_id = ? ORDER BY id DESC LIMIT 1", [id]);
+    const p = ps[0];
+    if (!p || !['rechazada', 'caducada'].includes(p.estado)) return res.status(409).json({ error: 'Ahora mismo no hay ninguna propuesta que rehacer' });
+    const [ya] = await conn.execute("SELECT id FROM solicitudes_presupuesto WHERE cliente_id = ? AND origen = 'otra_propuesta' AND atendida = 0", [id]);
+    if (ya.length) return res.json({ ok: true, ya: true });
+    let servs = []; try { servs = JSON.parse(p.servicios).map(s => typeof s === 'string' ? s : s && s.id).filter(Boolean); } catch (e) {}
+    const nota = String((req.body || {}).nota || '').trim().slice(0, 1000);
+    const detalle = ['Pide otra propuesta' + (p.estado === 'caducada' ? ' (la anterior caducó)' : ''), p.motivo_tipo ? 'Motivo del rechazo: ' + (MOTIVOS_RECHAZO[p.motivo_tipo] || p.motivo_tipo) : '', p.motivo_rechazo && p.motivo_rechazo !== MOTIVOS_RECHAZO[p.motivo_tipo] ? 'Lo que escribió: ' + p.motivo_rechazo : '', nota ? 'Ahora dice: ' + nota : ''].filter(Boolean).join('\n');
+    await conn.execute("INSERT INTO solicitudes_presupuesto (servicios, detalle, telefono, correo, origen, cliente_id) VALUES (?, ?, ?, ?, 'otra_propuesta', ?)", [JSON.stringify(servs), detalle, c.telefono || '', c.correo, id]);
+    avisarCliente(id, '🔁', 'un cliente pide otra propuesta', 'La tienes en Entrada, en «Solicitudes nuevas».');
+    res.json({ ok: true });
+  } finally { conn.release(); }
+};
+app.post('/api/clientes/flujo/otra-propuesta', requiereSesionCliente, flujoOtra);
+app.post('/api/propuestas/:token/flujo/otra-propuesta', flujoOtra);
+
+// ---------------- Panel: contacto del asesor para sus clientes (lo cambia él mismo o un administrador)
+const telLimpio = v => { const t = String(v || '').trim().slice(0, 30); return t && /^[+\d][\d\s.-]{6,28}$/.test(t) ? t : ''; };
+app.put('/api/admin/personas/:id(\\d+)/contacto', requiereSesionAsesor, async (req, res) => {
+  const id = Number(req.params.id);
+  const [[q]] = await pool.execute('SELECT id, asesor_id FROM personas WHERE id = ?', [id]);
+  if (!q) return res.status(404).json({ error: 'Persona no encontrada' });
+  const propio = q.asesor_id && q.asesor_id === req.asesor.id;
+  if (!req.asesor.esAdmin && !propio && !(typeof puedeTocarHorario === 'function' && await puedeTocarHorario(req, id))) return res.status(403).json({ error: 'Solo la propia persona o un administrador cambian su contacto' });
+  const b = req.body || {}, tel = telLimpio(b.telefono), wa = telLimpio(b.whatsapp), correo = String(b.correo || '').trim().slice(0, 160);
+  if (b.telefono && !tel) return res.status(400).json({ error: 'El teléfono no parece válido' });
+  if (b.whatsapp && !wa) return res.status(400).json({ error: 'El número de WhatsApp no parece válido' });
+  if (correo && !correoValido(correo)) return res.status(400).json({ error: 'El correo no es válido' });
+  await pool.execute('UPDATE personas SET telefono_clientes = ?, whatsapp_clientes = ?, correo_clientes = ? WHERE id = ?', [tel || null, wa || null, correo || null, id]);
+  res.json({ ok: true, telefono: tel, whatsapp: wa, correo });
+});
+app.get('/api/admin/personas/:id(\\d+)/contacto', requiereSesionAsesor, async (req, res) => {
+  const [[q]] = await pool.execute('SELECT telefono_clientes, whatsapp_clientes, correo_clientes, asesor_id FROM personas WHERE id = ?', [Number(req.params.id)]);
+  if (!q) return res.status(404).json({ error: 'Persona no encontrada' });
+  res.json({ telefono: q.telefono_clientes || '', whatsapp: q.whatsapp_clientes || '', correo: q.correo_clientes || '', puede: !!req.asesor.esAdmin || q.asesor_id === req.asesor.id });
+});
+
+// ---------------- Panel: plantillas de la nota de la carta y «qué incluye» cada servicio
+// Una plantilla: { id, n (nombre), modo: 'todas'|'alguna', conds: [{ c (dato), o (comparación), v (valor) }], t (texto con {nombre}, {asesor}…) }
+// Datos sobre los que se ponen condiciones (las respuestas reales de las baterías 1 y 2, y lo que pidió)
+const PL_CAMPOS = ['servicios', 'anio', 'donde', 'cuantos', 'valor', 'futuros', 'problema', 'trazabilidad_previa', 'ya_cliente'];
+const PL_OPS = ['incluye', 'no_incluye', 'es', 'no_es', 'antes_ejercicio', 'antes', 'desde'];
+// Las cuatro de la muestra aprobada (23/11), con las condiciones sobre las respuestas reales. Se cambian en el panel.
+const PL_DEFECTO = [
+  { id: 'general', n: 'Presentación', modo: 'todas', conds: [], t: '{nombre}, he preparado tu propuesta con lo que nos contaste. Si algo no encaja o quieres cambiar algún servicio, escríbeme y lo ajustamos.' },
+  { id: 'historial', n: 'Historial completo', modo: 'todas', conds: [{ c: 'servicios', o: 'no_incluye', v: 'pganterior' }, { c: 'anio', o: 'antes_ejercicio', v: '' }], t: '{nombre}, para el informe de {ejercicio} necesito tu historial completo desde {anio_inicio}: sin él no puedo calcular bien el coste de lo que vendes. Por eso incluyo también el informe de {anios_anteriores}, que va en esta propuesta.' },
+  { id: 'modelos', n: 'Modelos informativos', modo: 'alguna', conds: [{ c: 'valor', o: 'es', v: '50a700' }, { c: 'valor', o: 'es', v: 'mas700' }], t: '{nombre}, por lo que tenías a 31 de diciembre puede que te toque presentar el modelo 721. Lo incluyo para que no se te pase el plazo.' },
+  { id: 'vuelve', n: 'Cliente que vuelve', modo: 'todas', conds: [{ c: 'ya_cliente', o: 'es', v: 'si' }], t: '{nombre}, me alegra tenerte de vuelta. Partimos de lo que ya hicimos juntos, así que solo necesitamos lo nuevo de este año.' }];
+function limpiarPlantillas(l) {
+  return (Array.isArray(l) ? l : []).slice(0, 40).map((x, i) => ({
+    id: /^[a-z0-9-]{1,40}$/.test(String(x && x.id)) ? String(x.id) : 'pl-' + (i + 1),
+    n: String((x && x.n) || '').trim().slice(0, 80) || 'Plantilla ' + (i + 1),
+    modo: x && x.modo === 'alguna' ? 'alguna' : 'todas',
+    defecto: !!(x && x.defecto),
+    conds: (Array.isArray(x && x.conds) ? x.conds : []).slice(0, 10).filter(c => c && PL_CAMPOS.includes(c.c) && PL_OPS.includes(c.o)).map(c => ({ c: c.c, o: c.o, v: String(c.v == null ? '' : c.v).slice(0, 60) })),
+    t: String((x && x.t) || '').slice(0, 1200),
+  })).filter(x => x.t.trim());
+}
+app.get('/api/admin/carta', requiereSesionAsesor, async (req, res) => {
+  let pl = [], inc = {};
+  try { const [[f]] = await pool.query("SELECT valor FROM ajustes WHERE clave = 'carta_plantillas'"); pl = f ? limpiarPlantillas(JSON.parse(f.valor || '[]')) : PL_DEFECTO; } catch (e) { pl = PL_DEFECTO; }
+  inc = await flujoIncluye();
+  res.json({ plantillas: pl, incluye: inc, campos: PL_CAMPOS, ops: PL_OPS, puede: !!req.asesor.esAdmin || tieneRol(req, 'jefe') });
+});
+app.put('/api/admin/carta', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin && !tieneRol(req, 'jefe')) return res.status(403).json({ error: 'Las plantillas las cambia un administrador o un jefe' });
+  const b = req.body || {};
+  if (b.plantillas !== undefined) await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('carta_plantillas', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [JSON.stringify(limpiarPlantillas(b.plantillas))]);
+  if (b.incluye !== undefined) {
+    const inc = {}; for (const [k, v] of Object.entries(b.incluye || {})) if (/^[a-z0-9_-]{1,40}$/.test(k)) { const l = (Array.isArray(v) ? v : String(v || '').split('\n')).map(x => String(x).trim().slice(0, 160)).filter(Boolean).slice(0, 6); if (l.length) inc[k] = l; }
+    await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('carta_incluye', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [JSON.stringify(inc)]);
+  }
+  res.json({ ok: true });
+});
+// Lo que «Enviar propuesta» necesita para sugerir la plantilla: lo que pidió, sus respuestas y si ya fue cliente (por su correo)
+app.get('/api/admin/carta/datos', requiereSesionAsesor, async (req, res) => {
+  const correo = String(req.query.correo || '').trim().toLowerCase().slice(0, 190);
+  const out = { nombre: '', pedidos: [], respuestas: {}, ya_cliente: false };
+  if (!correoValido(correo)) return res.json(out);
+  try {
+    const [[c]] = await pool.query('SELECT id, nombre FROM clientes WHERE LOWER(correo) = ?', [correo]);
+    const [sol] = await pool.query('SELECT servicios, cuestionario FROM solicitudes_presupuesto WHERE LOWER(correo) = ? ORDER BY id DESC LIMIT 1', [correo]);
+    if (sol[0]) { try { const x = JSON.parse(sol[0].servicios); out.pedidos = Array.isArray(x) ? x.map(String) : []; } catch (e) { out.pedidos = String(sol[0].servicios || '').split(',').map(v => v.trim()).filter(Boolean); }
+      try { Object.assign(out.respuestas, ((JSON.parse(sol[0].cuestionario || '{}')._v2) || {}).respuestas || {}); } catch (e) {} }
+    if (c) {
+      out.nombre = c.nombre || '';
+      const r = await respuestasPreviasCliente(c.id); Object.assign(out.respuestas, (r && r.respuestas) || {});
+      const [[n]] = await pool.query("SELECT COUNT(*) n FROM propuestas WHERE cliente_id = ? AND estado = 'aceptada'", [c.id]); out.ya_cliente = Number(n.n) > 0;
+    }
+  } catch (e) { console.error('Datos de la carta:', e.message); }
+  res.json(out);
+});
+// Contacto para los clientes: el propio (y, si es administrador, el de cualquiera que atienda clientes)
+app.get('/api/admin/contacto-clientes', requiereSesionAsesor, async (req, res) => {
+  const [f] = await pool.query('SELECT id, nombre, asesor_id, telefono_clientes, whatsapp_clientes, correo_clientes FROM personas WHERE activa = 1 AND (atiende_clientes = 1 OR asesor_id = ?) ORDER BY orden, id', [req.asesor.id]);
+  const mia = f.find(q => q.asesor_id === req.asesor.id);
+  const lista = (req.asesor.esAdmin ? f : f.filter(q => q === mia)).map(q => ({ id: q.id, nombre: q.nombre, telefono: q.telefono_clientes || '', whatsapp: q.whatsapp_clientes || '', correo: q.correo_clientes || '' }));
+  res.json({ mia: mia ? mia.id : null, personas: lista, general: FLUJO_GENERAL });
+});
+
+app.get('/api/admin/area-animaciones', requiereSesionAsesor, async (req, res) => res.json({ animaciones: await animacionesArea(), puede: !!req.asesor.esAdmin || tieneRol(req, 'jefe') }));
+app.put('/api/admin/area-animaciones', requiereSesionAsesor, async (req, res) => {
+  if (!req.asesor.esAdmin && !tieneRol(req, 'jefe')) return res.status(403).json({ error: 'Las animaciones las cambia un administrador o un jefe' });
+  const act = await animacionesArea(), b = (req.body || {}).animaciones || {};
+  for (const k of Object.keys(ANIM_DEFECTO)) if (typeof b[k] === 'boolean') act[k] = b[k];
+  await pool.execute("INSERT INTO ajustes (clave, valor) VALUES ('area_animaciones', ?) ON DUPLICATE KEY UPDATE valor = VALUES(valor)", [JSON.stringify(act)]);
+  res.json({ ok: true, animaciones: act });
+});
+// ---------------- 25/11 (Vikn): resumen del informe, lo que el cliente lee antes de descargarlo
+// Lo rellenará una herramienta que lea el PDF (todos los informes de PyG tienen la misma estructura). Formato:
+//   { tipo: 'pyg', anios: [ { ejercicio: 2025, compraventas: -1234.56, staking: 120, airdrops: 30, liquidez: 12, otros: [{ concepto, importe }] } ] }
+// PyG de un año lleva un elemento en «anios»; PyG de años anteriores, uno por año. Importes en euros (positivo: ganancia; negativo: pérdida).
+function resumenLimpio(r) {
+  if (!r || typeof r !== 'object' || !Array.isArray(r.anios)) return null;
+  const num = v => (v === null || v === undefined || v === '' || !isFinite(Number(v))) ? null : Math.round(Number(v) * 100) / 100;
+  const anios = r.anios.slice(0, 30).map(a => ({ ejercicio: Number(a && a.ejercicio) || null, compraventas: num(a.compraventas), staking: num(a.staking), airdrops: num(a.airdrops), liquidez: num(a.liquidez),
+    otros: Array.isArray(a.otros) ? a.otros.slice(0, 10).map(o => ({ concepto: String((o && o.concepto) || '').slice(0, 60), importe: num(o && o.importe) })).filter(o => o.concepto && o.importe !== null) : [] })).filter(a => a.ejercicio);
+  return anios.length ? { tipo: String(r.tipo || 'pyg').slice(0, 20), anios } : null;
+}
+app.put('/api/admin/entregas/:id/resumen', requiereSesionAsesor, async (req, res) => {
+  const r = req.body && req.body.resumen === null ? null : resumenLimpio(req.body && req.body.resumen);
+  if (req.body && req.body.resumen !== null && !r) return res.status(400).json({ error: 'Resumen no válido: hace falta { tipo, anios: [{ ejercicio, compraventas, staking, airdrops, liquidez }] }' });
+  const [f] = await pool.execute('UPDATE entregas SET resumen = ? WHERE id = ?', [r ? JSON.stringify(r) : null, Number(req.params.id)]);
+  if (!f.affectedRows) return res.status(404).json({ error: 'Informe no encontrado' });
+  res.json({ ok: true, resumen: r });
+});
+
+// ---------------- Pago declarado sin confirmar: aviso al asesor a los 2 días laborables (una sola vez)
+function diasLaborablesDesde(d) { let n = 0; const x = new Date(d); while (x < ahora()) { x.setDate(x.getDate() + 1); if (x <= ahora() && x.getDay() !== 0 && x.getDay() !== 6) n++; } return n; }
+async function avisarPagosEnRevision() {
+  try {
+    const [f] = await pool.query("SELECT g.id, g.creado_en, p.cliente_id FROM pagos g JOIN propuestas p ON p.id = g.propuesta_id WHERE g.estado = 'autodeclarado' AND g.aviso_revision_en IS NULL AND g.creado_en < NOW() - INTERVAL 2 DAY");
+    for (const g of f) if (diasLaborablesDesde(g.creado_en) >= 2) {
+      await pool.execute('UPDATE pagos SET aviso_revision_en = NOW() WHERE id = ?', [g.id]);
+      avisarCliente(g.cliente_id, '⏳', 'un pago lleva 2 días laborables sin confirmar', 'El cliente lo ve «en revisión». Confírmalo en Cobros.');
+    }
+  } catch (e) { console.error('Pagos en revisión:', e.message); }
+}
+setInterval(avisarPagosEnRevision, 60 * 60 * 1000);
 
 async function prepararFormatosArchivo() {
   await pool.query(`CREATE TABLE IF NOT EXISTS formatos_archivo (
@@ -11202,11 +12240,11 @@ const TEMPORADA_POR_DEFECTO = { modo: 'auto', forzada: null, apagadas: [], halvi
 const APAR_TEMAS = ['bosque', 'grafito'];
 const APAR_TOKENS = ['fondo', 'superficie', 'cabecera', 'linea', 'circulo', 'texto', 'texto_suave', 'acento', 'boton', 'boton_texto'];
 const APAR_BASE = {
-  oscuro: 'bosque',
-  secreto: { tema: 'grafito', palabra: 'grafito', toques_logo: true },
+  oscuro: 'grafito',   // 24/11 (Vikn): vuelve el grafito como el de siempre; el bosque, de tema secreto
+  secreto: { tema: 'bosque', palabra: 'bosque', toques_logo: true },
   paletas: {
     bosque:  { fondo: '#17302A', superficie: '#20402F', cabecera: '#1B362D', linea: '#36584A', circulo: '#2A4A3B', texto: '#F2ECE1', texto_suave: '#CFC6B8', acento: '#D9A066', boton: '#F1E6D8', boton_texto: '#032617' },
-    grafito: { fondo: '#1A1D1B', superficie: '#262B28', cabecera: '#202421', linea: '#3A403C', circulo: '#30362F', texto: '#F2ECE1', texto_suave: '#CFC6B8', acento: '#D9A066', boton: '#F1E6D8', boton_texto: '#032617' }
+    grafito: { fondo: '#2B2E2F', superficie: '#35393A', cabecera: '#303334', linea: '#4A4F50', circulo: '#3D4243', texto: '#E9E4DA', texto_suave: '#C2BBAF', acento: '#D9A066', boton: '#E3D9CA', boton_texto: '#032617' }   // 24/11 (Vikn): más gris y menos deslumbrante
   }
 };
 function aparLimpia(c, estricto) {
@@ -11317,6 +12355,13 @@ const WALLETS_MAS = ['SafePal', 'Electrum', 'Atomic Wallet', 'Binance Web3 Walle
   'Sparrow', 'BlueWallet', 'Wasabi', 'Muun', 'Ellipal', 'Keystone', 'BitBox', 'Coldcard', 'Arculus'];
 const preguntaWallets = () => { const b = (n, g, r) => ({ t: n, grupo: g, r: r || 28 }); return { id: 'wallets', texto: '¿Qué wallets has usado?', tipo: 'varias', forma: 'rejilla', col: 4, dep: { pregunta: 'donde', respuestas: ['wallet'] },
   opciones: WALLETS.map(t => op(slug(t), t, { burbujas: [b(t, 'wallet', 20)] })).concat(WALLETS_MAS.map(t => op(slug(t), t, { mas: true, burbujas: [b(t, 'wallet', 18)] }))) }; };
+// 23/11 (Vikn): ¿ya pasó por otra empresa o plataforma de trazabilidad? Cada «sí» lleva logos que van rotando, elegidos en el
+// editor de entre «Plataformas y logos» (las empresas y las plataformas se dan de alta allí, con su logo).
+const preguntaTrazabilidad = () => ({ id: 'trazabilidad_previa', texto: '¿Has hecho antes algún servicio de trazabilidad cripto con otra empresa o plataforma?', tipo: 'una', forma: 'recuadros', col: 3, alto: 'media',
+  expl: 'Si ya tienes informes o archivos de otra empresa o de un programa de cálculo, podemos aprovecharlos.',
+  opciones: [op('empresa', 'Sí, con otra empresa', { mapa: false, s: 'Una asesoría o empresa especializada', ejemplos: ['taxdown', 'clcripto', 'abast'] }),
+    op('plataforma', 'Sí, con una plataforma', { mapa: false, s: 'Un programa de cálculo', ejemplos: ['cointracking', 'waltio', 'koinly', 'blockpit', 'crypto-tax-calculator'] }),
+    op('no', 'No', { mapa: false, s: 'Será la primera vez' })] });
 const slug = t => String(t).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 function definicionInicialCripto() {
   const b = (n, g, r) => ({ t: n, grupo: g, r: r || 28 });
@@ -11369,6 +12414,7 @@ function definicionInicialCripto() {
           { id: 'que_paso', texto: 'Nos has comentado que ocurrió algo con tus criptos. ¿Qué pasó exactamente?', tipo: 'varias', forma: 'casillas', dep: { pregunta: 'problema', respuestas: ['si'] },
             opciones: ['Un exchange cerró o quebró', 'Perdí el acceso', 'Estafa', 'Hackeo'].map(t => op(slug(t), t, { mapa: false })) },
           { id: 'denuncia', texto: '¿Tienes denuncia policial sobre la estafa?', tipo: 'una', forma: 'recuadros', col: 2, alto: 'media', dep: { pregunta: 'que_paso', respuestas: ['estafa'] }, opciones: [op('si', 'Sí', { mapa: false }), op('no', 'No', { mapa: false })] },
+          preguntaTrazabilidad(),
           { id: 'comentario', texto: '¿Algo más que quieras contarnos?', tipo: 'texto', forma: 'texto', opciones: [] }
         ] },
       { id: 's-propuesta', tipo: 'sistema', nombre: 'Propuesta' },
@@ -11395,6 +12441,8 @@ async function prepararFormularios() {
     if (!h.length) await pool.query('INSERT INTO formularios_def (formulario, version, definicion, nota) VALUES (?, 1, ?, ?)', [f, JSON.stringify(definicionInicialCripto()), 'Versión inicial']);
   }
   await anadirPreguntaWallets();
+  await anadirPreguntaTrazabilidad();
+  await aclaracionNoTrazabilidad();
   await walletsFueraDeExchanges();
   await menosEnPantalla();
 }
@@ -11447,6 +12495,34 @@ async function anadirPreguntaWallets() {
   const version = d.version + 1; delete d.version;
   await pool.query('INSERT IGNORE INTO formularios_def (formulario, version, definicion, nota) VALUES (?, ?, ?, ?)', ['cripto', version, JSON.stringify(d), 'Pregunta «¿Qué wallets has usado?» añadida a la batería 2']);
   console.log('Formularios: pregunta de wallets añadida (versión ' + version + ')');
+}
+// 23/11 (Vikn): la pregunta de trazabilidad previa entra UNA vez como versión nueva, justo antes de «¿Algo más que quieras
+// contarnos?» (al final de la batería 2). Si alguna versión ya la tuvo, no se vuelve a poner (si el equipo la quita, se respeta).
+async function anadirPreguntaTrazabilidad() {
+  const [ya] = await pool.query("SELECT 1 FROM formularios_def WHERE formulario = 'cripto' AND definicion LIKE '%\"id\":\"trazabilidad_previa\"%' LIMIT 1");
+  if (ya.length) return;
+  const d = await leerDefinicion('cripto'); if (!d) return;
+  const b2 = d.flujo.find(p => p.id === 'b2'); if (!b2 || !Array.isArray(b2.preguntas)) return;
+  if (d.flujo.some(p => (p.preguntas || []).some(q => q.id === 'trazabilidad_previa'))) return;
+  const k = b2.preguntas.findIndex(q => q.id === 'comentario');
+  b2.preguntas.splice(k >= 0 ? k : b2.preguntas.length, 0, preguntaTrazabilidad());
+  const version = d.version + 1; delete d.version;
+  await pool.query('INSERT IGNORE INTO formularios_def (formulario, version, definicion, nota) VALUES (?, ?, ?, ?)', ['cripto', version, JSON.stringify(d), 'Pregunta de trazabilidad previa añadida a la batería 2']);
+  console.log('Formularios: pregunta de trazabilidad previa añadida (versión ' + version + ')');
+}
+// 25/11 (Vikn, opción C): el «No» de la trazabilidad previa lleva «Será la primera vez». Entra UNA vez como versión nueva y solo
+// si ese «No» no tiene aclaración; si alguna versión ya la tuvo, se respeta lo que haya.
+const ACLARACION_NO_TRAZA = 'Será la primera vez';
+async function aclaracionNoTrazabilidad() {
+  const [ya] = await pool.query("SELECT 1 FROM formularios_def WHERE formulario = 'cripto' AND definicion LIKE ? LIMIT 1", ['%' + ACLARACION_NO_TRAZA + '%']);
+  if (ya.length) return;
+  const d = await leerDefinicion('cripto'); if (!d) return;
+  const q = d.flujo.flatMap(p => p.preguntas || []).find(x => x.id === 'trazabilidad_previa'); if (!q) return;
+  const no = (q.opciones || []).find(o => o.id === 'no'); if (!no || String(no.s || '').trim()) return;
+  no.s = ACLARACION_NO_TRAZA;
+  const version = d.version + 1; delete d.version;
+  await pool.query('INSERT IGNORE INTO formularios_def (formulario, version, definicion, nota) VALUES (?, ?, ?, ?)', ['cripto', version, JSON.stringify(d), '«' + ACLARACION_NO_TRAZA + '» en el «No» de la trazabilidad previa']);
+  console.log('Formularios: aclaración del «No» de trazabilidad (versión ' + version + ')');
 }
 async function leerDefinicion(form, version) {
   const [f] = version
@@ -11698,7 +12774,7 @@ async function correoBateria(clienteId, fila, esRecordatorio) {
     titulo: esRecordatorio ? 'Tienes unas preguntas pendientes' : 'Unas preguntas para seguir con tu caso',
     parrafos: [c.nombre ? `Hola, ${ESC_HTML(c.nombre)}:` : 'Hola:',
       esRecordatorio ? `Te recordamos que ${quien === 'Tu asesor' ? 'tu asesor' : quien} está esperando tus respuestas para seguir con tu caso.` : `${quien} necesita que respondas unas preguntas para seguir con tu caso.`,
-      (n ? `Son ${n === 1 ? 'una pregunta' : n + ' preguntas'} y` : 'Se') + ' responden en unos minutos desde tu área de cliente. Cuanto más sincero seas, más rápido y más barato será tu servicio.'],
+      (n === 1 ? 'Es una pregunta y se responde en un momento' : (n ? `Son ${n} preguntas y se` : 'Se') + ' responden en unos minutos') + ' desde tu área de cliente. Cuanto más sincero seas, más rápido y más barato será tu servicio.'],
     boton: enlace ? { texto: 'Responder ahora', url: enlace } : null });
   const conn = await pool.getConnection();
   try { await notificarCliente(conn, clienteId, 'documentos', () => enviarCorreo(c.correo, esRecordatorio ? 'Tienes unas preguntas pendientes en Acros' : 'Unas preguntas para seguir con tu caso', m.html, m.texto, { desde: 'asesor' }), 'Acros: tienes unas preguntas pendientes en tu área'); }
@@ -11757,6 +12833,9 @@ app.post('/api/clientes/formularios/:fid', requiereSesionCliente, async (req, re
     const limpio = {}; for (const [k, x] of Object.entries(resp)) if (/^[a-z0-9_-]{1,40}$/.test(k)) limpio[k] = Array.isArray(x) ? x.slice(0, 60).map(String) : String(x).slice(0, 2000);
     const def = await leerDefinicion(f.formulario, f.version), previas = await respuestasPreviasCliente(req.cliente.id);
     const todo = Object.assign({}, previas.respuestas, limpio), resumen = (resumenRespuestas(def, f.bateria, todo) || []).filter(x => x.id in limpio);
+    { const bat = def && def.flujo.find(x => x.id === f.bateria), vacia = v => v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length);   // 26/11 (menor): antes valían vacías
+      const hay = bat ? bat.preguntas.some(q => q.tipo !== 'texto' && !vacia(limpio[q.id])) : true;
+      if (!hay) return res.status(400).json({ error: 'No has respondido ninguna pregunta' }); }
     await pool.query("UPDATE formularios_cliente SET estado = 'respondida', respuestas = ?, resumen = ?, respondida_en = NOW() WHERE id = ?", [JSON.stringify(limpio), JSON.stringify(resumen), fid]);
     if (!(await completarMedioCamino(req.cliente.id))) avisarCliente(req.cliente.id, '📝', 'ha respondido sus preguntas', 'Las tienes en su ficha, en «Preguntas».');   // 12/11
     res.json({ ok: true });
@@ -11825,7 +12904,7 @@ app.get('/api/clientes/mapa', requiereSesionCliente, async (req, res) => {
   try {
     const e = await estadoMapa(req.cliente.id), def = await leerDefinicion('cripto');
     const inicialLista = !!e.previas.b1 && e.respondidas.has('b2') && e.pagado;
-    const out = { definicion: def, contratado_en: e.contratado_en, inicial: inicialLista ? e.inicial : null, falta: inicialLista ? null : (!e.previas.b1 || !e.respondidas.has('b2') ? 'preguntas' : 'pago') };
+    const out = { definicion: sinPrecios(def) /* 26/11 (M5): el cliente nunca ve tarifas */, contratado_en: e.contratado_en, inicial: inicialLista ? e.inicial : null, falta: inicialLista ? null : (!e.previas.b1 || !e.respondidas.has('b2') ? 'preguntas' : 'pago') };
     // 19/11 (Vikn): el mapa de sus respuestas se ve SIEMPRE (pantalla «Gracias» y botoncito junto a su nombre en el Área), en cuanto ha
     // respondido las baterías 1 y 2, haya pagado o no.
     if (e.previas.b1 && e.respondidas.has('b2')) out.vista = e.inicial;
@@ -11880,7 +12959,7 @@ app.post('/api/admin/clientes/:id/cierre', requiereSesionAsesor, async (req, res
     await pool.query("INSERT INTO formularios_mapa (cliente_id, correccion, metricas, cierre, cierre_resumen, guardado_por, guardado_en) VALUES (?, ?, ?, 'cerrado', ?, ?, NOW()) ON DUPLICATE KEY UPDATE correccion = VALUES(correccion), metricas = VALUES(metricas), cierre = 'cerrado', cierre_motivo = NULL, cierre_resumen = VALUES(cierre_resumen), guardado_por = VALUES(guardado_por), guardado_en = NOW()",
       [id, JSON.stringify(limpio), JSON.stringify(met), JSON.stringify(resumen), req.asesor.id]);
     await pool.query("INSERT INTO notas_cliente (cliente_id, asesor_id, origen, texto) VALUES (?, ?, 'ficha', ?)", [id, req.asesor.id,
-      quien + ' cerró el expediente: contó bien ' + resumen.bien + ' de ' + resumen.total + ' · faltaban ' + resumen.faltaban + ' · no era así ' + resumen.mal + '. Cifras reales: ' + met.operaciones + ' operaciones, ' + ({ gano: 'ganó', perdio: 'perdió', igual: 'más o menos igual' }[met.resultado]) + (met.importe ? ' (' + met.importe + ' €)' : '') + '.']);
+      quien + ' cerró el expediente: contó bien ' + resumen.bien + ' de ' + resumen.total + ', faltaban ' + resumen.faltaban + ', no era así ' + resumen.mal + '. Cifras reales: ' + met.operaciones + ' operaciones, ' + ({ gano: 'ganó', perdio: 'perdió', igual: 'más o menos igual' }[met.resultado]) + (met.importe ? ' (' + met.importe + ' €)' : '') + '.']);
     let enviada = false;
     if (b.enviar_b3) {
       const def = await leerDefinicion('cripto'), bat = def.flujo.find(p => p.id === 'b3');
@@ -12005,7 +13084,7 @@ async function correoMedioCamino(solId, esRecordatorio) {
     titulo: 'Termina tu solicitud',
     parrafos: [s.nombre ? `Hola, ${ESC_HTML(s.nombre)}:` : 'Hola:',
       esRecordatorio ? 'Tu solicitud de presupuesto sigue a medio camino: nos faltan unas pocas preguntas más para prepararlo.' : 'Gracias por tus respuestas. Para preparar tu presupuesto nos faltan unas pocas preguntas más.',
-      'Entra en tu área de cliente con el botón y las tendrás en «Te toca a ti». Se responden en unos minutos y, en cuanto las termines, tu asesor se pone con tu propuesta.'],
+      'Entra en tu área de cliente con el botón y las tendrás en «Tareas pendientes». Se responden en unos minutos y, en cuanto las termines, tu asesor se pone con tu propuesta.'],
     boton: enlace ? { texto: 'Entrar y terminar mi solicitud', url: enlace } : null,
     nota: 'El enlace es personal y sirve durante ' + DIAS_ENLACE_MC + ' días. Si no has pedido tú este presupuesto, ignora este correo.',
   });
